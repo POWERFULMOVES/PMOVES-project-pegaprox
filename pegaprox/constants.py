@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 
 # Version
-PEGAPROX_VERSION = "Beta 0.9.9.2"
+PEGAPROX_VERSION = "Beta 0.9.9.3"
 PEGAPROX_BUILD = "2026.05.08"
 
 # File Paths & Directories

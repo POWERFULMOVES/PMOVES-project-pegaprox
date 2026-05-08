@@ -205,6 +205,45 @@ main() {
     # =========================================================================
     print_step "Step 4/6: Setting up Python Environment"
 
+    # Python version sanity. We test against 3.10–3.13. 3.14 is too new for
+    # parts of our stack (gevent, websockets, pyvmomi may have edge cases the
+    # ecosystem hasn't worked through yet — issue #388 had a Python 3.14
+    # report where the SSH WebSocket subprocess couldn't bind cleanly). 3.9
+    # and earlier hit the urllib3/cryptography floor in requirements.txt.
+    PYTHON_BIN="python3"
+    PY_VER=$("$PYTHON_BIN" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null)
+    if [ -z "$PY_VER" ]; then
+        echo -e "${RED}python3 is not callable. Install it first: apt-get install python3 python3-venv${NC}"
+        exit 1
+    fi
+    print_info "Detected Python: $PY_VER"
+    PY_MAJOR=$(echo "$PY_VER" | cut -d. -f1)
+    PY_MINOR=$(echo "$PY_VER" | cut -d. -f2)
+    if [ "$PY_MAJOR" -ne 3 ]; then
+        echo -e "${RED}Unsupported Python major version: $PY_VER. PegaProx requires Python 3.10–3.13.${NC}"
+        exit 1
+    fi
+    if [ "$PY_MINOR" -lt 10 ]; then
+        echo -e "${RED}Python $PY_VER is too old. Minimum supported: 3.10. Recommended: 3.12.${NC}"
+        echo -e "${RED}Older versions hit the urllib3 / cryptography floors in requirements.txt.${NC}"
+        exit 1
+    fi
+    if [ "$PY_MINOR" -ge 14 ]; then
+        echo -e "${YELLOW}WARNING: Python $PY_VER is newer than what PegaProx is tested on (3.10–3.13).${NC}"
+        echo -e "${YELLOW}Known issue on 3.14: SSH/VNC WebSocket subprocesses may fail to bind${NC}"
+        echo -e "${YELLOW}cleanly (issue #388). If you hit a console-not-working bug, downgrade to${NC}"
+        echo -e "${YELLOW}python3.12 (Ubuntu 24.04 default) or python3.13 and run deploy.sh again.${NC}"
+        if [ -t 0 ] && [ -z "$DEPLOY_FORCE_PY" ]; then
+            read -r -p "Continue anyway? [y/N] " _ans
+            case "$_ans" in
+                y|Y|yes|YES) ;;
+                *) echo "Aborted. Set DEPLOY_FORCE_PY=1 to skip this prompt in non-interactive runs."; exit 1 ;;
+            esac
+        else
+            print_info "Non-interactive run or DEPLOY_FORCE_PY set — proceeding on $PY_VER."
+        fi
+    fi
+
     print_info "Creating virtual environment..."
     python3 -m venv "$INSTALL_DIR/venv"
 

@@ -8,8 +8,10 @@ flask-sock>=0.6.0
 flask-compress>=1.14
 # MK May 2026 — bumped requests + urllib3 floors to dodge CVE-2026-25645
 # and friends. Older versions still work in a pinch but pip-audit flags them.
+# NS May 2026 — urllib3 floor pushed to 2.0.7 (CVE-2023-43804: Cookie header
+# leaks via cross-origin redirect when allow_redirects not explicitly disabled).
 requests>=2.33.0
-urllib3>=2.0.0
+urllib3>=2.0.7
 
 # === Encryption & Security ===
 # NS May 2026 — cryptography 46.0.6/.0.7 patches CVE-2026-34073 + -39892,
@@ -19,7 +21,9 @@ pyopenssl>=26.0.0
 argon2-cffi>=23.0.0
 
 # === SSH & Console ===
-paramiko>=3.0.0
+# NS May 2026 — bump to 3.4.0+ for CVE-2023-48795 (Terrapin attack on the
+# SSH binary packet protocol). 3.4.0 disables the affected mode by default.
+paramiko>=3.4.0
 websockets>=11.0
 websocket-client>=1.6.0
 
@@ -48,3 +52,9 @@ pyvmomi>=8.0.0
 
 # === XCP-ng Integration (Optional) ===
 XenAPI>=23.14.0
+
+# === Hardened XML parsing ===
+# NS May 2026 — defusedxml replaces stdlib xml.etree for any input that comes
+# off the wire (XCP-ng RRD responses, iSCSI probe TGTs). Stops XXE / billion-laughs
+# / external-entity expansion. Pure-Python wrapper — no compile, tiny.
+defusedxml>=0.7.1

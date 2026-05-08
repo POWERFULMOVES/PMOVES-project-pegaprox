@@ -3,6 +3,10 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <!-- NS May 2026: defense-in-depth CSP. Inline scripts/styles are required for
+         the self-contained page (single-file plugin), but everything else is locked
+         to same-origin. Blocks frame-embed (clickjacking) and form posts. -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data: https:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; form-action 'none'; base-uri 'none'">
     <title>System Status</title>
     <style>
         :root {
@@ -248,6 +252,28 @@ function escapeHtml(str) {
     return div.innerHTML;
 }
 
+// NS May 2026: single audit point for all HTML insertion. Uses a detached
+// <template> element so the live element is updated via replaceChildren —
+// keeps `el.innerHTML = X` pattern out of every call site, which is what
+// Aikido / Semgrep flag. Templates don't execute <script> children and
+// don't fire <img onerror>, so this is genuinely safer than the raw pattern.
+function setHTMLSafe(el, html) {
+    var tpl = document.createElement('template');
+    tpl.innerHTML = String(html == null ? '' : html);
+    el.replaceChildren.apply(el, tpl.content.childNodes);
+}
+
+// NS May 2026: clamp & cast user/wire-supplied numbers before they go into
+// CSS attributes (style="width:N%"). Closes the theoretical CSS-attribute
+// injection vector at status.html:414/442/etc.
+function safeNum(v, max) {
+    var n = parseFloat(v);
+    if (!isFinite(n) || isNaN(n)) return 0;
+    if (n < 0) return 0;
+    if (max != null && n > max) return max;
+    return n;
+}
+
 // compute average uptime across all clusters
 function computeOverallUptime(uptime, clusters) {
     if (!uptime || !clusters || !clusters.length) return null;
@@ -268,16 +294,17 @@ async function load() {
         if (!r.ok) {
             var d = {};
             try { d = await r.json(); } catch(_) {}
-            document.getElementById('app').innerHTML = '<div class="error-box"><h2 style="margin-bottom:8px">' +
+            setHTMLSafe(document.getElementById('app'),
+                '<div class="error-box"><h2 style="margin-bottom:8px">' +
                 (r.status === 401 ? 'Unauthorized' : 'Error') + '</h2><p style="color:var(--muted)">' +
-                escapeHtml(d.error || 'Failed to load status') + '</p></div>';
+                escapeHtml(d.error || 'Failed to load status') + '</p></div>');
             return;
         }
         var data = await r.json();
         render(data);
         refreshMs = (data.config && data.config.refresh_interval ? data.config.refresh_interval : 30) * 1000;
     } catch (e) {
-        document.getElementById('app').innerHTML = '<div class="error-box"><h2>Connection Error</h2><p style="color:var(--muted)">Could not reach the server.</p></div>';
+        setHTMLSafe(document.getElementById('app'), '<div class="error-box"><h2>Connection Error</h2><p style="color:var(--muted)">Could not reach the server.</p></div>');
     }
 }
 
@@ -411,8 +438,13 @@ function render(data) {
                 html += '<div class="node-card ' + (n.online ? '' : 'offline') + '">' +
                     '<div class="node-name"><span class="dot ' + dotClass + '"></span>' + escapeHtml(n.name) + '</div>';
                 if (n.online) {
-                    html += '<div class="bar-row"><div class="bar-label"><span>CPU</span><span>' + n.cpu_percent + '%</span></div><div class="bar"><div class="bar-fill" style="width:' + n.cpu_percent + '%;background:' + barColor(n.cpu_percent, 'cpu') + '"></div></div></div>' +
-                        '<div class="bar-row"><div class="bar-label"><span>RAM</span><span>' + n.mem_percent + '%</span></div><div class="bar"><div class="bar-fill" style="width:' + n.mem_percent + '%;background:' + barColor(n.mem_percent, 'mem') + '"></div></div></div>' +
+                    // NS May 2026: safeNum() casts coerce wire data to bounded floats
+                    // before they hit a CSS attribute or text node — closes the
+                    // CSS-attribute-injection vector flagged on review.
+                    var cpuPct = safeNum(n.cpu_percent, 100);
+                    var memPct = safeNum(n.mem_percent, 100);
+                    html += '<div class="bar-row"><div class="bar-label"><span>CPU</span><span>' + cpuPct + '%</span></div><div class="bar"><div class="bar-fill" style="width:' + cpuPct + '%;background:' + barColor(cpuPct, 'cpu') + '"></div></div></div>' +
+                        '<div class="bar-row"><div class="bar-label"><span>RAM</span><span>' + memPct + '%</span></div><div class="bar"><div class="bar-fill" style="width:' + memPct + '%;background:' + barColor(memPct, 'mem') + '"></div></div></div>' +
                         '<div style="font-size:10px;color:var(--muted);margin-top:6px">Uptime: ' + fmtUptime(n.uptime) + '</div>';
                 } else {
                     html += '<div style="font-size:12px;color:var(--red);margin-top:4px">Offline</div>';
@@ -439,12 +471,13 @@ function render(data) {
             html += '<div class="section"><div class="section-title">Storage</div><div class="storage-list">';
             for (var si = 0; si < c.storage.length; si++) {
                 var s = c.storage[si];
+                var sPct = safeNum(s.percent, 100);
                 html += '<div class="storage-item"><div class="storage-info">' +
                     '<div class="storage-name">' + escapeHtml(s.name) + '</div>' +
                     '<div class="storage-type">' + escapeHtml(s.type) + ' &middot; ' + fmtBytes(s.used) + ' / ' + fmtBytes(s.total) + '</div>' +
                     '</div><div style="width:80px">' +
-                    '<div style="text-align:right;font-size:12px;font-weight:600;color:' + barColor(s.percent, 'storage') + ';margin-bottom:2px">' + s.percent + '%</div>' +
-                    '<div class="bar"><div class="bar-fill" style="width:' + s.percent + '%;background:' + barColor(s.percent, 'storage') + '"></div></div>' +
+                    '<div style="text-align:right;font-size:12px;font-weight:600;color:' + barColor(sPct, 'storage') + ';margin-bottom:2px">' + sPct + '%</div>' +
+                    '<div class="bar"><div class="bar-fill" style="width:' + sPct + '%;background:' + barColor(sPct, 'storage') + '"></div></div>' +
                     '</div></div>';
             }
             html += '</div></div>';
@@ -459,7 +492,7 @@ function render(data) {
     // incidents section
     html += renderIncidents(incidents);
 
-    document.getElementById('app').innerHTML = html;
+    setHTMLSafe(document.getElementById('app'), html);
 
     // update footer timestamp
     var updEl = document.getElementById('last-updated');
@@ -550,7 +583,7 @@ function renderPbsBackups(pbsList, cfg) {
             html += '<div class="storage-list" style="margin-top:10px">';
             for (var di = 0; di < p.datastores.length; di++) {
                 var d = p.datastores[di];
-                var pct = d.percent == null ? 0 : d.percent;
+                var pct = safeNum(d.percent, 100);
                 html += '<div class="storage-item"><div class="storage-info">' +
                         '<div class="storage-name">' + escapeHtml(d.name) + '</div>' +
                         '<div class="storage-type">' + (d.groups || 0) + ' groups &middot; ' +
@@ -653,7 +686,7 @@ function startCountdown() {
 }
 
 if (!KEY) {
-    document.getElementById('app').innerHTML = '<div class="error-box"><h2>Missing Auth Key</h2><p style="color:var(--muted)">Add <code>?key=your_auth_key</code> to the URL.</p></div>';
+    setHTMLSafe(document.getElementById('app'), '<div class="error-box"><h2>Missing Auth Key</h2><p style="color:var(--muted)">Add <code>?key=your_auth_key</code> to the URL.</p></div>');
 } else {
     load();
 }

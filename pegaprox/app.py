@@ -179,28 +179,104 @@ def create_app():
                 referer = request.headers.get('Referer', '')
                 allowed_origins = get_allowed_origins() or []
                 fwd_host = request.headers.get('X-Forwarded-Host', '')
-                fwd_proto = request.headers.get('X-Forwarded-Proto', request.scheme)
+
+                # NS May 2026 (#382 follow-up) — safer Origin matcher.
+                # The previous version used `value.startswith(f"{scheme}://{host}")`
+                # which (a) had a suffix-confusion bug — `https://pegaprox.com`
+                # would match an Origin of `https://pegaprox.com.attacker.com`
+                # because that string really does start with the substring —
+                # and (b) was strict about scheme, which broke users behind
+                # Apache/nginx reverse proxies that don't forward
+                # X-Forwarded-Proto (cklabautermann's report).
+                # New approach: parse the URL, compare *hostname* (and port
+                # if both sides specify one). Scheme is irrelevant for CSRF;
+                # the browser controls Origin and won't lie about hostname.
+                # HTTPS enforcement happens elsewhere (HSTS, secure cookie flag).
+                from urllib.parse import urlparse
+
+                def _host_port(hp):
+                    # split request.host or fwd_host into (host, port|None)
+                    if not hp: return ('', None)
+                    if ':' in hp:
+                        h, _, p = hp.rpartition(':')
+                        try: return (h.lower(), int(p))
+                        except ValueError: return (hp.lower(), None)
+                    return (hp.lower(), None)
+
+                req_host, req_port = _host_port(request.host)
+                fwd_h, fwd_p = _host_port(fwd_host)
 
                 def _origin_ok(value):
                     if not value: return False
-                    return (
-                        value in allowed_origins or
-                        value.startswith(f"{request.scheme}://{request.host}") or
-                        value.startswith(f"{fwd_proto}://{request.host}") or
-                        (fwd_host and value.startswith(f"{fwd_proto}://{fwd_host}"))
-                    )
+                    if value in allowed_origins:
+                        return True
+                    # NS May 2026 (pentest finding) — Python's urlparse silently
+                    # normalises tabs/whitespace inside the scheme: 'ht\ttp://x'
+                    # parses as scheme='http'. Browsers never produce that, but
+                    # an attacker with raw HTTP control could craft it. Lock the
+                    # scheme prefix down with a strict, byte-exact check before
+                    # parsing — only the two browser-realistic prefixes pass.
+                    if not (value.startswith('http://') or value.startswith('https://')):
+                        return False
+                    try:
+                        u = urlparse(value)
+                        # MK May 2026: u.port can ValueError for malformed authority
+                        # like "localhost:5000.attacker.com" — guard explicitly.
+                        try:
+                            cand_port = u.port
+                        except (ValueError, TypeError):
+                            return False
+                    except Exception:
+                        return False
+                    # Defensive: reject userinfo. RFC 6454 origins have no userinfo;
+                    # `http://evil.com:80@localhost` parses with hostname=localhost,
+                    # which would otherwise slip through.
+                    if u.username or u.password:
+                        return False
+                    if u.scheme not in ('http', 'https'):  # belt + braces
+                        return False
+                    if not u.hostname:
+                        return False
+                    cand_host = u.hostname.lower()
+                    # accept against request host or proxy-forwarded host
+                    targets = [(req_host, req_port)]
+                    if fwd_h:
+                        targets.append((fwd_h, fwd_p))
+                    for t_host, t_port in targets:
+                        if cand_host != t_host:
+                            continue
+                        # Port handling — strict by RFC 6454. If Origin has an
+                        # explicit port, it must match the target. We accept a
+                        # bit of slack only when the target port is unknown
+                        # (Flask sometimes drops the port from request.host
+                        # behind certain proxy setups), but only when Origin's
+                        # port matches the *default* port for its scheme — so
+                        # https://example.com:9999 is never accepted against
+                        # an unknown-port target.
+                        if cand_port is None and t_port is None:
+                            return True
+                        if cand_port == t_port:
+                            return True
+                        if t_port is None and cand_port in (80, 443):
+                            return True
+                        # any other combination is a port mismatch → reject
+                    return False
 
                 # accept either a same-origin Origin/Referer OR XHR + same-origin
                 # (XHR alone is not enough — fetch() lets attacker set X-R-W on
                 # same-origin, but cross-origin requests can also set it freely
                 # in non-browser contexts).
-                ok_origin = _origin_ok(origin) or _origin_ok(referer.rstrip('/').rsplit('/', 1)[0] if referer else '')
+                # MK May 2026: Referer parses as a full URL — pass it directly to
+                # _origin_ok which now uses urlparse, no manual splitting needed.
+                ok_origin = _origin_ok(origin) or _origin_ok(referer)
                 if not ok_origin:
                     # If neither Origin nor Referer matches, only allow when XHR
                     # marker is set AND there's no foreign Origin/Referer.
                     if not has_xhr:
                         return jsonify({'error': 'CSRF validation failed'}), 403
                     if origin and not _origin_ok(origin):
+                        return jsonify({'error': 'CSRF validation failed'}), 403
+                    if referer and not _origin_ok(referer):
                         return jsonify({'error': 'CSRF validation failed'}), 403
 
         return None
@@ -209,12 +285,18 @@ def create_app():
     @app.after_request
     def add_security_headers(response):
         response.headers['X-Content-Type-Options'] = 'nosniff'
-        response.headers['X-Frame-Options'] = 'DENY'
+        # NS May 2026 (#381) — relaxed from DENY to SAMEORIGIN so plugins
+        # can ship a frontend UI that the dashboard embeds in an iframe tab.
+        # Cross-origin clickjacking remains prevented; same-origin embedding
+        # is the documented plugin-frontend contract.
+        response.headers['X-Frame-Options'] = 'SAMEORIGIN'
         response.headers['X-XSS-Protection'] = '1; mode=block'
         response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
         response.headers['Permissions-Policy'] = 'geolocation=(), microphone=(), camera=()'
 
         # MK: Mar 2026 - tightened CSP, removed dead tailwindcss CDN ref (#118)
+        # NS May 2026 (#381) — frame-ancestors 'self' instead of 'none' to
+        # match the X-Frame-Options switch above. This is the modern equivalent.
         csp = (
             "default-src 'self'; "
             "script-src 'self' 'unsafe-inline' 'unsafe-eval' "
@@ -224,7 +306,7 @@ def create_app():
             "font-src 'self' data: https://fonts.gstatic.com https://fonts.googleapis.com; "
             "img-src 'self' data: blob:; "
             "connect-src 'self' wss: ws: https://cdn.jsdelivr.net; "
-            "frame-ancestors 'none'; "
+            "frame-ancestors 'self'; "
             "base-uri 'self'; "
             "form-action 'self'"
         )
@@ -235,6 +317,18 @@ def create_app():
         is_https = request.is_secure or (_is_trusted_proxy(request.remote_addr) and request.headers.get('X-Forwarded-Proto') == 'https')
         if is_https:
             response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+
+        # NS: kein Cache fuer API/auth-stuff, sonst leakt session-state via shared
+        # caches (browser-cache nach logout, reverse-proxy mit zu generouser
+        # cache config, browser-back-button mit cred response). semgrep findung
+        # vom 2026-05-06. /static/* darf weiter gecacht werden, das sind die
+        # JS-libs.
+        path = request.path or ''
+        if path.startswith('/api/') or path in ('/', '/portal', '/oidc/callback'):
+            # don't override if a route explicitly set its own Cache-Control
+            if 'Cache-Control' not in response.headers:
+                response.headers['Cache-Control'] = 'no-store, private'
+                response.headers['Pragma'] = 'no-cache'  # http/1.0 fallback, harmless
 
         return response
 

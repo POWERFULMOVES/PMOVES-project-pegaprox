@@ -3,14 +3,30 @@
         // Charts, Gauge, Toast, NodeJoin wizards
         // ═══════════════════════════════════════════════
 
+        // LW May 2026 — picks the layout-appropriate logo at render time.
+        // dark pegasus only when corporate light is active; everywhere else the white pegasus
+        // looks correct against the dark backgrounds. reads body data-attr so it updates
+        // synchronously with the corp-theme toggle.
+        function getLogoSrc() {
+            try {
+                return document.body?.dataset?.corpTheme === 'light'
+                    ? '/images/pegaprox-logo-light.png'
+                    : '/images/pegaprox-logo-dark.png';
+            } catch (_) {
+                return '/images/pegaprox-logo-dark.png';
+            }
+        }
+
         // MK: Apr 2026 - PDF generator with professional template
         // uses jsPDF + autoTable, loaded via CDN with local fallback
+        // NS May 2026 — switched PDF logo to the light variant (dark pegasus on transparent)
+        // because the PDF template is white-paper-on-print
         let _pdfLogoCache = null;
 
         async function _loadPdfLogo() {
             if (_pdfLogoCache) return _pdfLogoCache;
             try {
-                const resp = await fetch('/images/pegaprox.png');
+                const resp = await fetch('/images/pegaprox-logo-light.png');
                 const blob = await resp.blob();
                 return new Promise((resolve) => {
                     const reader = new FileReader();

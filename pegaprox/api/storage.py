@@ -9,6 +9,7 @@ import threading
 import uuid
 import hashlib
 import re
+import shlex  # NS 2026-05-06: für storage-resize ssh commands, semgrep finding
 from datetime import datetime
 from flask import Blueprint, jsonify, request
 
@@ -1799,8 +1800,12 @@ def rescan_storage(cluster_id, storage_id):
                                 
                                 # 2. LVM pvresize (auto-resize PVs to use new LUN size)
                                 if storage_type in ['lvm', 'lvmthin'] and auto_pvresize and vgname:
+                                    # NS 2026-05-06: vgname kommt aus storage.cfg (admin-managed),
+                                    # aber shlex.quote() schadet hier nicht und beruhigt semgrep.
+                                    # falls jemand mal nen vgname mit ; oder backticks reindreht
+                                    # wuerde sonst pvs --select clause kaputtgehen oder schlimmer.
                                     stdin, stdout, stderr = ssh.exec_command(
-                                        f'pvs --noheadings -o pv_name -S vgname={vgname} 2>/dev/null | xargs -r -n1 pvresize 2>&1',
+                                        f'pvs --noheadings -o pv_name -S vgname={shlex.quote(vgname)} 2>/dev/null | xargs -r -n1 pvresize 2>&1',
                                         timeout=60
                                     )
                                     output = stdout.read().decode()
@@ -1816,8 +1821,10 @@ def rescan_storage(cluster_id, storage_id):
                                 # 3. ZFS autoexpand
                                 if storage_type in ['zfspool', 'zfs']:
                                     pool = storage_config.get('pool', storage_id)
+                                    # NS: same defense-in-depth als bei vgname oben
+                                    pool_q = shlex.quote(pool)
                                     stdin, stdout, stderr = ssh.exec_command(
-                                        f'zpool online -e {pool} 2>&1 || zpool scrub {pool} 2>&1',
+                                        f'zpool online -e {pool_q} 2>&1 || zpool scrub {pool_q} 2>&1',
                                         timeout=30
                                     )
                                     exit_code = stdout.channel.recv_exit_status()

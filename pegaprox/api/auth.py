@@ -1145,12 +1145,35 @@ def verify_password_api():
         if 'error' in result:
             return jsonify({'error': 'Invalid password'}), 401
     elif auth_source in ('oidc', 'entra'):
-        # MK: OIDC/Entra users don't have local passwords — re-auth via session validity (#294)
-        # if they have a valid admin session, that's sufficient for sensitive ops
+        # NS May 2026: stolen-cookie replay risk — the original "session valid → accept"
+        # made re-auth a no-op for OIDC users. attacker with the cookie passes the gate
+        # for sensitive ops (delete cluster, rotate creds, etc). step-up via TOTP closes it.
+        # if the user hasn't enrolled TOTP we fail closed and ask them to set it up.
         if user.get('role') != 'admin':
             return jsonify({'error': 'Admin access required'}), 403
-        # session is already validated by @require_auth — accept
-        logging.info(f"[AUTH] OIDC re-auth bypass for admin '{username}' (no local password)")
+        totp_secret = user.get('totp_secret', '')
+        if not totp_secret:
+            # MK: OIDC admins without 2FA cannot perform re-auth-gated ops anymore (#294 follow-up)
+            logging.warning(f"[AUTH] OIDC re-auth blocked for admin '{username}' — no TOTP enrolled")
+            return jsonify({
+                'error': 'Re-authentication requires 2FA for OIDC accounts. Enable TOTP in your account settings first.',
+                'requires_totp_setup': True,
+            }), 403
+        totp_code = (data.get('totp_code') or '').strip()
+        if not totp_code:
+            return jsonify({
+                'error': 'TOTP code required for re-authentication',
+                'requires_totp': True,
+            }), 401
+        try:
+            import pyotp
+            if not pyotp.TOTP(totp_secret).verify(totp_code, valid_window=1):
+                logging.warning(f"[AUTH] OIDC re-auth bad TOTP for admin '{username}'")
+                return jsonify({'error': 'Invalid TOTP code'}), 401
+        except Exception as e:
+            logging.error(f"[AUTH] TOTP verify error for '{username}': {e}")
+            return jsonify({'error': 'TOTP verification failed'}), 500
+        logging.info(f"[AUTH] OIDC re-auth via TOTP for admin '{username}'")
     else:
         return jsonify({'error': 'Password verification not supported for this account type'}), 400
 

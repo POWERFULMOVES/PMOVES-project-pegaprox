@@ -195,6 +195,16 @@ def get_integrated_syslog_events():
 
     sort_by = sort_map.get(request.args.get('sort_by', 'timestamp'), 'timestamp')
     sort_dir = 'asc' if request.args.get('sort_dir', 'desc').lower() == 'asc' else 'desc'
+    # NS: belt-and-braces gegen die SQLi-finding bei semgrep am 2026-05-06.
+    # sort_by ist eh aus dem map.get() mit hardcoded fallback 'timestamp', und
+    # sort_dir aus dem ternary nur asc/desc -- aber semgrep sieht das nicht
+    # weil der validate-step 80 zeilen frueher steht. hier nochmal explizit
+    # damit's am sink offensichtlich ist und ich nicht in einem halben jahr
+    # an dieser stelle nochmal grübeln muss.
+    if sort_by not in sort_map.values():
+        sort_by = 'logs.timestamp'
+    if sort_dir not in ('asc', 'desc'):
+        sort_dir = 'desc'
 
     db_path = os.path.abspath(DB_FILE)
     if not os.path.exists(db_path):

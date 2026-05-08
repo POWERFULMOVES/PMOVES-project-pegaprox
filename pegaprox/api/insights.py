@@ -65,18 +65,28 @@ def _percentile(values, p):
 
 
 def _linear_regression(xs, ys):
-    """Returns (slope, intercept) or (None, None) if insufficient data.
-    xs: list of unix timestamps, ys: list of values."""
+    """Returns (slope, intercept, r_squared) or (None, None, 0.0) on insufficient data.
+    xs: list of unix timestamps, ys: list of values.
+
+    MK: May 2026 (#374) — added R² so callers can distinguish a real trend from
+    noise on a near-stable series. R² is 0 when the regression fits no better
+    than the mean, ~1 when the fit is near-perfect.
+    """
     n = len(xs)
-    if n < 2: return None, None
+    if n < 2: return None, None, 0.0
     mx = sum(xs) / n
     my = sum(ys) / n
     num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
-    den = sum((x - mx) ** 2 for x in xs)
-    if den == 0: return None, my
-    slope = num / den
+    den_x = sum((x - mx) ** 2 for x in xs)
+    den_y = sum((y - my) ** 2 for y in ys)
+    if den_x == 0: return None, my, 1.0 if den_y == 0 else 0.0
+    slope = num / den_x
     intercept = my - slope * mx
-    return slope, intercept
+    if den_y == 0:
+        return slope, intercept, 1.0
+    ss_res = sum((y - (slope * x + intercept)) ** 2 for x, y in zip(xs, ys))
+    r2 = max(0.0, 1.0 - ss_res / den_y)
+    return slope, intercept, r2
 
 
 @bp.route('/api/clusters/<cluster_id>/insights/right-sizing', methods=['GET'])
@@ -285,7 +295,7 @@ def capacity_forecast(cluster_id):
             return
         xs = [s[0] for s in samples]
         ys = [s[1] for s in samples]
-        slope, intercept = _linear_regression(xs, ys)
+        slope, intercept, r2 = _linear_regression(xs, ys)
         current = round(ys[-1], 1)
         # slope is units-per-second; convert to per-day for display
         slope_per_day = round(slope * 86400, 3) if slope is not None else None
@@ -299,8 +309,17 @@ def capacity_forecast(cluster_id):
                 if seconds_to_threshold and seconds_to_threshold > 0:
                     eta_days = round(seconds_to_threshold / 86400, 1)
                     eta_iso = (datetime.now() + timedelta(seconds=seconds_to_threshold)).isoformat()
-                    if eta_days < 7: status = 'critical'
-                    elif eta_days < 30: status = 'warning'
+                    # MK: May 2026 (#374) — gate "warning"/"critical" on actual
+                    # trend confidence. False positives on noisy stable clusters
+                    # came from a tiny slope coincidentally producing an ETA
+                    # below 30d when extrapolated. We now require:
+                    #   • R² >= 0.5 (the regression actually fits the data)
+                    #   • slope_per_day >= 1% of current (the trend is non-trivial
+                    #     relative to the current level — keeps small absolute
+                    #     drifts on small percentages from getting promoted)
+                    is_real_trend = (r2 >= 0.5) and (slope_per_day >= 0.01 * current)
+                    if eta_days < 7: status = 'critical' if is_real_trend else 'trending_up'
+                    elif eta_days < 30: status = 'warning' if is_real_trend else 'trending_up'
                     else: status = 'trending_up'
             elif current >= threshold:
                 status = 'over_threshold'
@@ -310,6 +329,7 @@ def capacity_forecast(cluster_id):
             'metric': label, 'kind': kind,
             'current_pct': current,
             'slope_per_day_pct': slope_per_day,
+            'r_squared': round(r2, 3),
             'threshold_pct': threshold,
             'eta_days': eta_days, 'eta_iso': eta_iso,
             'status': status, 'samples': len(samples),

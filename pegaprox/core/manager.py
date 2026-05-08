@@ -2358,10 +2358,35 @@ class PegaProxManager:
                     pass
             if not via_node:
                 return None
-            cmd = "which ceph >/dev/null 2>&1 && ceph -s --format=json 2>/dev/null || echo NO_CEPH"
+            # MK May 2026 (#xxx, PVE 9.1.9) — old detection swallowed stderr and
+            # collapsed every failure mode (binary missing, keyring perms, sudo
+            # not allowed, ceph daemon down) into a single "NO_CEPH" → silent
+            # "not deployed" log. Now we inspect each step:
+            #   no-binary  → genuinely no ceph on cluster (return None as before)
+            #   cmd-failed → cluster has ceph, but probe couldn't reach it. Surface
+            #                the stderr in 'warnings' so the rolling-update log
+            #                explains what went wrong instead of misclassifying.
+            cmd = (
+                "set +e; "
+                "if ! command -v ceph >/dev/null 2>&1; then echo CEPH_NOT_INSTALLED; exit 0; fi; "
+                "out=$(ceph -s --format=json 2>&1); rc=$?; "
+                "if [ $rc -eq 0 ]; then echo \"$out\"; "
+                "else printf 'CEPH_CMD_FAILED rc=%s\\n' \"$rc\"; echo \"$out\" | head -c 400; fi"
+            )
             out = self._ssh_node_output(via_node, cmd, timeout=15)
-            if not out or 'NO_CEPH' in out:
+            if not out:
+                # SSH itself didn't return anything — distinct from "ceph not deployed"
+                self.logger.debug(f"[CEPH] probe via {via_node} returned no output")
+                return {'status': 'unknown', 'osd_up': 0, 'osd_in': 0, 'pgs': '', 'warnings': ['ceph probe: no SSH output']}
+            if 'CEPH_NOT_INSTALLED' in out:
                 return None
+            if 'CEPH_CMD_FAILED' in out:
+                # Genuine failure with ceph deployed — extract the probe-side message
+                tail = out.split('CEPH_CMD_FAILED', 1)[1].strip()
+                short = (tail.replace('\n', ' ').strip())[:200]
+                self.logger.warning(f"[CEPH] probe failed via {via_node}: {short}")
+                return {'status': 'unknown', 'osd_up': 0, 'osd_in': 0, 'pgs': '',
+                        'warnings': [f'ceph probe failed: {short or "no detail"}']}
             import json as _json
             # sometimes there's a leading banner — pluck the first JSON object
             start = out.find('{')
@@ -6515,18 +6540,64 @@ echo "AGENT_INSTALLED_OK"
             return []
     
     def get_proxmox_ha_groups(self) -> List[Dict]:
-        
+        """Return HA groups in the legacy group shape so the existing UI keeps working.
+
+        MK May 2026 — PVE 9.1.x removed `/cluster/ha/groups` (now returns 500
+        with "ha groups have been migrated to rules") and replaced it with
+        `/cluster/ha/rules`. The hybrid path here tries rules first and
+        translates the node-affinity rule shape back into the group shape
+        the frontend already speaks. Falls back to the legacy endpoint when
+        rules isn't available (PVE 8.x).
+        """
         if not self.is_connected:
             if not self.connect_to_proxmox():
                 return []
-        
+
+        host = self.host
+
+        # 1) Try the new endpoint first (PVE 9.1+).
         try:
-            host = self.host
+            response = self._api_get(f"https://{host}:8006/api2/json/cluster/ha/rules")
+            if response.status_code == 200:
+                rules = response.json().get('data', []) or []
+                groups = []
+                for r in rules:
+                    # Only node-affinity rules map cleanly onto the group concept.
+                    # Other rule types (e.g. resource-affinity / anti-affinity) get
+                    # surfaced via the dedicated Affinity Rules UI when that lands;
+                    # for now they're not exposed via the group view.
+                    if (r.get('type') or '').lower() != 'node-affinity':
+                        continue
+                    groups.append({
+                        'group': r.get('rule', ''),
+                        'nodes': r.get('nodes', ''),
+                        'restricted': 1 if r.get('strict') else 0,
+                        # PVE rules don't carry nofailback — set 0 so the UI keeps the column populated.
+                        'nofailback': 0,
+                        'comment': r.get('comment', ''),
+                        # MK May 2026 — extra fields surfaced read-only so the UI
+                        # can flag rule-only attributes if it wants to.
+                        '_pve_rule_id': r.get('rule', ''),
+                        '_pve_rule_resources': r.get('resources', ''),
+                        '_pve_rule_disable': 1 if r.get('disable') else 0,
+                    })
+                return groups
+            if response.status_code not in (404, 501):
+                # Real error from /rules — don't silently swallow into a fallback
+                self.logger.warning(f"[HA] /cluster/ha/rules returned {response.status_code}: {response.text[:200]}")
+        except Exception as e:
+            self.logger.debug(f"[HA] /cluster/ha/rules probe failed (pre-PVE-9 cluster?): {e}")
+
+        # 2) Legacy fallback for PVE 8.x where /rules doesn't exist yet.
+        try:
             url = f"https://{host}:8006/api2/json/cluster/ha/groups"
             response = self._api_get(url)
-            
             if response.status_code == 200:
-                return response.json().get('data', [])
+                return response.json().get('data', []) or []
+            # On PVE 9.1.x the old endpoint returns 500 "migrated to rules" — log once
+            # and return empty rather than bubble up the misleading error to the UI.
+            if response.status_code == 500 and 'migrated to rules' in (response.text or '').lower():
+                self.logger.info("[HA] /cluster/ha/groups is gone on this cluster (PVE 9.1+); /rules call must have failed earlier")
             return []
         except Exception as e:
             self.logger.error(f"Error getting Proxmox HA groups: {e}")
@@ -7565,21 +7636,26 @@ echo "AGENT_INSTALLED_OK"
             self.logger.info(f"Migrating {vm_type}/{vmid} from {node} to {target_node}" + 
                            (f" (storage: {options.get('targetstorage')})" if options.get('targetstorage') else ""))
             response = self._api_post(url, data=data)
-            
+
             if response.status_code == 200:
                 task_data = response.json()
                 self.logger.info(f"[OK] Migration started for {vmid}, task: {task_data.get('data')}")
+                # MK May 2026 (#375) — drop the no-agent skip-flag on migration so
+                # the IP/disk refresh re-probes once the VM lands on the new node.
+                # Without this the agent shows up on the target but we keep
+                # short-circuiting the probe based on the pre-migration result.
+                self._no_agent_vms.discard(vmid)
                 return {'success': True, 'task': task_data.get('data')}
             else:
                 error_msg = response.text
                 self.logger.error(f"[ERROR] Migration failed: {error_msg}")
                 return {'success': False, 'error': error_msg}
-                
+
         except Exception as e:
             self.logger.error(f"[ERROR] Migration error: {e}")
             return {'success': False, 'error': str(e)}
-    
-    def remote_migrate_vm(self, node: str, vmid: int, vm_type: str, 
+
+    def remote_migrate_vm(self, node: str, vmid: int, vm_type: str,
                           target_endpoint: str, target_storage: str, target_bridge: str,
                           target_vmid: int = None, online: bool = True, 
                           delete_source: bool = True, bwlimit: int = None) -> Dict[str, Any]:
@@ -13890,13 +13966,27 @@ echo DONE""",
             self.logger.debug(f"[IP cache] refresh failed: {e}")
 
     def _ip_refresh_loop(self) -> None:
-        """Background loop that refreshes the IP cache every 30 seconds."""
+        """Background loop that refreshes the IP cache every 30 seconds.
+
+        MK May 2026 (#375) — every 5 min we also drop the entire `_no_agent_vms`
+        skip-list so VMs whose guest agent wasn't ready at the first probe get
+        re-checked. Without this, freshly-added or migrated VMs that booted
+        after the initial probe stayed permanently skipped until restart.
+        """
         if self.stop_event.wait(15):  # 15s initial delay
             return
+        _NO_AGENT_TTL = 300  # 5 minutes
+        last_no_agent_clear = time.time()
         while not self.stop_event.is_set():
             try:
                 if self.is_connected:
                     self.refresh_ip_cache()
+                    now = time.time()
+                    if now - last_no_agent_clear >= _NO_AGENT_TTL:
+                        if self._no_agent_vms:
+                            self.logger.debug(f"[IP refresh] retrying {len(self._no_agent_vms)} previously-skipped agent VMs")
+                            self._no_agent_vms.clear()
+                        last_no_agent_clear = now
             except Exception as e:
                 self.logger.debug(f"[IP refresh loop] error: {e}")
             self.stop_event.wait(30)

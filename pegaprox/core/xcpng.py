@@ -2563,7 +2563,10 @@ class XcpngManager:
 
     def _rrd_fetch(self, path, params=None):
         """Fetch RRD XML from XCP-ng host and parse into rows."""
-        import xml.etree.ElementTree as ET
+        # NS May 2026 — defusedxml: RRD payload is bytes off the wire from the
+        # remote host. Even if we trust the cluster, an attacker who lands on
+        # the network path could inject XXE/entity-expansion payloads. cheap fix.
+        from defusedxml import ElementTree as ET
         import requests as _req
 
         host_url = f"https://{self.host}"
@@ -4105,6 +4108,11 @@ echo DONE""",
 
     def discover_iscsi(self, node, target, port=3260):
         """Probe iSCSI target for available IQNs and LUNs."""
+        # NS May 2026: defusedxml here too — probe_result is whatever the
+        # iSCSI target returned, which is *not* something we control.
+        # hoisted ahead of api.SR.probe() so the outer-except parse path below
+        # (XAPI throws with LUN info — that *is* the common case) can also use ET.
+        from defusedxml import ElementTree as ET
         api, host_ref = self._resolve_host(node)
         if not host_ref:
             return {'success': False, 'error': f'Host {node} not found'}
@@ -4117,7 +4125,6 @@ echo DONE""",
             )
             # probe returns XML - parse IQNs
             iqns = []
-            import xml.etree.ElementTree as ET
             try:
                 root = ET.fromstring(probe_result)
                 for tgt in root.findall('.//TGT'):

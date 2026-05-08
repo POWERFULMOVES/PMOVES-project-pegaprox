@@ -9,6 +9,7 @@ registering blueprints after the first request — plugins can be loaded at runt
 """
 
 import json
+import re
 import sys
 import threading
 import logging
@@ -25,6 +26,10 @@ from pegaprox.utils.auth import require_auth
 from pegaprox.utils.audit import log_audit
 
 bp = Blueprint('plugins', __name__)
+
+# NS May 2026 (#381 pentest) — strict path-segment whitelist for frontend_route
+# values. One segment between slashes; alphanumerics + . _ - only.
+_SAFE_PATH_SEG = re.compile(r'^[A-Za-z0-9_.-]+$')
 
 # in-memory registries — guarded by _plugin_lock to prevent
 # "dictionary changed size during iteration" crashes that made plugins
@@ -258,6 +263,48 @@ def list_plugins():
     for plugin in discovered:
         pid = plugin['_id']
         state = states.get(pid, {})
+        # NS May 2026 (#381) — surface the manifest's frontend hook so the
+        # dashboard can build a plugin tab without core changes per plugin.
+        # Sanitize: route must be a string starting with /api/plugins/<pid>/
+        # so a malicious manifest can't redirect the iframe to an external host.
+        has_frontend = bool(plugin.get('has_frontend', False))
+        raw_route = plugin.get('frontend_route', '')
+        frontend_route = ''
+        # NS May 2026 (#381) — strict route validation. Accept either:
+        #   1. fully-qualified plugin path: /api/plugins/<pid>/api/...
+        #   2. pure relative form: 'ui' or 'admin/dash' → scoped under us
+        # Reject anything else: external URLs, protocol-relative, absolute
+        # paths to other plugins, leading slash, control chars, query/fragment.
+        # NS May 2026 (pentest follow-up) — additionally reject anything with
+        # control chars (CRLF/null/tab), URL semantics (?, #, %, \), or
+        # parent-segment traversal (..). These would otherwise land verbatim
+        # in the iframe src and could enable URL/header injection downstream.
+        def _is_safe_relative_path(s):
+            if not s or not isinstance(s, str): return False
+            if any(ord(c) < 0x20 or ord(c) == 0x7f for c in s): return False
+            for bad in ('?', '#', '%', '\\', '*', ':', ' ', '\t'):
+                if bad in s: return False
+            for seg in s.split('/'):
+                if not seg or seg in ('..', '.'): return False
+                if not _SAFE_PATH_SEG.match(seg): return False
+            return True
+
+        if has_frontend and isinstance(raw_route, str):
+            expected_prefix = f'/api/plugins/{pid}/'
+            if raw_route.startswith(expected_prefix):
+                tail = raw_route[len(expected_prefix):]
+                if _is_safe_relative_path(tail):
+                    frontend_route = raw_route
+                else:
+                    has_frontend = False
+            elif raw_route and _is_safe_relative_path(raw_route):
+                # 'ui' → /api/plugins/<pid>/api/ui — matches register_plugin_route()
+                frontend_route = f'/api/plugins/{pid}/api/{raw_route}'
+            else:
+                has_frontend = False
+        else:
+            # non-string routes (number, dict, list, None) → drop entirely
+            has_frontend = False
         result.append({
             'id': pid,
             'name': plugin.get('name', pid),
@@ -270,6 +317,8 @@ def list_plugins():
             'has_init': plugin.get('_has_init', False),
             'routes': routes_snapshot.get(pid, []),
             'trusted': plugin.get('author', '').startswith('PegaProx'),
+            'has_frontend': has_frontend,
+            'frontend_route': frontend_route,
         })
 
     return jsonify(result)

@@ -16,7 +16,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.9.9--beta-blue" alt="Version"/>
+  <img src="https://img.shields.io/badge/version-0.9.9.1--beta-blue" alt="Version"/>
   <img src="https://img.shields.io/badge/python-3.8+-green" alt="Python"/>
   <img src="https://img.shields.io/badge/license-AGPL--3.0--License-orange" alt="License"/>
 </p>
@@ -29,6 +29,10 @@ PegaProx is a powerful web-based management interface for Proxmox VE and XCP-ng 
 <p align="center">
   <img src="https://pegaprox.com/pictures/pegaprox.png" alt="Dashboard Screenshot" width="800"/>
 </p>
+
+### 🪽 What's in the name?
+
+The name **PegaProx** is inspired by *Pegasus*, the winged horse of Greek mythology, combined with *Prox* as a reference to Proxmox VE. Pegasus symbolises speed, freedom and elegant flight — qualities we aspire to bring to multi-cluster hypervisor management.
 
 ## ❤️ Sponsors
 

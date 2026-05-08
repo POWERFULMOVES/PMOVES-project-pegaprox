@@ -18,7 +18,7 @@ from pegaprox.utils.audit import log_audit
 from pegaprox.utils.rbac import (
     has_permission, filter_clusters_for_user, user_can_access_vm,
 )
-from pegaprox.api.helpers import get_connected_manager, safe_error
+from pegaprox.api.helpers import get_connected_manager, safe_error, check_cluster_access
 
 bp = Blueprint('search', __name__)
 
@@ -671,8 +671,12 @@ def update_vm_tags(cluster_id, vmid):
 @require_auth(perms=['vm.config'])
 def remove_vm_tag(cluster_id, vmid, tag_name):
     """Remove a tag from a VM"""
+    # NS May 2026: tenant ACL — vm.config alone wasn't enough; without this,
+    # any vm.config holder could yank tags off a VM in a cluster they don't own.
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
     tags_db = load_vm_tags()
-    
+
     if cluster_id not in tags_db:
         return jsonify({'error': 'No tags for this cluster'}), 404
     

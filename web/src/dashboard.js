@@ -6645,6 +6645,20 @@
                 }
             }, [activeTab]);
 
+            // NS May 2026 (#381) — eager-load enabled plugins so the dynamic
+            // plugin frontend tabs can render on first paint, not only after
+            // the user clicks the Plugins management tab. Gated on plugins.view
+            // so non-admins still don't see the listing.
+            useEffect(() => {
+                if (!user?.permissions?.includes?.('plugins.view')) return;
+                (async () => {
+                    try {
+                        const res = await authFetch(`${API_URL}/plugins`);
+                        if (res && res.ok) setEnabledPlugins((await res.json()).filter(p => p.enabled && p.loaded));
+                    } catch (e) {}
+                })();
+            }, [user]);
+
             // LW: Feb 2026 - Proxmox Backup Server state
             const [pbsServers, setPbsServers] = useState([]);
             const [selectedPBS, setSelectedPBS] = useState(null);
@@ -11741,9 +11755,9 @@
                                 >
                                     {/* PegaProx Logo */}
                                     <img
-                                        src="/images/pegaprox.png"
+                                        src={getLogoSrc()}
                                         alt="PegaProx"
-                                        className={`${isCorporate ? 'w-6 h-6' : 'w-10 h-10 rounded-xl'} object-contain`}
+                                        className={`${isCorporate ? 'w-8 h-8' : 'w-12 h-12 rounded-xl'} object-contain`}
                                         onError={(e) => {
                                             e.target.style.display = 'none';
                                             e.target.nextSibling.style.display = 'flex';
@@ -12153,12 +12167,32 @@
                     </header>
 
                     {/* LW: Feb 2026 - corporate warning banner */}
+                    {/* NS May 2026 (#380): include affected cluster/node names in the
+                        message so admins know WHICH ones are down. Truncate long lists
+                        with "+N more" so the banner doesn't blow up at scale. */}
                     {isCorporate && !warningBannerDismissed && (() => {
+                        const fmt = (template, vars) => String(template).replace(/\{(\w+)\}/g, (_, k) => vars[k] != null ? vars[k] : '');
+                        const truncateNames = (names, max = 3) => {
+                            if (!names || names.length === 0) return '';
+                            if (names.length <= max) return names.join(', ');
+                            const more = names.length - max;
+                            return fmt(t('andNMore') || '{names}, +{more} more',
+                                       { names: names.slice(0, max).join(', '), more });
+                        };
+
                         const alertMessages = [];
                         const offlineAlerts = Object.values(nodeAlerts || {}).filter(a => a.status === 'offline');
-                        if (offlineAlerts.length > 0) alertMessages.push(`${offlineAlerts.length} node(s) offline`);
+                        if (offlineAlerts.length > 0) {
+                            const names = offlineAlerts.map(a => a.node || a.name).filter(Boolean);
+                            const tpl = t('nodesOfflineNamed') || '{count} node(s) offline: {names}';
+                            alertMessages.push(fmt(tpl, { count: offlineAlerts.length, names: truncateNames(names) }));
+                        }
                         const disconnected = clusters.filter(c => c.connected === false);
-                        if (disconnected.length > 0) alertMessages.push(`${disconnected.length} cluster(s) disconnected`);
+                        if (disconnected.length > 0) {
+                            const names = disconnected.map(c => c.name || c.id).filter(Boolean);
+                            const tpl = t('clustersDisconnectedNamed') || '{count} cluster(s) disconnected: {names}';
+                            alertMessages.push(fmt(tpl, { count: disconnected.length, names: truncateNames(names) }));
+                        }
                         if (alertMessages.length === 0) return null;
                         return (
                             <div className="corp-warning-banner">
@@ -12805,21 +12839,38 @@
                                             ? 'corp-tab-strip'
                                             : 'flex items-center gap-1 p-1 bg-proxmox-card border border-proxmox-border rounded-xl w-fit flex-wrap'
                                         }>
-                                            {[
-                                                { id: 'overview', labelKey: 'overview', icon: Icons.Activity },
-                                                { id: 'resources', labelKey: 'resources', icon: Icons.Server },
-                                                { id: 'datacenter', labelKey: 'datacenter', icon: Icons.HardDrive },
-                                                { id: 'datastore', labelKey: 'datastore', icon: Icons.Database },
-                                                { id: 'automation', labelKey: 'automation', icon: Icons.Zap },
-                                                { id: 'reports', labelKey: 'reports', icon: Icons.BarChart },
-                                                { id: 'compliance', labelKey: 'compliance', icon: Icons.Lock },
-                                                { id: 'site-recovery', labelKey: 'siteRecovery', icon: Icons.Shield },
-                                                { id: 'plugins', labelKey: 'plugins', icon: Icons.Package },
-                                                { id: 'settings', labelKey: 'settings', icon: Icons.Settings },
-                                            ].filter(tab => {
+                                            {(() => {
+                                                // NS May 2026 (#381) — splice plugin frontend tabs between
+                                                // the management Plugins tab and Settings. Plugin tabs only
+                                                // render when the manifest declared has_frontend AND the
+                                                // server normalised frontend_route to /api/plugins/<id>/...
+                                                // (server-side validation in pegaprox/api/plugins.py).
+                                                const pluginFrontendTabs = (enabledPlugins || [])
+                                                    .filter(p => p && p.has_frontend && p.frontend_route)
+                                                    .map(p => ({
+                                                        id: `plugin:${p.id}`,
+                                                        label: p.name || p.id,  // shown verbatim
+                                                        icon: Icons.Package,
+                                                        _plugin: p,
+                                                    }));
+                                                return [
+                                                    { id: 'overview', labelKey: 'overview', icon: Icons.Activity },
+                                                    { id: 'resources', labelKey: 'resources', icon: Icons.Server },
+                                                    { id: 'datacenter', labelKey: 'datacenter', icon: Icons.HardDrive },
+                                                    { id: 'datastore', labelKey: 'datastore', icon: Icons.Database },
+                                                    { id: 'automation', labelKey: 'automation', icon: Icons.Zap },
+                                                    { id: 'reports', labelKey: 'reports', icon: Icons.BarChart },
+                                                    { id: 'compliance', labelKey: 'compliance', icon: Icons.Lock },
+                                                    { id: 'site-recovery', labelKey: 'siteRecovery', icon: Icons.Shield },
+                                                    { id: 'plugins', labelKey: 'plugins', icon: Icons.Package },
+                                                    ...pluginFrontendTabs,
+                                                    { id: 'settings', labelKey: 'settings', icon: Icons.Settings },
+                                                ];
+                                            })().filter(tab => {
                                                 if (tab.id === 'site-recovery') return user?.permissions?.includes('site_recovery.view');
                                                 if (tab.id === 'plugins') return user?.permissions?.includes('plugins.view');
                                                 if (tab.id === 'compliance') return user?.permissions?.includes('admin.audit') || user?.permissions?.includes('node.maintenance');
+                                                if (typeof tab.id === 'string' && tab.id.startsWith('plugin:')) return user?.permissions?.includes('plugins.view');
                                                 return true;
                                             }).map(tab => (
                                                 <button
@@ -12835,7 +12886,7 @@
                                                     }
                                                 >
                                                     <tab.icon className={isCorporate ? 'w-3 h-3' : undefined} />
-                                                    {t(tab.labelKey)}
+                                                    {tab.labelKey ? t(tab.labelKey) : tab.label}
                                                 </button>
                                             ))}
                                         </div>
@@ -15608,6 +15659,53 @@
                                                 )}
                                             </div>
                                         )}
+
+                                        {/* NS May 2026 (#381) — Generic plugin frontend iframe.
+                                            Activated when activeTab matches 'plugin:<id>' for any
+                                            plugin that declared has_frontend in its manifest.
+                                            Security:
+                                              - frontend_route is validated server-side to start with
+                                                /api/plugins/<id>/ — manifest can't redirect off-host
+                                              - sandbox attrs deny top-navigation (clickjacking protection)
+                                                while permitting same-origin fetches the plugin needs
+                                              - referrerpolicy keeps the URL out of cross-origin Referer */}
+                                        {typeof activeTab === 'string' && activeTab.startsWith('plugin:') && (() => {
+                                            const pid = activeTab.slice('plugin:'.length);
+                                            const plugin = (enabledPlugins || []).find(p => p && p.id === pid);
+                                            if (!plugin || !plugin.has_frontend || !plugin.frontend_route) {
+                                                return (
+                                                    <div className="text-center py-12 text-gray-400">
+                                                        <Icons.Package className="w-12 h-12 mx-auto mb-3 opacity-50" />
+                                                        <p>{t('pluginUnavailable') || 'Plugin frontend unavailable'}</p>
+                                                        <p className="text-xs text-gray-600 mt-1">{t('pluginUnavailableDesc') || 'The plugin may have been disabled or unloaded.'}</p>
+                                                    </div>
+                                                );
+                                            }
+                                            // pass the current theme so the plugin can match the dashboard look
+                                            const corpLightActive = (typeof document !== 'undefined') &&
+                                                document.body.dataset.corpTheme === 'light';
+                                            const theme = isCorporate
+                                                ? (corpLightActive ? 'corp-light' : 'corp-dark')
+                                                : 'modern-dark';
+                                            const sep = plugin.frontend_route.includes('?') ? '&' : '?';
+                                            const src = `${plugin.frontend_route}${sep}theme=${encodeURIComponent(theme)}&cluster=${encodeURIComponent(selectedCluster?.id || '')}`;
+                                            return (
+                                                <div style={{
+                                                    margin: isCorporate ? '-8px -12px' : '0 0 -24px',
+                                                    height: 'calc(100vh - 130px)',
+                                                    background: 'var(--proxmox-darker, #0d1117)',
+                                                }}>
+                                                    <iframe
+                                                        key={`${selectedCluster?.id || ''}-${pid}`}
+                                                        src={src}
+                                                        title={plugin.name || pid}
+                                                        sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals allow-downloads"
+                                                        referrerPolicy="same-origin"
+                                                        style={{ width: '100%', height: '100%', border: 'none', display: 'block' }}
+                                                    />
+                                                </div>
+                                            );
+                                        })()}
 
                                         {/* Settings Tab */}
                                         {activeTab === 'settings' && (

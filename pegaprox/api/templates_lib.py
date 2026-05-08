@@ -578,6 +578,11 @@ def deployment_status(dep_id):
         if not r:
             return jsonify({'error': 'not found'}), 404
         d = dict(r)
+        # NS May 2026: tenant ACL — dep_id is opaque to clients but a holder of
+        # cluster.view on cluster A could enumerate deployments belonging to B.
+        # gate the response on the requester's actual access to the originating cluster.
+        ok, err = check_cluster_access(d.get('cluster_id'))
+        if not ok: return err
         return jsonify(d)
     except Exception as e:
         logging.exception('handler error in templates_lib.py'); return jsonify({'error': 'internal error'}), 500

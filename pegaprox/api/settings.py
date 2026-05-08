@@ -3335,10 +3335,17 @@ def check_cluster_updates(cluster_id):
     nodes_failed = sum(1 for r in results.values() if not r.get('success', True))
 
     # MK: Apr 2026 - also check PBS servers (#240)
+    # MK: May 2026 (#376) - respect PBSManager.linked_clusters so a global PBS
+    # set across multiple clusters doesn't bleed into every cluster's update
+    # manager. PBS without linked_clusters set is treated as cluster-agnostic
+    # and still shows everywhere (no breaking change for existing setups).
     pbs_results = {}
     try:
         for pid, pmgr in pbs_managers.items():
             if not pmgr.connected:
+                continue
+            linked = getattr(pmgr, 'linked_clusters', None) or []
+            if linked and cluster_id not in linked:
                 continue
             try:
                 pbs_upd = pmgr.get_apt_updates()

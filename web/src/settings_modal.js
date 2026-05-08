@@ -6777,7 +6777,7 @@
                                     {/* Version Info */}
                                     <div className="bg-proxmox-dark border border-proxmox-border rounded-xl p-6 text-center">
                                         <div className="inline-flex items-center justify-center w-20 h-20 rounded-2xl mb-4">
-                                            <img src="/images/pegaprox.png" alt="PegaProx" className="w-20 h-20 object-contain" />
+                                            <img src={getLogoSrc()} alt="PegaProx" className="w-20 h-20 object-contain" />
                                         </div>
                                         <h2 className="text-3xl font-bold text-white">PegaProx</h2>
                                         <p className="text-xl text-proxmox-orange mt-1">{PEGAPROX_VERSION}</p>

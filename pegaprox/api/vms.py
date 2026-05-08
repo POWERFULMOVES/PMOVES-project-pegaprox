@@ -45,6 +45,30 @@ bp = Blueprint('vms', __name__)
 VNC_PVE_CONNECT_TIMEOUT = int(os.environ.get('PEGAPROX_VNC_CONNECT_TIMEOUT', '15'))
 
 
+# NS 2026-05-06: cluster-add / -join nehmen frei eingegebene node-targets
+# entgegen. Semgrep flagt das als tainted-flask-input -> paramiko.connect.
+# Paramiko's connect() ist zwar nicht shell-injectable, aber wir wollen auch
+# nicht dass jemand der admin.cluster perm hat hier internal network scans
+# triggert via 192.168.1.255 oder so. Strikte regex auf hostname/ipv4/ipv6.
+_HOST_RE = re.compile(r'^(?:'
+                      r'(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?'
+                          r'(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*)'
+                      r'|'
+                      r'(?:\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'
+                      r'|'
+                      r'(?:\[[0-9a-fA-F:]+\])'
+                      r')$')
+
+
+def _validate_host(value):
+    """Return value if it looks like a hostname/IPv4/IPv6, else None.
+    Used at the boundary where flask request input flows into paramiko.connect."""
+    v = (value or '').strip()
+    if not v or len(v) > 253:
+        return None
+    return v if _HOST_RE.match(v) else None
+
+
 def _apply_vnc_socket_options(sock):
     """Apply TCP_NODELAY + aggressive TCP keepalive to a VNC-forwarding socket.
 
@@ -2122,13 +2146,13 @@ def test_node_connection(cluster_id):
         return jsonify({'error': 'SSH not available. Install paramiko: pip install paramiko'}), 500
     
     data = request.get_json() or {}
-    node_ip = data.get('node_ip', '').strip()
+    node_ip = _validate_host(data.get('node_ip', ''))
     username = data.get('username', 'root')
     password = data.get('password', '')
     ssh_port = sanitize_int(data.get('ssh_port', 22), default=22, min_val=1, max_val=65535)
 
     if not node_ip:
-        return jsonify({'success': False, 'error': 'Node IP is required'}), 400
+        return jsonify({'success': False, 'error': 'Node IP is required (must be a valid hostname or IP address)'}), 400
     if not password:
         return jsonify({'success': False, 'error': 'SSH password is required'}), 400
 
@@ -2137,7 +2161,7 @@ def test_node_connection(cluster_id):
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.WarningPolicy())
         ssh.connect(node_ip, port=ssh_port, username=username, password=password, timeout=15)
-        
+
         # Get hostname
         stdin, stdout, stderr = ssh.exec_command('hostname')
         hostname = stdout.read().decode().strip()
@@ -2226,13 +2250,13 @@ def join_node_to_cluster(cluster_id):
     mgr = cluster_managers[cluster_id]
     data = request.get_json() or {}
     
-    node_ip = data.get('node_ip', '').strip()
+    node_ip = _validate_host(data.get('node_ip', ''))
     username = data.get('username', 'root')
     password = data.get('password', '')
     ssh_port = sanitize_int(data.get('ssh_port', 22), default=22, min_val=1, max_val=65535)
     link0_address = data.get('link0_address', '').strip()
     force_rejoin = data.get('force', False)  # LW: Feb 2026 - Clean old cluster config before join
-    
+
     if not node_ip or not password:
         return jsonify({'success': False, 'error': 'Node IP and password are required'}), 400
     

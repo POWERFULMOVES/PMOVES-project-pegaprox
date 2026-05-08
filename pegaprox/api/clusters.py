@@ -1688,26 +1688,49 @@ def create_proxmox_ha_group(cluster_id):
     
     try:
         host = manager.host
-        url = f"https://{host}:8006/api2/json/cluster/ha/groups"
-        
-        payload = {
-            'group': group_name,
-            'nodes': nodes
+        # MK May 2026 — PVE 9.1.x replaced /cluster/ha/groups with /cluster/ha/rules.
+        # Try rules-shape POST first (translated from group fields). On 404/501
+        # fall back to the legacy groups endpoint for PVE 8.x.
+        rules_payload = {
+            'rule': group_name,
+            'type': 'node-affinity',
+            'nodes': nodes,
+            # /rules requires non-empty resources. Caller can specify them
+            # via 'resources' on the request body; otherwise PegaProx passes
+            # whatever the resource picker collected.  If empty PVE will
+            # reject with a clear message, which we surface to the user.
+            'resources': data.get('resources', '') or '',
         }
         if data.get('restricted'):
-            payload['restricted'] = 1
-        if data.get('nofailback'):
-            payload['nofailback'] = 1
+            rules_payload['strict'] = 1
         if data.get('comment'):
-            payload['comment'] = data['comment']
-        
-        resp = manager._api_post(url, data=payload)
-        
+            rules_payload['comment'] = data['comment']
+
+        rules_url = f"https://{host}:8006/api2/json/cluster/ha/rules"
+        resp = manager._api_post(rules_url, data=rules_payload)
+
+        if resp.status_code in (404, 501):
+            # PVE 8.x — legacy groups path
+            legacy_url = f"https://{host}:8006/api2/json/cluster/ha/groups"
+            legacy_payload = {
+                'group': group_name,
+                'nodes': nodes,
+            }
+            if data.get('restricted'):
+                legacy_payload['restricted'] = 1
+            if data.get('nofailback'):
+                legacy_payload['nofailback'] = 1
+            if data.get('comment'):
+                legacy_payload['comment'] = data['comment']
+            resp = manager._api_post(legacy_url, data=legacy_payload)
+
         if resp.status_code == 200:
             usr = getattr(request, 'session', {}).get('user', 'system')
             log_audit(usr, 'ha.group_created', f"HA group '{group_name}' created", cluster=manager.config.name)
             return jsonify({'success': True})
         else:
+            # Pass PVE's own error through — usually informative enough
+            # ("no resources were specified", "duplicate rule name", etc.)
             return jsonify({'error': resp.text}), 400
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Operation failed')}), 500
@@ -1719,17 +1742,20 @@ def create_proxmox_ha_group(cluster_id):
 def delete_proxmox_ha_group(cluster_id, group_name):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
-    
+
     manager, error = get_connected_manager(cluster_id)
     if error:
         return error
-    
+
     try:
         host = manager.host
-        url = f"https://{host}:8006/api2/json/cluster/ha/groups/{group_name}"
-        
-        resp = manager._api_delete(url)
-        
+        # MK May 2026 — same rules-first/groups-fallback as the create path.
+        rules_url = f"https://{host}:8006/api2/json/cluster/ha/rules/{group_name}"
+        resp = manager._api_delete(rules_url)
+        if resp.status_code in (404, 501) or (resp.status_code == 500 and 'no such ha rule' in (resp.text or '').lower()):
+            legacy_url = f"https://{host}:8006/api2/json/cluster/ha/groups/{group_name}"
+            resp = manager._api_delete(legacy_url)
+
         if resp.status_code == 200:
             usr = getattr(request, 'session', {}).get('user', 'system')
             log_audit(usr, 'ha.group_deleted', f"HA group '{group_name}' deleted", cluster=manager.config.name)

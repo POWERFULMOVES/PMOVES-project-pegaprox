@@ -632,4 +632,23 @@
                     <path strokeLinecap="round" strokeWidth={2} d="M21 21l-4.35-4.35M8 11h6" />
                 </svg>
             ),
+            // NS May 2026 — circle alert icon (used in PBS Gap-tab empty state)
+            AlertCircle: ({ className, style } = {}) => (
+                <svg className={className || "w-4 h-4"} style={style} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <circle cx="12" cy="12" r="10" strokeWidth={1.5} />
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 8v4M12 16h.01" />
+                </svg>
+            ),
+            // MK May 2026
+            Keyboard: ({ className, style } = {}) => (
+                <svg className={className || "w-4 h-4"} style={style} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <rect x="2" y="6" width="20" height="12" rx="2" strokeWidth={1.5} />
+                    <path strokeLinecap="round" strokeWidth={1.5} d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M6 14h.01M18 14h.01M9 14h6" />
+                </svg>
+            ),
+            Home: ({ className, style } = {}) => (
+                <svg className={className || "w-4 h-4"} style={style} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M3 12l9-9 9 9M5 10v10a1 1 0 001 1h3a1 1 0 001-1v-5h4v5a1 1 0 001 1h3a1 1 0 001-1V10" />
+                </svg>
+            ),
         };

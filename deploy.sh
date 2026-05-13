@@ -420,6 +420,48 @@ EOF
     [ -d "$INSTALL_DIR/config" ] && chmod 700 "$INSTALL_DIR/config"
     [ -d "$INSTALL_DIR/ssl" ] && chmod 700 "$INSTALL_DIR/ssl"
 
+    # MK May 2026 — master-key bootstrap (Tier-4: /etc/pegaprox/secret.key).
+    # Fresh installs get the key OUTSIDE $INSTALL_DIR/config so a backup of the
+    # config dir doesn't pick up the decryption key. Idempotent: only acts when
+    # no key already exists (neither at the new location nor in the legacy spot).
+    LEGACY_KEY="$INSTALL_DIR/config/.pegaprox.key"
+    SYS_KEY_DIR="/etc/pegaprox"
+    SYS_KEY="$SYS_KEY_DIR/secret.key"
+
+    if [ -f "$SYS_KEY" ]; then
+        print_info "Master key already at $SYS_KEY — leaving untouched"
+    elif [ -f "$LEGACY_KEY" ]; then
+        print_warning "Legacy key at $LEGACY_KEY detected"
+        print_info "  PegaProx will keep using it but emit a deprecation warning."
+        print_info "  Migrate with:  sudo mv \"$LEGACY_KEY\" \"$SYS_KEY\" && sudo chmod 600 \"$SYS_KEY\" && sudo chown root:$SERVICE_GROUP \"$SYS_KEY\""
+    else
+        # No key anywhere — generate the new default at the secure location.
+        mkdir -p "$SYS_KEY_DIR"
+        chmod 700 "$SYS_KEY_DIR"
+        chown "root:$SERVICE_GROUP" "$SYS_KEY_DIR" 2>/dev/null || true
+
+        # 32 raw bytes -> urlsafe-base64. Python is already a hard dep at this
+        # point in the install so we don't need a bash-only fallback.
+        if "$INSTALL_DIR/venv/bin/python3" -c "
+import base64, os, secrets, sys
+key = base64.urlsafe_b64encode(secrets.token_bytes(32))
+fd = os.open('$SYS_KEY', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+try:
+    os.write(fd, key)
+finally:
+    os.close(fd)
+" 2>/dev/null; then
+            chmod 600 "$SYS_KEY"
+            chown "root:$SERVICE_GROUP" "$SYS_KEY" 2>/dev/null || \
+                chown "root:root" "$SYS_KEY"
+            print_success "Generated master key at $SYS_KEY (0600 root:$SERVICE_GROUP)"
+            print_info "  Loader tier: 4 (system-service default — outside $INSTALL_DIR/config)"
+            print_info "  Stronger: wrap with systemd-creds — see docs/SECURITY.md §5"
+        else
+            print_warning "Could not pre-generate $SYS_KEY — PegaProx will fall back to legacy path on first boot"
+        fi
+    fi
+
     # Enable and start service
     systemctl daemon-reload
     systemctl enable pegaprox

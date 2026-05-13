@@ -320,8 +320,8 @@ def get_cluster_nodes(cluster_id):
 
     # Try to get live data
     try:
-        host = manager.host
-        url = f"https://{host}:8006/api2/json/nodes"
+        host, port = manager.host, manager.api_port
+        url = f"https://{host}:{port}/api2/json/nodes"
         r = manager._create_session().get(url, timeout=10)
 
         if r.status_code == 200:
@@ -375,7 +375,7 @@ def delete_cluster(cluster_id):
         try:
             token_user = mgr.config.api_token_user  # e.g. root@pam!pegaprox
             user_part, token_id = token_user.split('!', 1)
-            url = f"https://{mgr.host}:8006/api2/json/access/users/{user_part}/token/{token_id}"
+            url = f"https://{mgr.host}:{mgr.api_port}/api2/json/access/users/{user_part}/token/{token_id}"
             resp = mgr._create_session().delete(url, timeout=10)
             if resp.status_code == 200:
                 logging.info(f"Revoked API token {token_user} on PVE")
@@ -517,6 +517,241 @@ def get_cluster_metrics(cluster_id):
     
     # Return error with empty metrics - frontend will keep old data
     return jsonify({'error': 'Connection temporarily unavailable', 'offline': True}), 503
+
+
+# NS May 2026 — single-number cluster health score (0-100). Inputs are cheap-to-compute
+# stuff we already pull elsewhere: node status, per-node storages, replication, backup-SLA.
+# The drill-down list lets the user see what dragged the score down.
+@bp.route('/api/clusters/<cluster_id>/health', methods=['GET'])
+@require_auth(perms=['cluster.view'])
+def get_cluster_health(cluster_id):
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+
+    mgr = cluster_managers[cluster_id]
+    score = 100
+    factors = []
+    issues = []
+
+    # Connectivity gate — if API isn't reachable, everything else is moot
+    if not mgr.is_connected:
+        return jsonify({
+            'score': 0,
+            'band': 'critical',
+            'factors': [{'key': 'api', 'label': 'API connectivity', 'value': 'disconnected', 'delta': -100}],
+            'issues': ['Cluster API not reachable'],
+            'computed_at': None,
+        })
+
+    # 1) Nodes online
+    try:
+        ns = mgr.get_node_status() or {}
+    except Exception:
+        ns = {}
+    total_nodes = len(ns)
+    online_nodes = sum(1 for n in ns.values() if (n.get('status') in ('online', 'running') or not n.get('offline')))
+    if total_nodes:
+        offline = total_nodes - online_nodes
+        delta = -25 * offline
+        score += delta
+        factors.append({
+            'key': 'nodes', 'label': 'Nodes online',
+            'value': f'{online_nodes}/{total_nodes}', 'delta': delta,
+            'severity': 'critical' if offline else 'ok',
+        })
+        if offline:
+            offline_names = [name for name, d in ns.items()
+                             if d.get('status') == 'offline' or d.get('offline')]
+            issues.append(f'{offline} node(s) offline: {", ".join(offline_names) or "?"}')
+
+    # 2) Storage pressure — worst-offender across all nodes
+    worst_pct = 0.0
+    worst_label = None
+    try:
+        for node_name in ns.keys():
+            try:
+                stors = mgr.get_storage_list(node_name) or []
+            except Exception:
+                stors = []
+            for s in stors:
+                if not s.get('active'):
+                    continue
+                total = s.get('total') or 0
+                used = s.get('used') or 0
+                if total <= 0:
+                    continue
+                pct = (used / total) * 100.0
+                if pct > worst_pct:
+                    worst_pct = pct
+                    worst_label = f"{s.get('storage', '?')} @ {node_name}"
+    except Exception as e:
+        logging.debug(f"[health] storage scan failed: {e}")
+    if worst_label is not None:
+        if worst_pct >= 95:
+            d = -25
+        elif worst_pct >= 90:
+            d = -15
+        elif worst_pct >= 80:
+            d = -5
+        else:
+            d = 0
+        score += d
+        factors.append({
+            'key': 'storage', 'label': 'Worst storage',
+            'value': f'{worst_label} ({worst_pct:.0f}%)', 'delta': d,
+            'severity': 'critical' if worst_pct >= 95 else 'warning' if worst_pct >= 80 else 'ok',
+        })
+        if worst_pct >= 90:
+            issues.append(f'Storage near full: {worst_label} at {worst_pct:.0f}%')
+
+    # 3) Replication — failed jobs hurt
+    try:
+        repl = mgr.get_replication_status() or []
+    except Exception:
+        repl = []
+    if repl:
+        # PVE flags failures via 'fail_count' or non-zero error
+        failed = sum(1 for r in repl if (r.get('fail_count') or 0) > 0 or r.get('error'))
+        d = max(-20, -5 * failed)
+        score += d
+        factors.append({
+            'key': 'replication', 'label': 'Replication',
+            'value': f'{failed} failing / {len(repl)} jobs',
+            'delta': d,
+            'severity': 'warning' if failed else 'ok',
+        })
+        if failed:
+            issues.append(f'{failed} replication job(s) failing')
+
+    # 4) Backup-SLA — only if admin set a max-age threshold on the cluster
+    try:
+        db = get_db()
+        row = db.conn.cursor().execute(
+            "SELECT backup_sla_max_age_hours FROM clusters WHERE id = ?", (cluster_id,)
+        ).fetchone()
+        max_age = (dict(row).get('backup_sla_max_age_hours') if row else None) or 0
+    except Exception:
+        max_age = 0
+    if max_age and max_age > 0:
+        # Pull the most-recent backup timestamp via cluster/backup-info — cheap call
+        try:
+            import time as _t
+            now = _t.time()
+            url = f"https://{mgr.host}:{mgr.api_port}/api2/json/cluster/backup-info/not-backed-up"
+            r = mgr._api_get(url)
+            stale = 0
+            if r is not None and r.status_code == 200:
+                stale = len(r.json().get('data') or [])
+            d = -10 if stale else 0
+            score += d
+            factors.append({
+                'key': 'backup_sla', 'label': 'Backup SLA',
+                'value': f'{stale} VM(s) past RPO ({max_age}h)' if stale else 'within RPO',
+                'delta': d,
+                'severity': 'warning' if stale else 'ok',
+            })
+            if stale:
+                issues.append(f'{stale} VMs past backup RPO of {max_age}h')
+        except Exception as e:
+            logging.debug(f"[health] backup-sla check failed: {e}")
+
+    # Clamp & band
+    score = max(0, min(100, score))
+    if score >= 90:
+        band = 'excellent'
+    elif score >= 70:
+        band = 'good'
+    elif score >= 50:
+        band = 'warning'
+    elif score >= 30:
+        band = 'degraded'
+    else:
+        band = 'critical'
+
+    import datetime as _dt
+    return jsonify({
+        'score': score,
+        'band': band,
+        'factors': factors,
+        'issues': issues,
+        'computed_at': _dt.datetime.utcnow().isoformat() + 'Z',
+    })
+
+
+# MK May 2026 — API latency dashboard backing endpoint. Reads the deque the
+# manager populates on every Proxmox API roundtrip. Cheap: in-memory only.
+@bp.route('/api/clusters/<cluster_id>/api-latency', methods=['GET'])
+@require_auth(perms=['cluster.view'])
+def get_cluster_api_latency(cluster_id):
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+
+    mgr = cluster_managers[cluster_id]
+    samples = list(getattr(mgr, '_api_latency', []) or [])
+    if not samples:
+        return jsonify({
+            'samples': 0,
+            'p50': 0, 'p95': 0, 'p99': 0, 'avg': 0, 'max': 0,
+            'error_rate': 0,
+            'recent': [],
+            'by_endpoint': [],
+        })
+
+    # window: only consider last 5 min for headline stats; recent for sparkline
+    import time as _t
+    now = _t.time()
+    window = [s for s in samples if (now - s.get('ts', 0)) <= 300]
+    if not window:
+        window = samples[-50:]
+
+    durations = sorted(s['duration_ms'] for s in window)
+    n = len(durations)
+    def pct(q):
+        idx = max(0, min(n - 1, int(n * q)))
+        return round(durations[idx], 1)
+    avg = round(sum(durations) / n, 1)
+    mx = round(durations[-1], 1)
+    errs = sum(1 for s in window if (s.get('status') or 0) >= 400 or s.get('status') == 0)
+
+    by_ep = {}
+    for s in window:
+        ep = s.get('endpoint') or '?'
+        e = by_ep.setdefault(ep, {'endpoint': ep, 'count': 0, 'total_ms': 0.0,
+                                   'max_ms': 0.0, 'errors': 0})
+        d = float(s.get('duration_ms') or 0)
+        e['count'] += 1
+        e['total_ms'] += d
+        if d > e['max_ms']:
+            e['max_ms'] = d
+        if (s.get('status') or 0) >= 400 or s.get('status') == 0:
+            e['errors'] += 1
+    by_ep_list = sorted(by_ep.values(), key=lambda x: -x['total_ms'])[:12]
+    for e in by_ep_list:
+        e['avg_ms'] = round(e['total_ms'] / e['count'], 1)
+        e['max_ms'] = round(e['max_ms'], 1)
+        e['total_ms'] = round(e['total_ms'], 1)
+
+    # last ~30 samples for sparkline
+    recent = [{'ts': s['ts'], 'duration_ms': round(s['duration_ms'], 1),
+               'status': s.get('status', 0), 'method': s.get('method', '?')}
+              for s in samples[-30:]]
+
+    return jsonify({
+        'samples': n,
+        'window_seconds': 300,
+        'p50': pct(0.5), 'p95': pct(0.95), 'p99': pct(0.99),
+        'avg': avg, 'max': mx,
+        'error_rate': round((errs / n) * 100.0, 1) if n else 0,
+        'recent': recent,
+        'by_endpoint': by_ep_list,
+    })
+
 
 @bp.route('/api/clusters/<cluster_id>/resources', methods=['GET'])
 @require_auth()
@@ -1129,15 +1364,15 @@ def get_backup_sla(cluster_id):
     # 2) most-recent backup ts per (vmtype, vmid) across local backup storages
     last_backup = {}  # (type, vmid) -> {'ts': int, 'source': 'local|pbs', 'volid': str}
     try:
-        host = mgr.host
+        host, port = mgr.host, mgr.api_port
         sess = mgr._create_session()
         # discover unique nodes
-        nodes_resp = sess.get(f"https://{host}:8006/api2/json/nodes", timeout=10)
+        nodes_resp = sess.get(f"https://{host}:{port}/api2/json/nodes", timeout=10)
         nodes = [n['node'] for n in (nodes_resp.json().get('data') or []) if n.get('status') == 'online'] if nodes_resp.status_code == 200 else []
         seen_storages = set()
         for node in nodes:
             try:
-                stor_resp = sess.get(f"https://{host}:8006/api2/json/nodes/{node}/storage", timeout=10)
+                stor_resp = sess.get(f"https://{host}:{port}/api2/json/nodes/{node}/storage", timeout=10)
                 if stor_resp.status_code != 200:
                     continue
                 for st in stor_resp.json().get('data') or []:
@@ -1149,7 +1384,7 @@ def get_backup_sla(cluster_id):
                     seen_storages.add((node, sname))
                     try:
                         c_resp = sess.get(
-                            f"https://{host}:8006/api2/json/nodes/{node}/storage/{sname}/content",
+                            f"https://{host}:{port}/api2/json/nodes/{node}/storage/{sname}/content",
                             params={'content': 'backup'}, timeout=(5, 30))
                     except Exception:
                         continue
@@ -1687,7 +1922,7 @@ def create_proxmox_ha_group(cluster_id):
         return jsonify({'error': 'group and nodes required'}), 400
     
     try:
-        host = manager.host
+        host, port = manager.host, manager.api_port
         # MK May 2026 — PVE 9.1.x replaced /cluster/ha/groups with /cluster/ha/rules.
         # Try rules-shape POST first (translated from group fields). On 404/501
         # fall back to the legacy groups endpoint for PVE 8.x.
@@ -1706,12 +1941,12 @@ def create_proxmox_ha_group(cluster_id):
         if data.get('comment'):
             rules_payload['comment'] = data['comment']
 
-        rules_url = f"https://{host}:8006/api2/json/cluster/ha/rules"
+        rules_url = f"https://{host}:{port}/api2/json/cluster/ha/rules"
         resp = manager._api_post(rules_url, data=rules_payload)
 
         if resp.status_code in (404, 501):
             # PVE 8.x — legacy groups path
-            legacy_url = f"https://{host}:8006/api2/json/cluster/ha/groups"
+            legacy_url = f"https://{host}:{port}/api2/json/cluster/ha/groups"
             legacy_payload = {
                 'group': group_name,
                 'nodes': nodes,
@@ -1748,12 +1983,12 @@ def delete_proxmox_ha_group(cluster_id, group_name):
         return error
 
     try:
-        host = manager.host
+        host, port = manager.host, manager.api_port
         # MK May 2026 — same rules-first/groups-fallback as the create path.
-        rules_url = f"https://{host}:8006/api2/json/cluster/ha/rules/{group_name}"
+        rules_url = f"https://{host}:{port}/api2/json/cluster/ha/rules/{group_name}"
         resp = manager._api_delete(rules_url)
         if resp.status_code in (404, 501) or (resp.status_code == 500 and 'no such ha rule' in (resp.text or '').lower()):
-            legacy_url = f"https://{host}:8006/api2/json/cluster/ha/groups/{group_name}"
+            legacy_url = f"https://{host}:{port}/api2/json/cluster/ha/groups/{group_name}"
             resp = manager._api_delete(legacy_url)
 
         if resp.status_code == 200:

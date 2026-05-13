@@ -75,11 +75,11 @@ def _fetch_state(mgr, cluster_id):
     """Return list of (kind, scope, snapshot_dict). Robust to per-call fails;
     a single dead node shouldn't poison the whole snapshot."""
     out = []
-    host = mgr.host
+    host, port = mgr.host, mgr.api_port
 
     # cluster options
     try:
-        r = mgr._api_get(f"https://{host}:8006/api2/json/cluster/options")
+        r = mgr._api_get(f"https://{host}:{port}/api2/json/cluster/options")
         if r is not None and getattr(r, 'status_code', 0) == 200:
             data = r.json().get('data') or {}
             out.append(('cluster_options', 'global', data))
@@ -88,7 +88,7 @@ def _fetch_state(mgr, cluster_id):
 
     # storage configs (cluster-wide)
     try:
-        r = mgr._api_get(f"https://{host}:8006/api2/json/storage")
+        r = mgr._api_get(f"https://{host}:{port}/api2/json/storage")
         if r is not None and getattr(r, 'status_code', 0) == 200:
             for s in (r.json().get('data') or []):
                 sid = s.get('storage')
@@ -106,7 +106,7 @@ def _fetch_state(mgr, cluster_id):
         nodes = []
     for node in nodes:
         try:
-            r = mgr._api_get(f"https://{host}:8006/api2/json/nodes/{node}/network")
+            r = mgr._api_get(f"https://{host}:{port}/api2/json/nodes/{node}/network")
             if r is None or getattr(r, 'status_code', 0) != 200:
                 continue
             for nic in (r.json().get('data') or []):
@@ -125,7 +125,7 @@ def _fetch_state(mgr, cluster_id):
             node = r.get('node')
             if t not in ('qemu', 'lxc') or not vmid or not node:
                 continue
-            url = f"https://{host}:8006/api2/json/nodes/{node}/{t}/{vmid}/config"
+            url = f"https://{host}:{port}/api2/json/nodes/{node}/{t}/{vmid}/config"
             try:
                 resp = mgr._api_get(url)
                 if resp is None or getattr(resp, 'status_code', 0) != 200:

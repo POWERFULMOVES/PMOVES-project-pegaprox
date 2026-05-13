@@ -5,11 +5,15 @@ import time
 import os
 import logging
 import re
-import sqlite3
+import sqlite3  # kept for Row + type re-exports
 import threading
 from urllib.parse import urlparse
 from datetime import datetime, timedelta
 from flask import Blueprint, jsonify, request
+
+# MK May 2026 — direct DB connections must go through dbcrypto so SQLCipher
+# unlocks the encrypted DB with the master key.
+from pegaprox.core import dbcrypto
 
 from pegaprox.constants import *
 from pegaprox.globals import *
@@ -104,6 +108,7 @@ def _syslog_cluster_hostnames(cluster_id):
             hostnames.update(_syslog_hostname_tokens(node_name))
 
     return hostnames
+
 
 @bp.route('/api/reports/summary', methods=['GET'])
 @require_auth()
@@ -270,8 +275,9 @@ def get_integrated_syslog_events():
     params = []
     joins = []
 
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
+    # MK May 2026: route via dbcrypto so SQLCipher handshake runs first.
+    conn = dbcrypto.connect(db_path)
+    conn.row_factory = dbcrypto.Row
     conn.execute("PRAGMA temp_store=MEMORY")
     fts_available = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'logs_fts'"

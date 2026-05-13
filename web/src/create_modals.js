@@ -129,7 +129,9 @@
                 cpu: 'host',
                 bios: 'seabios',
                 machine: 'i440fx',
-                scsihw: 'virtio-scsi-pci',
+                // NS May 2026 — virtio-scsi-single is the modern PVE default
+                // (one controller per disk → own IO thread, better perf)
+                scsihw: 'virtio-scsi-single',
                 vga: 'std',
                 agent: true,
                 efi_storage: '',     // Storage for EFI disk
@@ -1639,19 +1641,119 @@
                 }
             };
 
+            // NS May 2026: Corporate path got a corporate chrome upgrade.
+            // The previous setup mixed corp-modal-header with bg-proxmox-card
+            // outer + Modern-styled steps/footer, which looked unfinished
+            // under the Corporate light theme. Both code paths are kept
+            // explicit (isCorporate vs Modern) so they don't tangle.
+            if (isCorporate) {
+                return (
+                    <div className="corp-vm-modal-overlay">
+                        <div className="corp-vm-modal" style={{ maxWidth: '760px' }}>
+                            <div className="corp-vm-modal-header">
+                                <div className="corp-vm-modal-header-left">
+                                    <span className={`corp-vm-type-pill ${isQemu ? '' : 'lxc'}`}>{isQemu ? 'VM' : 'CT'}</span>
+                                    <div className="corp-vm-modal-title-block">
+                                        <h2 className="corp-vm-modal-title">
+                                            {isQemu ? (t('createVm') || 'Create VM') : (t('createContainer') || 'Create Container')}
+                                        </h2>
+                                        <div className="corp-vm-modal-meta">
+                                            <span>{isQemu ? 'QEMU/KVM' : 'LXC'}</span>
+                                            <span className="corp-meta-sep">·</span>
+                                            <span>{t('step') || 'Step'} {activeStep + 1} / {steps.length}</span>
+                                            {nextVmid && (
+                                                <>
+                                                    <span className="corp-meta-sep">·</span>
+                                                    <span>{t('vmid') || 'VMID'} {nextVmid}</span>
+                                                </>
+                                            )}
+                                        </div>
+                                    </div>
+                                </div>
+                                <div className="corp-vm-modal-actions">
+                                    <button onClick={onClose} className="corp-vm-btn corp-vm-btn-ghost">
+                                        {t('close') || 'Close'}
+                                    </button>
+                                </div>
+                            </div>
+
+                            {nodes.length === 0 && (
+                                <div className="corp-vm-modal-warning">
+                                    <Icons.AlertTriangle className="w-3.5 h-3.5" />
+                                    <span>{t('noNodesAvailable') || 'No nodes available. Please wait for cluster data to load.'}</span>
+                                </div>
+                            )}
+
+                            {/* Steps as a numbered stepper, corporate flat style */}
+                            <div className="corp-vm-stepper">
+                                {steps.map((step, idx) => {
+                                    const cls = idx === activeStep ? 'active' : (idx < activeStep ? 'done' : 'todo');
+                                    return (
+                                        <button
+                                            key={step}
+                                            onClick={() => setActiveStep(idx)}
+                                            className={`corp-vm-step ${cls}`}
+                                            disabled={idx > activeStep}
+                                        >
+                                            <span className="corp-vm-step-num">{idx < activeStep ? '✓' : idx + 1}</span>
+                                            <span className="corp-vm-step-label">{step}</span>
+                                            {idx < steps.length - 1 && <span className="corp-vm-step-line" />}
+                                        </button>
+                                    );
+                                })}
+                            </div>
+
+                            <div className="corp-vm-modal-body" style={{ minHeight: '320px' }}>
+                                {storageList.length === 0 && config.node && (
+                                    <p style={{ fontSize: '11.5px', color: 'var(--corp-text-muted)', margin: '0 0 12px' }}>
+                                        {t('loadingStorage') || 'Loading storage list...'} ({t('node') || 'Node'}: {config.node})
+                                    </p>
+                                )}
+                                {renderStepContent()}
+                            </div>
+
+                            {/* NS May 2026 — Cancel left, Back+Next right.
+                                Was Cancel directly next to Next which is a misclick footgun. */}
+                            <div className="corp-vm-modal-footer">
+                                <button onClick={onClose} className="corp-vm-btn corp-vm-btn-ghost">
+                                    {t('cancel') || 'Cancel'}
+                                </button>
+                                <div style={{ display: 'flex', gap: '8px' }}>
+                                    <button
+                                        onClick={() => setActiveStep(Math.max(0, activeStep - 1))}
+                                        disabled={activeStep === 0}
+                                        className="corp-vm-btn corp-vm-btn-ghost"
+                                    >
+                                        {t('back') || 'Back'}
+                                    </button>
+                                    {activeStep < steps.length - 1 ? (
+                                        <button
+                                            onClick={() => { if (validateStep(activeStep)) setActiveStep(activeStep + 1); }}
+                                            className="corp-vm-btn corp-vm-btn-primary"
+                                        >
+                                            {t('next') || 'Next'}
+                                        </button>
+                                    ) : (
+                                        <button
+                                            onClick={handleCreate}
+                                            disabled={loading || (!isQemu && !config.template)}
+                                            className="corp-vm-btn corp-vm-btn-create"
+                                        >
+                                            {loading && <Icons.RotateCw className="w-3.5 h-3.5" />}
+                                            {isQemu ? (t('createVm') || 'Create VM') : (t('createContainer') || 'Create Container')}
+                                        </button>
+                                    )}
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                );
+            }
+
             return (
                 <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80">
-                    <div className={`w-full max-w-2xl bg-proxmox-card border border-proxmox-border shadow-2xl overflow-hidden ${isCorporate ? 'rounded' : 'rounded-xl animate-scale-in'}`}>
+                    <div className="w-full max-w-2xl bg-proxmox-card border border-proxmox-border shadow-2xl overflow-hidden rounded-xl animate-scale-in">
                         {/* Header */}
-                        {isCorporate ? (
-                        <div className="corp-modal-header">
-                            <span className="corp-modal-title" style={{display:'flex',alignItems:'center',gap:'8px'}}>
-                                {isQemu ? <Icons.VM className="w-4 h-4" style={{color:'var(--corp-accent)'}} /> : <Icons.Container className="w-4 h-4" style={{color:'#9b59b6'}} />}
-                                {isQemu ? t('createVm') : t('createContainer')}
-                            </span>
-                            <button className="corp-modal-close" onClick={onClose}><Icons.X className="w-4 h-4" /></button>
-                        </div>
-                        ) : (
                         <div className="flex items-center justify-between border-b border-proxmox-border bg-proxmox-dark px-6 py-4">
                             <div className="flex items-center gap-3">
                                 <div className={`p-2 rounded-lg ${isQemu ? 'bg-blue-500/10' : 'bg-purple-500/10'}`}>
@@ -1665,7 +1767,6 @@
                                 <Icons.X />
                             </button>
                         </div>
-                        )}
 
                         {/* No nodes warning */}
                         {nodes.length === 0 && (
@@ -1675,7 +1776,7 @@
                                 </p>
                             </div>
                         )}
-                        
+
                         {/* Debug info */}
                         {storageList.length === 0 && config.node && (
                             <div className="px-6 pt-2">
@@ -1708,17 +1809,18 @@
                         </div>
 
                         {/* Footer */}
+                        {/* NS May 2026 — Cancel left, Back+Next right (misclick safety) */}
                         <div className="flex items-center justify-between px-6 py-4 border-t border-proxmox-border bg-proxmox-dark">
-                            <button
-                                onClick={() => setActiveStep(Math.max(0, activeStep - 1))}
-                                disabled={activeStep === 0}
-                                className="px-4 py-2 text-gray-400 hover:text-white disabled:opacity-50 disabled:cursor-not-allowed"
-                            >
-                                {t('back')}
+                            <button onClick={onClose} className="px-4 py-2 text-gray-300 hover:text-white">
+                                {t('cancel')}
                             </button>
                             <div className="flex gap-3">
-                                <button onClick={onClose} className="px-4 py-2 text-gray-300 hover:text-white">
-                                    {t('cancel')}
+                                <button
+                                    onClick={() => setActiveStep(Math.max(0, activeStep - 1))}
+                                    disabled={activeStep === 0}
+                                    className="px-4 py-2 text-gray-400 hover:text-white disabled:opacity-50 disabled:cursor-not-allowed"
+                                >
+                                    {t('back')}
                                 </button>
                                 {activeStep < steps.length - 1 ? (
                                     <button
@@ -1762,14 +1864,14 @@
                     if (rc.cluster_type === 'xcpng') {
                         setXcpConfig(prev => ({ ...prev, name: rc.name || '', host: rc.host || '', user: rc.user || '', pass: '', ssl_verification: rc.ssl_verification || false, migration_threshold: rc.migration_threshold || 20, check_interval: rc.check_interval || 300, auto_migrate: rc.auto_migrate || false, dry_run: rc.dry_run || false }));
                     } else {
-                        setConfig(prev => ({ ...prev, name: rc.name || '', host: rc.host || '', user: rc.user || '', pass: '', ssl_verification: rc.ssl_verification || false, migration_threshold: rc.migration_threshold || 20, migration_tolerance: rc.migration_tolerance || 10, check_interval: rc.check_interval || 300, auto_migrate: rc.auto_migrate || false, balance_containers: rc.balance_containers || false, balance_local_disks: rc.balance_local_disks || false, dry_run: rc.dry_run || false, ssh_key: '' }));
+                        setConfig(prev => ({ ...prev, name: rc.name || '', host: rc.host || '', api_port: rc.api_port || 8006, user: rc.user || '', pass: '', ssl_verification: rc.ssl_verification || false, migration_threshold: rc.migration_threshold || 20, migration_tolerance: rc.migration_tolerance || 10, check_interval: rc.check_interval || 300, auto_migrate: rc.auto_migrate || false, balance_containers: rc.balance_containers || false, balance_local_disks: rc.balance_local_disks || false, dry_run: rc.dry_run || false, ssh_key: '' }));
                     }
                 }
             }, [isOpen, initialType, reconfigureConfig]);
             
             // Proxmox config
             const [config, setConfig] = useState({
-                name: '', host: '', user: 'root@pam', pass: '',
+                name: '', host: '', api_port: 8006, user: 'root@pam', pass: '',
                 ssl_verification: false, migration_threshold: 20, migration_tolerance: 10, check_interval: 300,
                 auto_migrate: false, balance_containers: false, balance_local_disks: false,
                 dry_run: false, ssh_key: '',
@@ -1824,7 +1926,7 @@
                                     { id: 'proxmox', label: 'Proxmox VE', icon: Icons.Server, active: 'bg-orange-500/20 text-orange-400 border-orange-500/40', inactive: 'bg-proxmox-dark text-gray-500 border-transparent hover:text-gray-300 hover:border-proxmox-border' },
                                     { id: 'xcpng', label: 'XCP-ng (TP)', icon: Icons.Cpu, active: 'bg-cyan-500/20 text-cyan-400 border-cyan-500/40', inactive: 'bg-proxmox-dark text-gray-500 border-transparent hover:text-gray-300 hover:border-proxmox-border' },
                                     { id: 'pbs', label: 'PBS', icon: Icons.Shield, active: 'bg-blue-500/20 text-blue-400 border-blue-500/40', inactive: 'bg-proxmox-dark text-gray-500 border-transparent hover:text-gray-300 hover:border-proxmox-border' },
-                                    { id: 'vmware', label: 'ESXi / vCenter', icon: Icons.Cloud, active: 'bg-emerald-500/20 text-emerald-400 border-emerald-500/40', inactive: 'bg-proxmox-dark text-gray-500 border-transparent hover:text-gray-300 hover:border-proxmox-border' },
+                                    { id: 'vmware', label: 'ESXi', icon: Icons.Cloud, active: 'bg-emerald-500/20 text-emerald-400 border-emerald-500/40', inactive: 'bg-proxmox-dark text-gray-500 border-transparent hover:text-gray-300 hover:border-proxmox-border' },
                                 ].map(tab => (
                                     <button
                                         key={tab.id}
@@ -1861,6 +1963,19 @@
                                     <input type="text" value={config.host} onChange={e => setConfig({...config, host: e.target.value})} required
                                         className="w-full px-4 py-2.5 bg-proxmox-dark border border-proxmox-border rounded-lg text-white placeholder-gray-500 focus:outline-none focus:border-proxmox-orange transition-colors"
                                         placeholder="proxmox.example.com" />
+                                </div>
+                            </div>
+                            {/* MK May 2026 — API-port override. Default 8006; override only if your PVE listens elsewhere.
+                                We never go through a reverse proxy — direct TLS to PVE, no MitM-able middlebox. */}
+                            <div className="grid grid-cols-2 gap-4">
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-300 mb-2">{t('apiPort') || 'Proxmox API Port'}</label>
+                                    <input type="number" value={config.api_port}
+                                        onChange={e => setConfig({...config, api_port: parseInt(e.target.value) || 8006})}
+                                        min="1" max="65535"
+                                        className="w-full px-4 py-2.5 bg-proxmox-dark border border-proxmox-border rounded-lg text-white placeholder-gray-500 focus:outline-none focus:border-proxmox-orange transition-colors"
+                                        placeholder="8006" />
+                                    <p className="mt-1 text-xs text-gray-500">{t('apiPortHint') || 'Default 8006. Override only if PVE listens on a non-standard port. Direct TLS only — no reverse-proxy support.'}</p>
                                 </div>
                             </div>
                             <div className="grid grid-cols-2 gap-4">
@@ -2501,69 +2616,83 @@
             };
             
             if (!isOpen) return null;
-            
+
+            // LW: corporate corporate chrome – flat tabs, soft borders, no orange
+            const overlayCls = isCorporate
+                ? "corp-vm-modal-overlay"
+                : "fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/80";
+            const panelCls = isCorporate
+                ? "corp-vm-modal"
+                : "w-full max-w-2xl max-h-[90vh] bg-proxmox-card border border-proxmox-border rounded-2xl shadow-2xl overflow-hidden flex flex-col";
+            const tabsWrapCls = isCorporate ? "corp-vm-modal-tabs" : "flex border-b border-proxmox-border";
+            const tabCls = (active) => isCorporate
+                ? `corp-vm-modal-tab${active ? ' active' : ''}`
+                : `flex-1 px-4 py-3 text-sm font-medium transition-colors flex items-center justify-center gap-2 ${active ? 'text-proxmox-orange border-b-2 border-proxmox-orange' : 'text-gray-400 hover:text-white'}`;
+
             return(
-                <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/80" onClick={onClose}>
-                    <div 
-                        className="w-full max-w-2xl max-h-[90vh] bg-proxmox-card border border-proxmox-border rounded-2xl shadow-2xl overflow-hidden flex flex-col"
+                <div className={overlayCls} onClick={onClose}>
+                    <div
+                        className={panelCls}
                         onClick={e => e.stopPropagation()}
+                        style={isCorporate ? {maxWidth: '760px', width: '100%'} : undefined}
                     >
                         {/* Header */}
-                        <div className="flex items-center justify-between p-6 border-b border-proxmox-border">
-                            <div className="flex items-center gap-3">
-                                <UserAvatar user={user} sizeClass="w-10 h-10" textClass="text-base" />
-                                <div>
-                                    <h2 className="text-xl font-bold text-white">{t('myProfile')}</h2>
-                                    <p className="text-sm text-gray-400">{user?.display_name || user?.username}</p>
+                        {isCorporate ? (
+                            <div className="corp-vm-modal-header">
+                                <div className="flex items-center gap-3 min-w-0 flex-1">
+                                    <UserAvatar user={user} sizeClass="w-9 h-9" textClass="text-sm" />
+                                    <div className="min-w-0">
+                                        <div className="corp-vm-modal-title truncate">{t('myProfile')}</div>
+                                        <div className="corp-vm-modal-meta truncate">{user?.display_name || user?.username}</div>
+                                    </div>
+                                </div>
+                                <div className="corp-vm-modal-actions">
+                                    <button onClick={onClose} className="corp-vm-btn corp-vm-btn-ghost" title={t('close') || 'Close'}>
+                                        <Icons.X />
+                                    </button>
                                 </div>
                             </div>
-                            <button onClick={onClose} className="p-2 rounded-lg hover:bg-proxmox-dark text-gray-400 hover:text-white">
-                                <Icons.X />
-                            </button>
-                        </div>
-                        
+                        ) : (
+                            <div className="flex items-center justify-between p-6 border-b border-proxmox-border">
+                                <div className="flex items-center gap-3">
+                                    <UserAvatar user={user} sizeClass="w-10 h-10" textClass="text-base" />
+                                    <div>
+                                        <h2 className="text-xl font-bold text-white">{t('myProfile')}</h2>
+                                        <p className="text-sm text-gray-400">{user?.display_name || user?.username}</p>
+                                    </div>
+                                </div>
+                                <button onClick={onClose} className="p-2 rounded-lg hover:bg-proxmox-dark text-gray-400 hover:text-white">
+                                    <Icons.X />
+                                </button>
+                            </div>
+                        )}
+
                         {/* Tabs */}
-                        <div className="flex border-b border-proxmox-border">
+                        <div className={tabsWrapCls}>
                             <button
                                 onClick={() => setActiveTab('appearance')}
-                                className={`flex-1 px-4 py-3 text-sm font-medium transition-colors flex items-center justify-center gap-2 ${
-                                    activeTab === 'appearance' 
-                                        ? 'text-proxmox-orange border-b-2 border-proxmox-orange' 
-                                        : 'text-gray-400 hover:text-white'
-                                }`}
+                                className={tabCls(activeTab === 'appearance')}
                             >
                                 <Icons.Palette />
                                 {t('appearance') || 'Appearance'}
                             </button>
                             <button
                                 onClick={() => setActiveTab('security')}
-                                className={`flex-1 px-4 py-3 text-sm font-medium transition-colors flex items-center justify-center gap-2 ${
-                                    activeTab === 'security' 
-                                        ? 'text-proxmox-orange border-b-2 border-proxmox-orange' 
-                                        : 'text-gray-400 hover:text-white'
-                                }`}
+                                className={tabCls(activeTab === 'security')}
                             >
                                 <Icons.Lock />
                                 {t('security')}
                             </button>
                             <button
                                 onClick={() => setActiveTab('tokens')}
-                                className={`flex-1 px-4 py-3 text-sm font-medium transition-colors flex items-center justify-center gap-2 ${
-                                    activeTab === 'tokens'
-                                        ? 'text-proxmox-orange border-b-2 border-proxmox-orange'
-                                        : 'text-gray-400 hover:text-white'
-                                }`}
+                                className={tabCls(activeTab === 'tokens')}
                             >
                                 <Icons.Key />
                                 API Tokens
                             </button>
                             <button
                                 onClick={() => setActiveTab('sessions')}
-                                className={`flex-1 px-4 py-3 text-sm font-medium transition-colors flex items-center justify-center gap-2 ${
-                                    activeTab === 'sessions'
-                                        ? 'text-proxmox-orange border-b-2 border-proxmox-orange'
-                                        : 'text-gray-400 hover:text-white'
-                                }`}
+                                className={tabCls(activeTab === 'sessions')}
                             >
                                 <Icons.Monitor />
                                 {t('activeSessions') || 'Sessions'}
@@ -2571,7 +2700,7 @@
                         </div>
                         
                         {/* Content */}
-                        <div className="flex-1 overflow-auto p-6">
+                        <div className={isCorporate ? "corp-vm-modal-body" : "flex-1 overflow-auto p-6"}>
                             {/* Appearance Tab */}
                             {activeTab === 'appearance' && (
                                 <div className="space-y-6">

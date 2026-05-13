@@ -8,11 +8,13 @@ Original PR by gyptazy, adapted to fit PegaProx architecture.
 import os
 import time
 import logging
-import sqlite3
+import sqlite3  # kept for type re-exports
 import threading
 from datetime import datetime
 
 from pegaprox.constants import CONFIG_DIR
+# MK May 2026 — syslog DB also goes through dbcrypto for SQLCipher unlock.
+from pegaprox.core import dbcrypto
 
 DB_FILE = os.path.join(CONFIG_DIR, 'syslog.db')
 
@@ -25,7 +27,8 @@ _syslog_thread = None
 
 
 def _open_db(timeout=30):
-    conn = sqlite3.connect(DB_FILE, timeout=timeout)
+    # MK May 2026: dbcrypto.connect() unlocks SQLCipher transparently when active.
+    conn = dbcrypto.connect(DB_FILE, timeout=timeout)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA temp_store=MEMORY;")

@@ -724,25 +724,51 @@ class VMwareManager:
         return self.api_get(f'/api/vcenter/vm/{vm_id}/snapshots')  # vSphere 8+
     
     def _soap_get_snapshots(self, vm_id: str) -> dict:
+        # MK May 2026 (#393) — ESXi 8 sometimes returns a stale .snapshot tree
+        # (None or pre-create) for ~1-2s after CreateSnapshot_Task completes.
+        # Re-fetch the VM via a fresh container view up to 3x before giving
+        # up on "no snapshots" — keeps the UI consistent with the ESXi view.
         try:
             from pyVmomi import vim
-            vm = self._soap_get_managed_object(vim.VirtualMachine, vm_id)
-            if not vm or not vm.snapshot:
-                return {'data': []}
-            result = []
-            def _walk_snaps(snap_list):
-                for snap in snap_list:
-                    result.append({
-                        'snapshot': str(snap.snapshot._moId) if snap.snapshot else '',
-                        'name': snap.name,
-                        'description': snap.description or '',
-                        'create_time': snap.createTime.isoformat() if snap.createTime else '',
-                        'power_state': str(snap.state).replace('powered', 'POWERED_').upper() if snap.state else '',
-                    })
-                    if snap.childSnapshotList:
-                        _walk_snaps(snap.childSnapshotList)
-            _walk_snaps(vm.snapshot.rootSnapshotList)
-            return {'data': result}
+            import time as _t
+            last_err = None
+            for attempt in range(3):
+                try:
+                    vm = self._soap_get_managed_object(vim.VirtualMachine, vm_id)
+                    if not vm:
+                        if attempt == 2:
+                            return {'data': []}
+                        _t.sleep(0.5)
+                        continue
+                    snap_tree = vm.snapshot
+                    if not snap_tree or not snap_tree.rootSnapshotList:
+                        # No snapshots in the tree.  Retry briefly in case the
+                        # property collector is still catching up post-create.
+                        if attempt < 2:
+                            _t.sleep(0.5)
+                            continue
+                        return {'data': []}
+                    result = []
+                    def _walk_snaps(snap_list):
+                        for snap in snap_list:
+                            result.append({
+                                'snapshot': str(snap.snapshot._moId) if snap.snapshot else '',
+                                'name': snap.name,
+                                'description': snap.description or '',
+                                'create_time': snap.createTime.isoformat() if snap.createTime else '',
+                                'power_state': str(snap.state).replace('powered', 'POWERED_').upper() if snap.state else '',
+                            })
+                            if snap.childSnapshotList:
+                                _walk_snaps(snap.childSnapshotList)
+                    _walk_snaps(snap_tree.rootSnapshotList)
+                    return {'data': result}
+                except Exception as e:
+                    last_err = e
+                    if attempt < 2:
+                        _t.sleep(0.5)
+                        continue
+                    break
+            return {'error': str(last_err) if last_err else 'snapshot listing failed'}
         except Exception as e:
             return {'error': str(e)}
     

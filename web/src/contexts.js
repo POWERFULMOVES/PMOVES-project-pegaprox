@@ -6,11 +6,39 @@
         // LW: Default is German (de) since thats what we use internally
         const LanguageContext = createContext();
 
+        // NS May 2026 (#389): supported language allowlist — reused for input validation
+        // both at init (localStorage) and at switch time. Keep in sync with the
+        // backend allowlist in pegaprox/api/users.py and the LanguageSwitcher list.
+        const SUPPORTED_LANGS = ['de', 'en', 'it', 'fr', 'es', 'pt', 'ko'];
+
+        // map navigator.language ("en-US", "de-AT", ...) onto a supported code, or null
+        function _detectBrowserLang() {
+            try {
+                const langs = [];
+                if (navigator.languages && navigator.languages.length) langs.push(...navigator.languages);
+                if (navigator.language) langs.push(navigator.language);
+                for (const raw of langs) {
+                    if (typeof raw !== 'string' || !raw) continue;
+                    const base = raw.toLowerCase().split(/[-_]/)[0];
+                    if (SUPPORTED_LANGS.includes(base)) return base;
+                }
+            } catch (_) { /* navigator unavailable / locked down */ }
+            return null;
+        }
+
         function LanguageProvider({ children }) {
-            // Persist language preference in localStorage
+            // Persist language preference in localStorage.
+            // NS May 2026 (#389): validate stored value against allowlist
+            // (defence in depth — protects against tampered localStorage), and
+            // when no valid value is stored, fall back to browser language.
             const [language, setLanguage] = useState(() => {
-                const saved = localStorage.getItem('pegaprox-language');
-                return saved || 'de';  // German default
+                try {
+                    const saved = localStorage.getItem('pegaprox-language');
+                    if (saved && SUPPORTED_LANGS.includes(saved)) return saved;
+                } catch (_) {}
+                const detected = _detectBrowserLang();
+                if (detected) return detected;
+                return 'de';
             });
 
             // Translation function with English fallback
@@ -18,25 +46,35 @@
                 return translations[language]?.[key] || translations['en']?.[key] || key;
             }, [language]);
 
-            const changeLanguage = useCallback((lang) => {
+            // Internal: validate + persist locally. Used by both code paths.
+            const _setAndPersist = useCallback((lang) => {
+                if (!SUPPORTED_LANGS.includes(lang)) return false;
                 setLanguage(lang);
-                localStorage.setItem('pegaprox-language', lang);
-                // persist to server so other devices pick it up
+                try { localStorage.setItem('pegaprox-language', lang); } catch (_) {}
+                return true;
+            }, []);
+
+            // changeLanguage = user-initiated switch from an authenticated context.
+            // Persists locally AND syncs to the server so other devices pick it up.
+            // NS May 2026 (#389) — caller is responsible for only invoking this when
+            // authenticated; the switcher uses applyLanguage on the login page.
+            const changeLanguage = useCallback((lang) => {
+                if (!_setAndPersist(lang)) return;
                 fetch(`${API_URL}/user/preferences`, {
                     method: 'PUT', credentials: 'include',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ language: lang })
                 }).catch(() => {}); // fire and forget
-            });
+            }, [_setAndPersist]);
 
-            // applyLanguage just sets state+localStorage without API call (used on login/session restore)
+            // applyLanguage just sets state+localStorage without API call.
+            // Used on login/session restore AND on the unauth login page.
             const applyLanguage = useCallback((lang) => {
-                setLanguage(lang);
-                localStorage.setItem('pegaprox-language', lang);
-            }, []);
+                _setAndPersist(lang);
+            }, [_setAndPersist]);
 
             return(
-                <LanguageContext.Provider value={{ language, t, changeLanguage, applyLanguage }}>
+                <LanguageContext.Provider value={{ language, t, changeLanguage, applyLanguage, supportedLangs: SUPPORTED_LANGS }}>
                     {children}
                 </LanguageContext.Provider>
             );
@@ -48,8 +86,14 @@
 
         // Language Switcher Component
         function LanguageSwitcher() {
-            const { language, changeLanguage } = useTranslation();
+            const { language, changeLanguage, applyLanguage } = useTranslation();
             const { isCorporate } = useLayout();
+            // NS May 2026 (#389): On the login page (unauthenticated) we must NOT
+            // hit /api/user/preferences — it would always 401 and spam the console.
+            // useAuth() reads cleanly here because LanguageSwitcher is rendered
+            // inside both providers in the tree.
+            const auth = useContext(AuthContext);
+            const switchLang = (auth && auth.isAuthenticated) ? changeLanguage : applyLanguage;
             const langs = [
                 { code: 'de', flag: '🇦🇹', label: 'DE', title: 'Deutsch' },
                 { code: 'en', flag: '🇬🇧', label: 'EN', title: 'English' },
@@ -70,7 +114,7 @@
                         <span className="text-base leading-none" aria-hidden="true">{activeLanguage.flag}</span>
                         <select
                             value={language}
-                            onChange={(e) => changeLanguage(e.target.value)}
+                            onChange={(e) => switchLang(e.target.value)}
                             className="bg-transparent text-xs text-gray-200 border-0 p-0 pr-6 focus:ring-0 focus:outline-none"
                             aria-label="Select language"
                             title={activeLanguage.title}
@@ -90,7 +134,7 @@
                     {langs.map(l => (
                         <button
                             key={l.code}
-                            onClick={() => !l.soon && changeLanguage(l.code)}
+                            onClick={() => !l.soon && switchLang(l.code)}
                             className={`flex items-center gap-1 px-1.5 py-1 rounded text-sm transition-all ${language === l.code ? 'bg-proxmox-orange text-white' : l.soon ? 'text-gray-600 cursor-not-allowed' : 'text-gray-400 hover:text-white'}`}
                             title={l.title}
                             disabled={l.soon}

@@ -205,7 +205,7 @@ def _execute_drill(drill_id):
         tgt_bridges = set()
         try:
             for node in (tgt_mgr.nodes or {}).keys():
-                r = tgt_mgr._api_get(f"https://{tgt_mgr.host}:8006/api2/json/nodes/{node}/network")
+                r = tgt_mgr._api_get(f"https://{tgt_mgr.host}:{tgt_mgr.api_port}/api2/json/nodes/{node}/network")
                 if r and r.status_code == 200:
                     for nic in (r.json().get('data') or []):
                         if nic.get('type') in ('bridge', 'OVSBridge', 'bond'):
@@ -213,7 +213,7 @@ def _execute_drill(drill_id):
         except Exception: pass
         # also check SDN VNets cluster-wide
         try:
-            r = tgt_mgr._api_get(f"https://{tgt_mgr.host}:8006/api2/json/cluster/sdn/vnets")
+            r = tgt_mgr._api_get(f"https://{tgt_mgr.host}:{tgt_mgr.api_port}/api2/json/cluster/sdn/vnets")
             if r and r.status_code == 200:
                 for v in (r.json().get('data') or []):
                     n = v.get('vnet') or v.get('name')
@@ -235,7 +235,7 @@ def _execute_drill(drill_id):
         if not (tgt_mgr and getattr(tgt_mgr, 'is_connected', False)):
             return ('warn', 'target offline — cannot verify', f"mappings={list(stor_maps.keys())}")
         try:
-            r = tgt_mgr._api_get(f"https://{tgt_mgr.host}:8006/api2/json/storage")
+            r = tgt_mgr._api_get(f"https://{tgt_mgr.host}:{tgt_mgr.api_port}/api2/json/storage")
             data = r.json().get('data') if (r and r.status_code == 200) else []
         except Exception:
             data = []
@@ -327,7 +327,7 @@ def _execute_drill(drill_id):
         if not (tgt_mgr and getattr(tgt_mgr, 'is_connected', False)):
             return ('warn', 'target offline — cannot verify target HA capability', '')
         try:
-            r = src_mgr._api_get(f"https://{src_mgr.host}:8006/api2/json/cluster/ha/resources")
+            r = src_mgr._api_get(f"https://{src_mgr.host}:{src_mgr.api_port}/api2/json/cluster/ha/resources")
             data = r.json().get('data') if (r and r.status_code == 200) else []
             ha_vmids = {str(item.get('sid', '')).split(':')[-1] for item in data if item.get('type') == 'vm'}
         except Exception as e:

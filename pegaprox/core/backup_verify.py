@@ -82,7 +82,7 @@ def start_verification(pve_mgr, params):
     def run():
         start_time = time.time()
         test_vmid = None
-        host = pve_mgr.host
+        host, port = pve_mgr.host, pve_mgr.api_port
         node = params.get('node', '')
         vm_type = params.get('vm_type', 'qemu')
 
@@ -102,7 +102,7 @@ def start_verification(pve_mgr, params):
             _log(f"Getting next available VMID...")
 
             nextid_resp = pve_mgr._api_get(
-                f"https://{host}:8006/api2/json/cluster/nextid"
+                f"https://{host}:{port}/api2/json/cluster/nextid"
             )
             if nextid_resp.status_code != 200:
                 raise Exception("Could not get next VMID")
@@ -123,7 +123,7 @@ def start_verification(pve_mgr, params):
             }
 
             restore_resp = pve_mgr._api_post(
-                f"https://{host}:8006/api2/json/nodes/{node}/{vm_type}",
+                f"https://{host}:{port}/api2/json/nodes/{node}/{vm_type}",
                 data=restore_data
             )
 
@@ -147,7 +147,7 @@ def start_verification(pve_mgr, params):
 
                 # get current config to find network interfaces
                 cfg_resp = pve_mgr._api_get(
-                    f"https://{host}:8006/api2/json/nodes/{node}/{vm_type}/{test_vmid}/config"
+                    f"https://{host}:{port}/api2/json/nodes/{node}/{vm_type}/{test_vmid}/config"
                 )
                 if cfg_resp.status_code == 200:
                     config = cfg_resp.json().get('data', {})
@@ -158,7 +158,7 @@ def start_verification(pve_mgr, params):
                             import re
                             new_net = re.sub(r'bridge=[^,]+', f'bridge={network_bridge}', net_val)
                             pve_mgr._api_put(
-                                f"https://{host}:8006/api2/json/nodes/{node}/{vm_type}/{test_vmid}/config",
+                                f"https://{host}:{port}/api2/json/nodes/{node}/{vm_type}/{test_vmid}/config",
                                 data={key: new_net}
                             )
                     _log(f"Network reconfigured to {network_bridge}")
@@ -168,7 +168,7 @@ def start_verification(pve_mgr, params):
             _log("Starting test VM...")
 
             start_resp = pve_mgr._api_post(
-                f"https://{host}:8006/api2/json/nodes/{node}/{vm_type}/{test_vmid}/status/start"
+                f"https://{host}:{port}/api2/json/nodes/{node}/{vm_type}/{test_vmid}/status/start"
             )
             if start_resp.status_code != 200:
                 raise Exception(f"Failed to start VM: {start_resp.text[:200]}")
@@ -186,7 +186,7 @@ def start_verification(pve_mgr, params):
             while time.time() - boot_start < boot_timeout:
                 try:
                     st_resp = pve_mgr._api_get(
-                        f"https://{host}:8006/api2/json/nodes/{node}/{vm_type}/{test_vmid}/status/current"
+                        f"https://{host}:{port}/api2/json/nodes/{node}/{vm_type}/{test_vmid}/status/current"
                     )
                     if st_resp.status_code == 200:
                         st_data = st_resp.json().get('data', {})
@@ -214,7 +214,7 @@ def start_verification(pve_mgr, params):
 
                     try:
                         agent_resp = pve_mgr._api_get(
-                            f"https://{host}:8006/api2/json/nodes/{node}/{vm_type}/{test_vmid}/agent/network-get-interfaces"
+                            f"https://{host}:{port}/api2/json/nodes/{node}/{vm_type}/{test_vmid}/agent/network-get-interfaces"
                         )
                         if agent_resp.status_code == 200:
                             interfaces = agent_resp.json().get('data', {}).get('result', [])
@@ -235,7 +235,7 @@ def start_verification(pve_mgr, params):
                 # stop first
                 try:
                     pve_mgr._api_post(
-                        f"https://{host}:8006/api2/json/nodes/{node}/{vm_type}/{test_vmid}/status/stop",
+                        f"https://{host}:{port}/api2/json/nodes/{node}/{vm_type}/{test_vmid}/status/stop",
                         data={'timeout': 30}
                     )
                     time.sleep(5)
@@ -245,7 +245,7 @@ def start_verification(pve_mgr, params):
                 # delete
                 try:
                     del_resp = pve_mgr._api_delete(
-                        f"https://{host}:8006/api2/json/nodes/{node}/{vm_type}/{test_vmid}",
+                        f"https://{host}:{port}/api2/json/nodes/{node}/{vm_type}/{test_vmid}",
                         params={'purge': 1, 'destroy-unreferenced-disks': 1}
                     )
                     if del_resp.status_code == 200:
@@ -279,11 +279,11 @@ def start_verification(pve_mgr, params):
             if test_vmid:
                 try:
                     pve_mgr._api_post(
-                        f"https://{host}:8006/api2/json/nodes/{node}/{vm_type}/{test_vmid}/status/stop"
+                        f"https://{host}:{port}/api2/json/nodes/{node}/{vm_type}/{test_vmid}/status/stop"
                     )
                     time.sleep(3)
                     pve_mgr._api_delete(
-                        f"https://{host}:8006/api2/json/nodes/{node}/{vm_type}/{test_vmid}",
+                        f"https://{host}:{port}/api2/json/nodes/{node}/{vm_type}/{test_vmid}",
                         params={'purge': 1, 'destroy-unreferenced-disks': 1}
                     )
                     _log(f"Emergency cleanup: deleted test VM {test_vmid}")

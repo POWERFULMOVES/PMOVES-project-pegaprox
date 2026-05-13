@@ -945,6 +945,14 @@
             const dragStartRef = useRef(null);
             const [tooltip, setTooltip] = useState(null);
             const [networkData, setNetworkData] = useState(null);
+            // NS May 2026 — storage tier overlay (lazy fetch on first toggle)
+            const [storageData, setStorageData] = useState(null);
+            // NS May 2026 — VM↔storage assignments come from the same /networks
+            // response (extended in manager.get_cluster_networks) so we can draw
+            // per-VM lines to its storages without an extra round trip.
+            const [storageAssignments, setStorageAssignments] = useState(null);
+            // hover state used by both tiers — highlight a single VM's edges
+            const [hoveredVm, setHoveredVm] = useState(null);
             // LW: legend starts collapsed to avoid covering small diagrams, user can pop it open
             const [showLegend, setShowLegend] = useState(() => {
                 try { return localStorage.getItem('pegaprox-topo-legend') === '1'; } catch(_) { return false; }
@@ -961,6 +969,28 @@
             // NS: cluster-wide affinity rules (fetched lazily — only when diagram is open)
             const [affinityRules, setAffinityRules] = useState([]);
             const [showAffinity, setShowAffinity] = useState(false);
+            // NS May 2026 — storage / network tier toggles. Default OFF so diagram
+            // stays uncluttered for users who don't care about infra layers.
+            const [showStorage, setShowStorage] = useState(() => {
+                try { return localStorage.getItem('pegaprox-topo-storage') === '1'; } catch(_) { return false; }
+            });
+            const [showNetwork, setShowNetwork] = useState(() => {
+                try { return localStorage.getItem('pegaprox-topo-network') === '1'; } catch(_) { return false; }
+            });
+            const toggleStorageTier = () => {
+                setShowStorage(v => {
+                    const n = !v;
+                    try { localStorage.setItem('pegaprox-topo-storage', n ? '1' : '0'); } catch(_) {}
+                    return n;
+                });
+            };
+            const toggleNetworkTier = () => {
+                setShowNetwork(v => {
+                    const n = !v;
+                    try { localStorage.setItem('pegaprox-topo-network', n ? '1' : '0'); } catch(_) {}
+                    return n;
+                });
+            };
 
             // ── common data from frozen snapshot ──
             const nodeGroups = {};
@@ -1076,9 +1106,32 @@
                     headers: getAuthHeaders(), credentials: 'include'
                 })
                 .then(r => r.ok ? r.json() : null)
-                .then(d => { if (d?.networks) setNetworkData(d.networks); })
+                .then(d => {
+                    if (d?.networks) setNetworkData(d.networks);
+                    // NS May 2026 — same payload now also carries vm↔storage links
+                    if (Array.isArray(d?.storage_assignments)) {
+                        setStorageAssignments(d.storage_assignments);
+                    }
+                })
                 .catch(() => {}); // non-critical, bridges just wont show
             }, [clusterId, viewMode]);
+
+            // NS May 2026 — storage tier data, lazy-loaded the first time the
+            // user opens the storage toggle. Reuses the existing /datastores
+            // endpoint (already perm-gated by storage.view in vms.py).
+            React.useEffect(() => {
+                if (!clusterId || viewMode !== 'diagram' || !showStorage) return;
+                if (storageData !== null) return; // already loaded once
+                fetch(`${API_URL}/clusters/${clusterId}/datastores`, {
+                    headers: getAuthHeaders(), credentials: 'include'
+                })
+                .then(r => r.ok ? r.json() : null)
+                .then(d => {
+                    if (d && (d.shared || d.local)) setStorageData(d);
+                    else setStorageData({ shared: [], local: {}, nodes: [] });
+                })
+                .catch(() => { setStorageData({ shared: [], local: {}, nodes: [] }); });
+            }, [clusterId, viewMode, showStorage]);
 
             const vmBridgeMap = React.useMemo(() => {
                 const map = {};
@@ -1092,6 +1145,41 @@
                 });
                 return map;
             }, [networkData]);
+
+            // NS May 2026 — multi-bridge map (a VM can have several net interfaces).
+            // Returns vmid → array of distinct bridge names. Used for VM→bridge edges.
+            const vmBridgesAll = React.useMemo(() => {
+                const map = {};
+                if (!Array.isArray(networkData)) return map;
+                networkData.forEach(net => {
+                    const name = net.name;
+                    if (!name) return;
+                    (net.vms || []).forEach(v => {
+                        if (!v || !v.vmid) return;
+                        const k = String(v.vmid);
+                        if (!map[k]) map[k] = [];
+                        if (!map[k].includes(name)) map[k].push(name);
+                    });
+                });
+                return map;
+            }, [networkData]);
+
+            // NS May 2026 — vmid → array of distinct storage names (rootfs, scsi0, ...).
+            const vmStoragesAll = React.useMemo(() => {
+                const map = {};
+                if (!Array.isArray(storageAssignments)) return map;
+                storageAssignments.forEach(entry => {
+                    const sname = entry?.storage;
+                    if (!sname) return;
+                    (entry.vms || []).forEach(v => {
+                        if (!v || !v.vmid) return;
+                        const k = String(v.vmid);
+                        if (!map[k]) map[k] = [];
+                        if (!map[k].includes(sname)) map[k].push(sname);
+                    });
+                });
+                return map;
+            }, [storageAssignments]);
 
             // ── diagram layout calculation ──
             const ICON = 40;
@@ -1169,7 +1257,104 @@
                 ...pbs, x: pbsXPositions[i], y: TIER_Y.nodes
             }));
 
-            const svgH = Math.max(480, maxVmBottom + 60);
+            // ── Storage tier (single-cluster only). Built from /datastores.
+            // Renders below the VM grid, with dashed edges from each node to
+            // the storages it has access to (active_on for shared, owning node for local).
+            const STORAGE_ICON_W = 138;
+            const STORAGE_ICON_H = 38;
+            const STORAGE_GAP_X = 14;
+            const STORAGE_TIER_TOP_PAD = 56;
+            const buildStorageList = (data) => {
+                const out = [];
+                if (data && Array.isArray(data.shared)) {
+                    for (const s of data.shared) {
+                        if (!s || !s.storage) continue;
+                        out.push({
+                            name: s.storage,
+                            label: s.storage,
+                            kind: 'shared',
+                            type: s.type || 'unknown',
+                            used_fraction: typeof s.used_fraction === 'number' ? s.used_fraction : null,
+                            total: s.total || 0,
+                            used: s.used || 0,
+                            active_on: Array.isArray(s.active_on) ? s.active_on : [],
+                        });
+                    }
+                }
+                if (data && data.local && typeof data.local === 'object') {
+                    for (const node of Object.keys(data.local)) {
+                        const list = data.local[node] || [];
+                        for (const s of list) {
+                            if (!s || !s.storage) continue;
+                            out.push({
+                                name: `${s.storage}@${node}`,
+                                label: s.storage,
+                                kind: 'local',
+                                type: s.type || 'unknown',
+                                used_fraction: typeof s.used_fraction === 'number' ? s.used_fraction : null,
+                                total: s.total || 0,
+                                used: s.used || 0,
+                                active_on: [node],
+                            });
+                        }
+                    }
+                }
+                // de-duplicate (defensive: same name twice = one row)
+                const seen = new Set();
+                return out.filter(s => seen.has(s.name) ? false : (seen.add(s.name), true));
+            };
+            const storageList = (showStorage && storageData) ? buildStorageList(storageData) : [];
+            const storagesPerRow = Math.max(1, Math.floor((svgW - 80) / (STORAGE_ICON_W + STORAGE_GAP_X)));
+            const storageRowCount = Math.max(0, Math.ceil(storageList.length / storagesPerRow));
+            const storageTierTop = (showStorage && storageList.length > 0)
+                ? maxVmBottom + STORAGE_TIER_TOP_PAD : maxVmBottom;
+            const storagePositions = storageList.map((s, i) => {
+                const row = Math.floor(i / storagesPerRow);
+                const col = i % storagesPerRow;
+                const itemsThisRow = Math.min(storagesPerRow, storageList.length - row * storagesPerRow);
+                const rowW = itemsThisRow * STORAGE_ICON_W + (itemsThisRow - 1) * STORAGE_GAP_X;
+                const startX = (svgW - rowW) / 2;
+                return {
+                    ...s,
+                    x: startX + col * (STORAGE_ICON_W + STORAGE_GAP_X),
+                    y: storageTierTop + row * (STORAGE_ICON_H + 14),
+                };
+            });
+            const storageTierBottom = (showStorage && storageRowCount > 0)
+                ? storageTierTop + storageRowCount * (STORAGE_ICON_H + 14)
+                : maxVmBottom;
+
+            // ── Network tier (single-cluster only). Reuses networkData fetched
+            // for the bridge labels. Bridges shown as horizontal pills under the
+            // storage tier, with dashed edges to the nodes that host each bridge.
+            const NET_ICON_W = 118;
+            const NET_ICON_H = 34;
+            const NET_GAP_X = 12;
+            const NET_TIER_TOP_PAD = 50;
+            const networkList = (showNetwork && Array.isArray(networkData))
+                ? networkData.filter(n => n && typeof n.name === 'string' && n.name.length)
+                : [];
+            const netPerRow = Math.max(1, Math.floor((svgW - 80) / (NET_ICON_W + NET_GAP_X)));
+            const netRowCount = Math.max(0, Math.ceil(networkList.length / netPerRow));
+            const networkTierTop = (showNetwork && networkList.length > 0)
+                ? storageTierBottom + NET_TIER_TOP_PAD : storageTierBottom;
+            const networkPositions = networkList.map((n, i) => {
+                const row = Math.floor(i / netPerRow);
+                const col = i % netPerRow;
+                const itemsThisRow = Math.min(netPerRow, networkList.length - row * netPerRow);
+                const rowW = itemsThisRow * NET_ICON_W + (itemsThisRow - 1) * NET_GAP_X;
+                const startX = (svgW - rowW) / 2;
+                return {
+                    ...n,
+                    x: startX + col * (NET_ICON_W + NET_GAP_X),
+                    y: networkTierTop + row * (NET_ICON_H + 12),
+                };
+            });
+            const networkTierBottom = (showNetwork && netRowCount > 0)
+                ? networkTierTop + netRowCount * (NET_ICON_H + 12)
+                : storageTierBottom;
+
+            const svgH = Math.max(480, networkTierBottom + 60);
             const clusterX = svgW / 2;
 
             // ── diagram edges ──
@@ -1537,29 +1722,58 @@
 
             return (
                 <div className={isCorporate
-                    ? 'bg-proxmox-card border border-proxmox-border p-4'
+                    ? 'corp-topo-frame'
                     : 'bg-proxmox-card border border-proxmox-border rounded-xl p-6'
                 }>
                     {/* Header with view toggle + toolbar */}
-                    <div className="flex items-center justify-between mb-5">
+                    <div className={isCorporate ? 'corp-topo-header' : 'flex items-center justify-between mb-5'}>
                         <div className="flex items-center gap-2">
-                            <Icons.Network className="w-5 h-5 text-proxmox-orange" />
-                            <h3 className={isCorporate ? 'text-sm font-semibold text-white' : 'text-lg font-semibold text-white'}>
+                            <Icons.Network className={isCorporate ? 'w-5 h-5' : 'w-5 h-5 text-proxmox-orange'} style={isCorporate ? {color:'var(--corp-accent, #49afd9)'} : undefined} />
+                            <h3 className={isCorporate ? 'text-[14px] font-medium' : 'text-lg font-semibold text-white'} style={isCorporate ? {color:'#e9ecef', letterSpacing:'-0.01em'} : undefined}>
                                 {t('topologyView') || 'Topology'}
                             </h3>
+                            {isCorporate && isMultiCluster && (
+                                <span className="text-[11px] ml-1" style={{color:'var(--corp-text-muted, #728b9a)'}}>
+                                    · {frozenMultiCluster.length} clusters
+                                </span>
+                            )}
+                            {isCorporate && !isMultiCluster && allNodes.length > 0 && (
+                                <span className="text-[11px] ml-1" style={{color:'var(--corp-text-muted, #728b9a)'}}>
+                                    · {allNodes.length} {allNodes.length === 1 ? 'node' : 'nodes'}, {totalGuests} {totalGuests === 1 ? 'guest' : 'guests'}
+                                </span>
+                            )}
                         </div>
                         <div className="flex items-center gap-1">
-                            <button onClick={() => setViewMode('diagram')}
-                                className={`px-2.5 py-1 text-[11px] rounded-l ${viewMode === 'diagram' ? 'bg-proxmox-orange/20 text-proxmox-orange' : 'text-gray-400 hover:text-white'}`}
-                                style={{border: '1px solid rgba(255,255,255,0.1)'}}>
-                                {t('diagramView') || 'Diagram'}
-                            </button>
-                            {!isMultiCluster && (
-                                <button onClick={() => setViewMode('cards')}
-                                    className={`px-2.5 py-1 text-[11px] rounded-r ${viewMode === 'cards' ? 'bg-proxmox-orange/20 text-proxmox-orange' : 'text-gray-400 hover:text-white'}`}
-                                    style={{border: '1px solid rgba(255,255,255,0.1)', borderLeft: 'none'}}>
-                                    {t('cardView') || 'Cards'}
-                                </button>
+                            {isCorporate ? (
+                                <div className="corp-topo-toggle">
+                                    <button onClick={() => setViewMode('diagram')}
+                                        className={viewMode === 'diagram' ? 'active' : ''}>
+                                        <Icons.Network className="w-3 h-3 inline mr-1" />
+                                        {t('diagramView') || 'Diagram'}
+                                    </button>
+                                    {!isMultiCluster && (
+                                        <button onClick={() => setViewMode('cards')}
+                                            className={viewMode === 'cards' ? 'active' : ''}>
+                                            <Icons.Server className="w-3 h-3 inline mr-1" />
+                                            {t('cardView') || 'Cards'}
+                                        </button>
+                                    )}
+                                </div>
+                            ) : (
+                                <>
+                                    <button onClick={() => setViewMode('diagram')}
+                                        className={`px-2.5 py-1 text-[11px] rounded-l ${viewMode === 'diagram' ? 'bg-proxmox-orange/20 text-proxmox-orange' : 'text-gray-400 hover:text-white'}`}
+                                        style={{border: '1px solid rgba(255,255,255,0.1)'}}>
+                                        {t('diagramView') || 'Diagram'}
+                                    </button>
+                                    {!isMultiCluster && (
+                                        <button onClick={() => setViewMode('cards')}
+                                            className={`px-2.5 py-1 text-[11px] rounded-r ${viewMode === 'cards' ? 'bg-proxmox-orange/20 text-proxmox-orange' : 'text-gray-400 hover:text-white'}`}
+                                            style={{border: '1px solid rgba(255,255,255,0.1)', borderLeft: 'none'}}>
+                                            {t('cardView') || 'Cards'}
+                                        </button>
+                                    )}
+                                </>
                             )}
 
                             {viewMode === 'diagram' && !isMultiCluster && (() => {
@@ -1591,7 +1805,7 @@
                             })()}
                             {viewMode === 'diagram' && (
                                 <>
-                                    <div className="w-px h-4 bg-gray-700 mx-2" />
+                                    <div className="w-px h-4 mx-2" style={{background: isCorporate ? 'var(--corp-border-medium)' : '#374151'}} />
                                     <button onClick={() => setZoom(z => Math.min(3, z * 1.2))}
                                         className="p-1 text-gray-400 hover:text-white" title="Zoom in">
                                         <Icons.ZoomIn />
@@ -1608,7 +1822,7 @@
                                         className="p-1 text-gray-400 hover:text-white" title={t('refreshData') || 'Refresh'}>
                                         <Icons.RefreshCw />
                                     </button>
-                                    <div className="w-px h-4 bg-gray-700 mx-2" />
+                                    <div className="w-px h-4 mx-2" style={{background: isCorporate ? 'var(--corp-border-medium)' : '#374151'}} />
                                     <button onClick={() => exportDiagram('png')}
                                         className="px-1.5 py-0.5 text-[10px] text-gray-400 hover:text-white"
                                         title={t('exportAsPng') || 'Export PNG'}>PNG</button>
@@ -1686,6 +1900,32 @@
                                     title={t('toggleLegend') || 'Show / hide legend'}>
                                     {showLegend ? '●' : '○'} {t('legend') || 'Legend'}
                                 </button>
+                                {!isMultiCluster && (
+                                    <>
+                                        <button
+                                            onClick={toggleStorageTier}
+                                            style={{
+                                                padding: '3px 8px', fontSize: 11, borderRadius: 3,
+                                                background: showStorage ? `${topoColor.brand}2e` : 'transparent',
+                                                border: '1px solid rgba(255,255,255,0.1)',
+                                                color: showStorage ? topoColor.brand : '#728b9a', cursor: 'pointer',
+                                            }}
+                                            title={t('toggleStorageTier') || 'Show / hide storage tier'}>
+                                            {showStorage ? '●' : '○'} {t('storage') || 'Storage'}
+                                        </button>
+                                        <button
+                                            onClick={toggleNetworkTier}
+                                            style={{
+                                                padding: '3px 8px', fontSize: 11, borderRadius: 3,
+                                                background: showNetwork ? `${topoColor.brand}2e` : 'transparent',
+                                                border: '1px solid rgba(255,255,255,0.1)',
+                                                color: showNetwork ? topoColor.brand : '#728b9a', cursor: 'pointer',
+                                            }}
+                                            title={t('toggleNetworkTier') || 'Show / hide network tier'}>
+                                            {showNetwork ? '●' : '○'} {t('network') || 'Network'}
+                                        </button>
+                                    </>
+                                )}
                             </div>
                             <svg ref={svgRef}
                                 role="img"
@@ -2103,15 +2343,23 @@
                                             transition: 'opacity 0.2s',
                                         }}
                                         onClick={onVmClick ? () => onVmClick(vm) : undefined}
-                                        onMouseEnter={(e) => showTooltip(e, label, [
-                                            `VMID: ${vm.vmid}`,
-                                            `Type: ${isQemu ? 'QEMU' : 'LXC'}`,
-                                            `Status: ${vm.status}`,
-                                            isRunning ? `CPU: ${((vm.cpu || 0) * 100).toFixed(0)}%` : null,
-                                            isRunning ? `RAM: ${fmtMem(vm.mem)}` : null,
-                                            vmBridgeMap[String(vm.vmid)] ? `Bridge: ${vmBridgeMap[String(vm.vmid)]}` : null
-                                        ].filter(Boolean))}
-                                        onMouseLeave={hideTooltip}>
+                                        onMouseEnter={(e) => {
+                                            // NS May 2026 — light up this VM's edges to storage / bridges
+                                            if (showStorage || showNetwork) setHoveredVm(vm.vmid);
+                                            const bridges = vmBridgesAll[String(vm.vmid)] || [];
+                                            const storages = vmStoragesAll[String(vm.vmid)] || [];
+                                            showTooltip(e, label, [
+                                                `VMID: ${vm.vmid}`,
+                                                `Type: ${isQemu ? 'QEMU' : 'LXC'}`,
+                                                `Status: ${vm.status}`,
+                                                isRunning ? `CPU: ${((vm.cpu || 0) * 100).toFixed(0)}%` : null,
+                                                isRunning ? `RAM: ${fmtMem(vm.mem)}` : null,
+                                                bridges.length ? `Bridge${bridges.length > 1 ? 's' : ''}: ${bridges.join(', ')}`
+                                                    : (vmBridgeMap[String(vm.vmid)] ? `Bridge: ${vmBridgeMap[String(vm.vmid)]}` : null),
+                                                storages.length ? `Storage: ${storages.join(', ')}` : null,
+                                            ].filter(Boolean));
+                                        }}
+                                        onMouseLeave={() => { setHoveredVm(null); hideTooltip(); }}>
                                         {/* pill backdrop */}
                                         <rect x={-75} y={-14} width={150} height={28} rx={4}
                                             fill={topoColor.bg} fillOpacity={isCorporate ? 0.55 : 0.65}
@@ -2161,6 +2409,205 @@
                                         <text y={ICON / 2 + 18} textAnchor="middle" fill={topoColor.muted} fontSize="9">Backup Server</text>
                                     </g>
                                 ))}
+
+                                {/* NS May 2026 — Storage tier (opt-in via toggle).
+                                    Each storage rendered as a flat pill below the VM grid.
+                                    Edges link each storage to the nodes it is reachable from. */}
+                                {showStorage && storagePositions.length > 0 && (
+                                    <g className="topo-storage-tier">
+                                        <text x={20} y={storageTierTop - 14}
+                                            fill={topoColor.muted} fontSize={10} letterSpacing={1.5}
+                                            fontWeight={600}>
+                                            {(t('storage') || 'STORAGE').toUpperCase()}
+                                        </text>
+                                        {/* node → storage edges */}
+                                        {storagePositions.map(s => (s.active_on || []).map(nName => {
+                                            const node = diagramNodes.find(n => n.name === nName);
+                                            if (!node) return null;
+                                            const x1 = node.x;
+                                            const y1 = TIER_Y.nodes + ICON / 2 + 8;
+                                            const x2 = s.x + STORAGE_ICON_W / 2;
+                                            const y2 = s.y;
+                                            return (
+                                                <line key={`se-${s.name}-${nName}`}
+                                                    x1={x1} y1={y1} x2={x2} y2={y2}
+                                                    stroke={topoColor.brand} strokeOpacity={0.18}
+                                                    strokeWidth={1} strokeDasharray="3,3" />
+                                            );
+                                        }))}
+                                        {/* NS May 2026 — per-VM → storage edges (the connection
+                                            the user asked for: each VM lights up its disk targets) */}
+                                        {diagramNodes.flatMap(node =>
+                                            (node.vms || []).flatMap(vm => {
+                                                const storages = vmStoragesAll[String(vm.vmid)] || [];
+                                                return storages.map(sname => {
+                                                    const sp = storagePositions.find(s =>
+                                                        s.label === sname && (
+                                                            s.kind === 'shared' ||
+                                                            (s.kind === 'local' && s.active_on[0] === node.name)
+                                                        )
+                                                    );
+                                                    if (!sp) return null;
+                                                    const isHovered = hoveredVm === vm.vmid;
+                                                    const dimmed = hoveredVm != null && !isHovered;
+                                                    return (
+                                                        <line key={`vmst-${vm.vmid}-${sname}`}
+                                                            x1={vm.x} y1={vm.y + VM_ROW_H / 2}
+                                                            x2={sp.x + STORAGE_ICON_W / 2} y2={sp.y}
+                                                            stroke={topoColor.brand}
+                                                            strokeOpacity={isHovered ? 0.65 : (dimmed ? 0.04 : 0.12)}
+                                                            strokeWidth={isHovered ? 1.4 : 0.7}
+                                                            pointerEvents="none" />
+                                                    );
+                                                });
+                                            })
+                                        )}
+                                        {/* storage pills */}
+                                        {storagePositions.map(s => {
+                                            const usagePct = s.used_fraction != null
+                                                ? Math.max(0, Math.min(1, s.used_fraction))
+                                                : null;
+                                            const usageColor = usagePct == null ? topoColor.muted
+                                                : usagePct > 0.9 ? '#f54f47'
+                                                : usagePct > 0.75 ? '#efc006'
+                                                : '#60b515';
+                                            const tooltipLines = [
+                                                `${s.kind === 'shared' ? (t('sharedStorage') || 'Shared storage') : (t('localStorage') || 'Local storage')} · ${s.type}`,
+                                                usagePct != null ? `${(usagePct*100).toFixed(0)}% used` : 'usage unknown',
+                                                s.active_on.length
+                                                    ? `${t('activeOn') || 'Active on'}: ${s.active_on.join(', ')}`
+                                                    : 'no active node',
+                                            ];
+                                            return (
+                                                <g key={`st-${s.name}`} transform={`translate(${s.x}, ${s.y})`}
+                                                    style={{cursor: 'default'}}
+                                                    onMouseEnter={(e) => showTooltip(e, s.label, tooltipLines)}
+                                                    onMouseLeave={hideTooltip}>
+                                                    <rect width={STORAGE_ICON_W} height={STORAGE_ICON_H} rx={3}
+                                                        fill={topoColor.section}
+                                                        stroke={s.kind === 'shared' ? topoColor.brand : '#9b59b6'}
+                                                        strokeOpacity={0.55}
+                                                        strokeWidth={1} />
+                                                    {/* disk icon */}
+                                                    <g transform="translate(8, 8)">
+                                                        <ellipse cx={6} cy={3} rx={6} ry={2}
+                                                            fill="none" stroke={s.kind === 'shared' ? topoColor.brand : '#9b59b6'} strokeWidth={1.3} />
+                                                        <line x1={0} y1={3} x2={0} y2={11}
+                                                            stroke={s.kind === 'shared' ? topoColor.brand : '#9b59b6'} strokeWidth={1.3} />
+                                                        <line x1={12} y1={3} x2={12} y2={11}
+                                                            stroke={s.kind === 'shared' ? topoColor.brand : '#9b59b6'} strokeWidth={1.3} />
+                                                        <ellipse cx={6} cy={11} rx={6} ry={2}
+                                                            fill="none" stroke={s.kind === 'shared' ? topoColor.brand : '#9b59b6'} strokeWidth={1.3} />
+                                                    </g>
+                                                    <text x={28} y={15} fontSize={11} fontWeight={600}
+                                                        fill={topoColor.text}>
+                                                        {s.label.length > 16 ? s.label.substring(0, 15) + '…' : s.label}
+                                                    </text>
+                                                    <text x={28} y={27} fontSize={9}
+                                                        fill={topoColor.muted}>
+                                                        {s.type}{s.kind === 'shared' ? ' · shared' : ' · local'}
+                                                    </text>
+                                                    {usagePct != null && (
+                                                        <React.Fragment>
+                                                            <rect x={STORAGE_ICON_W - 50} y={STORAGE_ICON_H - 7}
+                                                                width={42} height={3.5} rx={1}
+                                                                fill="rgba(255,255,255,0.06)" />
+                                                            <rect x={STORAGE_ICON_W - 50} y={STORAGE_ICON_H - 7}
+                                                                width={Math.max(1, 42 * usagePct)} height={3.5} rx={1}
+                                                                fill={usageColor} />
+                                                        </React.Fragment>
+                                                    )}
+                                                </g>
+                                            );
+                                        })}
+                                    </g>
+                                )}
+
+                                {/* NS May 2026 — Network bridge tier (opt-in).
+                                    Bridges from /clusters/<id>/networks rendered below storage,
+                                    edges linking each bridge to the nodes that host it. */}
+                                {showNetwork && networkPositions.length > 0 && (
+                                    <g className="topo-network-tier">
+                                        <text x={20} y={networkTierTop - 14}
+                                            fill={topoColor.muted} fontSize={10} letterSpacing={1.5}
+                                            fontWeight={600}>
+                                            {(t('network') || 'NETWORK').toUpperCase()}
+                                        </text>
+                                        {/* node → bridge edges */}
+                                        {networkPositions.map(n => (n.nodes || []).map(nName => {
+                                            const node = diagramNodes.find(d => d.name === nName);
+                                            if (!node) return null;
+                                            const x1 = node.x;
+                                            const y1 = TIER_Y.nodes + ICON / 2 + 8;
+                                            const x2 = n.x + NET_ICON_W / 2;
+                                            const y2 = n.y;
+                                            return (
+                                                <line key={`ne-${n.name}-${nName}`}
+                                                    x1={x1} y1={y1} x2={x2} y2={y2}
+                                                    stroke="#9b59b6" strokeOpacity={0.16}
+                                                    strokeWidth={1} strokeDasharray="3,3" />
+                                            );
+                                        }))}
+                                        {/* NS May 2026 — per-VM → bridge edges */}
+                                        {diagramNodes.flatMap(node =>
+                                            (node.vms || []).flatMap(vm => {
+                                                const bridges = vmBridgesAll[String(vm.vmid)] || [];
+                                                return bridges.map(bname => {
+                                                    const np = networkPositions.find(n => n.name === bname);
+                                                    if (!np) return null;
+                                                    const isHovered = hoveredVm === vm.vmid;
+                                                    const dimmed = hoveredVm != null && !isHovered;
+                                                    return (
+                                                        <line key={`vmnt-${vm.vmid}-${bname}`}
+                                                            x1={vm.x} y1={vm.y + VM_ROW_H / 2}
+                                                            x2={np.x + NET_ICON_W / 2} y2={np.y}
+                                                            stroke="#9b59b6"
+                                                            strokeOpacity={isHovered ? 0.65 : (dimmed ? 0.04 : 0.12)}
+                                                            strokeWidth={isHovered ? 1.4 : 0.7}
+                                                            pointerEvents="none" />
+                                                    );
+                                                });
+                                            })
+                                        )}
+                                        {networkPositions.map(n => {
+                                            const vmCount = Array.isArray(n.vms) ? n.vms.length : 0;
+                                            const tooltipLines = [
+                                                `${n.type || 'bridge'}${n.cidr ? ' · ' + n.cidr : ''}`,
+                                                n.gateway ? `Gateway: ${n.gateway}` : null,
+                                                n.bridge_ports ? `Ports: ${n.bridge_ports}` : null,
+                                                `${vmCount} ${vmCount === 1 ? 'VM' : 'VMs'}`,
+                                            ].filter(Boolean);
+                                            return (
+                                                <g key={`net-${n.name}`} transform={`translate(${n.x}, ${n.y})`}
+                                                    style={{cursor: 'default'}}
+                                                    onMouseEnter={(e) => showTooltip(e, n.name, tooltipLines)}
+                                                    onMouseLeave={hideTooltip}>
+                                                    <rect width={NET_ICON_W} height={NET_ICON_H} rx={3}
+                                                        fill={topoColor.section}
+                                                        stroke="#9b59b6" strokeOpacity={0.55}
+                                                        strokeWidth={1} />
+                                                    {/* network icon */}
+                                                    <g transform="translate(7, 7)">
+                                                        <circle cx={5} cy={5} r={4} fill="none"
+                                                            stroke="#9b59b6" strokeWidth={1.3} />
+                                                        <line x1={5} y1={1} x2={5} y2={9}
+                                                            stroke="#9b59b6" strokeWidth={1.1} />
+                                                        <line x1={1} y1={5} x2={9} y2={5}
+                                                            stroke="#9b59b6" strokeWidth={1.1} />
+                                                    </g>
+                                                    <text x={24} y={13} fontSize={11} fontWeight={600}
+                                                        fill={topoColor.text}>
+                                                        {n.name.length > 14 ? n.name.substring(0, 13) + '…' : n.name}
+                                                    </text>
+                                                    <text x={24} y={25} fontSize={9}
+                                                        fill={topoColor.muted}>
+                                                        {n.type || 'bridge'}{vmCount ? ` · ${vmCount}` : ''}
+                                                    </text>
+                                                </g>
+                                            );
+                                        })}
+                                    </g>
+                                )}
                                     </React.Fragment>
                                 )}
                             </svg>
@@ -2756,33 +3203,166 @@
             };
             React.useEffect(() => { refresh(); /* eslint-disable-line */ }, [clusterId]);
 
-            // Hierarchical layout — 4 rows.
-            // row 0: cluster (1)
-            // row 1: nodes (N) and SDN VNets (M)
-            // row 2: bridges (per-node)
-            // row 3: VMs/CTs
+            // NS May 2026 — rebuilt the layout for high NIC / high VM counts.
+            // Old version flattened all VMs into one row at y=480; with 100 VMs
+            // the labels overlapped into a single illegible blob. New layout
+            // groups VMs under their owning bridge as a small column-wrapped
+            // grid and grows the SVG width based on cumulative content.
+            //
+            // Tiers:
+            //   row 0  cluster                  (centered)
+            //   row 1  SDN VNets + nodes        (spread)
+            //   row 2  bridges (per-node lane)  (nested under parent node)
+            //   row 3+ VMs/CTs                  (column under their bridge, wraps to multiple rows)
             const layout = React.useMemo(() => {
                 if (!graph) return null;
-                const W = 1200, H = 600, padX = 40;
+                const padX = 40;
+                const Y_CLUSTER = 50;
+                const Y_NODES = 150;
+                const Y_BRIDGES = 290;
+                const Y_VMS_TOP = 380;
+                const VM_W = 78;
+                const VM_H = 26;
+                const VM_GAP_X = 8;
+                const VM_GAP_Y = 8;
+                const VM_COLS = 4; // per bridge
+                const BRIDGE_MIN_W = 110;
+                const NODE_GAP = 50;
+
                 const positions = {};
                 const byKind = { cluster: [], node: [], sdn_vnet: [], bridge: [], bond: [], vm: [], ct: [] };
                 for (const n of graph.nodes) {
                     if (byKind[n.kind]) byKind[n.kind].push(n);
                 }
-                const place = (arr, y) => {
-                    const n = arr.length;
-                    if (!n) return;
-                    const span = W - padX * 2;
-                    const step = n > 1 ? span / (n - 1) : 0;
-                    arr.forEach((node, i) => {
-                        positions[node.id] = { x: padX + (n > 1 ? i * step : span / 2), y };
-                    });
+
+                // Build VM-per-bridge groups via 'attached' links
+                const vmsByBridge = {};
+                const vmIdToNode = {};
+                for (const vm of [...byKind.vm, ...byKind.ct]) {
+                    vmIdToNode[vm.id] = vm;
+                }
+                for (const link of (graph.links || [])) {
+                    if (link.kind !== 'attached') continue;
+                    const vm = vmIdToNode[link.source];
+                    if (!vm) continue;
+                    if (!vmsByBridge[link.target]) vmsByBridge[link.target] = [];
+                    vmsByBridge[link.target].push(vm);
+                }
+
+                // VMs/CTs without any 'attached' link → orphan bucket so we still
+                // render them somewhere (otherwise the user wonders why their VM
+                // disappeared from the diagram).
+                const placedVmIds = new Set();
+                for (const id of Object.keys(vmsByBridge)) {
+                    for (const vm of vmsByBridge[id]) placedVmIds.add(vm.id);
+                }
+                const orphanVms = [...byKind.vm, ...byKind.ct].filter(v => !placedVmIds.has(v.id));
+
+                // For each bridge: column count = ceil(VM count / rows-per-col).
+                // We use VM_COLS columns, wrapping to as many rows as needed.
+                const bridgeWidth = (br) => {
+                    const vms = vmsByBridge[br.id] || [];
+                    const cols = Math.min(VM_COLS, Math.max(1, vms.length));
+                    const w = cols * VM_W + Math.max(0, cols - 1) * VM_GAP_X;
+                    return Math.max(BRIDGE_MIN_W, w);
                 };
-                place(byKind.cluster, 40);
-                place([...byKind.node, ...byKind.sdn_vnet], 130);
-                place([...byKind.bridge, ...byKind.bond], 280);
-                place([...byKind.vm, ...byKind.ct], 480);
-                return { positions, W, H };
+
+                // Per-node lane width = sum of bridge widths + gaps.
+                const bridgesByNode = {};
+                for (const br of [...byKind.bridge, ...byKind.bond]) {
+                    const parent = br.parent_id || (br.id.startsWith('br:')
+                        ? `node:${br.id.split(':')[1]}` : null);
+                    if (!parent) continue;
+                    if (!bridgesByNode[parent]) bridgesByNode[parent] = [];
+                    bridgesByNode[parent].push(br);
+                }
+                const nodeWidth = (nodeId) => {
+                    const brs = bridgesByNode[nodeId] || [];
+                    if (!brs.length) return 160;
+                    const total = brs.reduce((s, b) => s + bridgeWidth(b), 0)
+                                + Math.max(0, brs.length - 1) * 24;
+                    return Math.max(160, total);
+                };
+
+                // Assign X positions per node (left-to-right)
+                const nodeList = byKind.node;
+                const nodeWidths = nodeList.map(n => nodeWidth(n.id));
+                const totalNodeW = nodeWidths.reduce((s, w) => s + w, 0)
+                                 + Math.max(0, nodeList.length - 1) * NODE_GAP;
+                const sdnW = byKind.sdn_vnet.length * 130;
+                const contentW = Math.max(totalNodeW + (sdnW ? sdnW + 80 : 0), 720);
+                const W = contentW + padX * 2;
+
+                // Cluster — centered
+                if (byKind.cluster[0]) positions[byKind.cluster[0].id] = { x: W / 2, y: Y_CLUSTER };
+
+                // SDN VNets in their own band on the right of the node row
+                let cursorX = padX;
+                byKind.sdn_vnet.forEach((sdn, i) => {
+                    positions[sdn.id] = { x: padX + i * 130 + 60, y: Y_NODES - 40 };
+                });
+                cursorX = padX + (byKind.sdn_vnet.length ? sdnW + 60 : 0);
+
+                // Nodes laid out left-to-right with their bridge children nested below
+                let maxBridgeBottom = Y_BRIDGES;
+                let maxVmBottom = Y_VMS_TOP;
+                nodeList.forEach((n, i) => {
+                    const w = nodeWidths[i];
+                    const center = cursorX + w / 2;
+                    positions[n.id] = { x: center, y: Y_NODES };
+
+                    // place bridges of this node within [cursorX, cursorX+w]
+                    const brs = bridgesByNode[n.id] || [];
+                    const brWs = brs.map(bridgeWidth);
+                    const brTotal = brWs.reduce((s, x) => s + x, 0)
+                                  + Math.max(0, brs.length - 1) * 24;
+                    let brX = cursorX + (w - brTotal) / 2;
+                    brs.forEach((br, bi) => {
+                        const brW = brWs[bi];
+                        const brCenter = brX + brW / 2;
+                        positions[br.id] = { x: brCenter, y: Y_BRIDGES };
+
+                        // VMs under this bridge — multi-row grid centered on bridge X
+                        const vms = vmsByBridge[br.id] || [];
+                        const cols = Math.min(VM_COLS, Math.max(1, vms.length));
+                        vms.forEach((vm, vi) => {
+                            const row = Math.floor(vi / VM_COLS);
+                            const col = vi % VM_COLS;
+                            const inThisRow = Math.min(VM_COLS, vms.length - row * VM_COLS);
+                            const rowW = inThisRow * VM_W + (inThisRow - 1) * VM_GAP_X;
+                            const startX = brCenter - rowW / 2 + VM_W / 2;
+                            const x = startX + col * (VM_W + VM_GAP_X);
+                            const y = Y_VMS_TOP + row * (VM_H + VM_GAP_Y);
+                            positions[vm.id] = { x, y };
+                            maxVmBottom = Math.max(maxVmBottom, y);
+                        });
+
+                        brX += brW + 24;
+                    });
+                    if (brs.length) maxBridgeBottom = Math.max(maxBridgeBottom, Y_BRIDGES);
+
+                    cursorX += w + NODE_GAP;
+                });
+
+                // Orphan VMs (no bridge link) get a band below everything else
+                if (orphanVms.length) {
+                    const orphanRowY = maxVmBottom + 60;
+                    const cols = Math.max(1, Math.min(8, Math.floor((W - padX * 2) / (VM_W + VM_GAP_X))));
+                    orphanVms.forEach((vm, i) => {
+                        const row = Math.floor(i / cols);
+                        const col = i % cols;
+                        const inThisRow = Math.min(cols, orphanVms.length - row * cols);
+                        const rowW = inThisRow * VM_W + (inThisRow - 1) * VM_GAP_X;
+                        const startX = (W - rowW) / 2 + VM_W / 2;
+                        const x = startX + col * (VM_W + VM_GAP_X);
+                        const y = orphanRowY + row * (VM_H + VM_GAP_Y);
+                        positions[vm.id] = { x, y };
+                        maxVmBottom = Math.max(maxVmBottom, y);
+                    });
+                }
+
+                const H = Math.max(420, maxVmBottom + 60);
+                return { positions, W, H, vmDims: { w: VM_W, h: VM_H } };
             }, [graph]);
 
             const nodeColor = (kind) => ({
@@ -2844,38 +3424,78 @@
                                 </div>
                             </div>
 
-                            <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-3 overflow-x-auto">
-                                <svg viewBox={`0 0 ${layout.W} ${layout.H}`} style={{ width: '100%', height: 600 }}>
-                                    {/* links */}
+                            <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-3 overflow-auto">
+                                <svg viewBox={`0 0 ${layout.W} ${layout.H}`}
+                                    style={{ width: layout.W > 1400 ? `${layout.W}px` : '100%', height: layout.H, display: 'block' }}>
+                                    {/* links — bezier from parent to child for the tree edges,
+                                        straight muted line for VM↔bridge attachments */}
                                     {graph.links.map((l, i) => {
                                         const a = layout.positions[l.source];
                                         const b = layout.positions[l.target];
                                         if (!a || !b) return null;
                                         const dim = highlight && !(l.source === highlight || l.target === highlight);
+                                        const isAttached = l.kind === 'attached';
+                                        // For tree edges (cluster→node→bridge), use a soft bezier
+                                        const midY = (a.y + b.y) / 2;
+                                        const path = `M ${a.x} ${a.y} C ${a.x} ${midY}, ${b.x} ${midY}, ${b.x} ${b.y}`;
                                         return (
-                                            <line key={i} x1={a.x} y1={a.y} x2={b.x} y2={b.y}
-                                                stroke={dim ? '#2a3441' : '#4a5563'}
-                                                strokeWidth={dim ? 0.5 : 1}
-                                                strokeDasharray={l.kind === 'sdn' ? '4 2' : ''} />
+                                            <path key={i} d={path}
+                                                fill="none"
+                                                stroke={dim ? '#2a3441' : (isAttached ? '#3b82f6' : '#4a5563')}
+                                                strokeOpacity={dim ? 0.3 : (isAttached ? 0.35 : 0.7)}
+                                                strokeWidth={dim ? 0.5 : (isAttached ? 0.8 : 1.2)}
+                                                strokeDasharray={l.kind === 'sdn' ? '4 2' : (isAttached ? '2 3' : '')} />
                                         );
                                     })}
-                                    {/* nodes */}
+                                    {/* nodes — VMs as small pills, infra as circles */}
                                     {graph.nodes.map(n => {
                                         const p = layout.positions[n.id];
                                         if (!p) return null;
                                         const linked = isLinked(n.id);
                                         const dim = highlight && !linked;
+                                        const isVm = n.kind === 'vm' || n.kind === 'ct';
+                                        if (isVm) {
+                                            // pill rectangle for VMs/CTs — label fits inside
+                                            const w = layout.vmDims?.w || 78;
+                                            const h = layout.vmDims?.h || 26;
+                                            const fill = n.kind === 'vm' ? '#1f2937' : '#1e293b';
+                                            const stroke = n.meta?.status === 'running' ? '#10b981'
+                                                : (n.meta?.status === 'stopped' ? '#6b7280' : '#374151');
+                                            return (
+                                                <g key={n.id}
+                                                   onClick={() => setHighlight(highlight === n.id ? null : n.id)}
+                                                   style={{ cursor: 'pointer', opacity: dim ? 0.25 : 1 }}>
+                                                    <rect x={p.x - w/2} y={p.y - h/2} width={w} height={h} rx={3}
+                                                        fill={highlight === n.id ? '#1e3a5f' : fill}
+                                                        stroke={highlight === n.id ? '#fff' : stroke}
+                                                        strokeWidth={highlight === n.id ? 1.5 : 1} />
+                                                    {/* type indicator */}
+                                                    <rect x={p.x - w/2} y={p.y - h/2} width={3} height={h}
+                                                        fill={n.kind === 'vm' ? '#3b82f6' : '#a855f7'} rx={1.5} />
+                                                    <text x={p.x + 2} y={p.y + 4} textAnchor="middle"
+                                                        fontSize={10} fill="#d1d5db" fontFamily="sans-serif"
+                                                        style={{ pointerEvents: 'none' }}>
+                                                        {n.label.length > 11 ? n.label.substring(0, 10) + '…' : n.label}
+                                                    </text>
+                                                </g>
+                                            );
+                                        }
                                         const r = n.kind === 'cluster' ? 22 :
                                                   (n.kind === 'node' || n.kind === 'sdn_vnet') ? 16 :
-                                                  (n.kind === 'bridge' || n.kind === 'bond') ? 12 : 8;
+                                                  (n.kind === 'bridge' || n.kind === 'bond') ? 13 : 8;
                                         return (
                                             <g key={n.id} onClick={() => setHighlight(highlight === n.id ? null : n.id)}
                                                style={{ cursor: 'pointer', opacity: dim ? 0.3 : 1 }}>
                                                 <circle cx={p.x} cy={p.y} r={r} fill={nodeColor(n.kind)}
                                                     stroke={highlight === n.id ? '#fff' : 'none'} strokeWidth={2} />
                                                 <text x={p.x} y={p.y + r + 12} textAnchor="middle"
-                                                    fontSize={n.kind === 'cluster' ? 13 : 10}
-                                                    fill="#d1d5db" fontFamily="sans-serif">{n.label}</text>
+                                                    fontSize={n.kind === 'cluster' ? 13 : (n.kind === 'bridge' || n.kind === 'bond') ? 10 : 11}
+                                                    fill="#d1d5db" fontFamily="sans-serif"
+                                                    style={{ pointerEvents: 'none' }}>
+                                                    {n.kind === 'bridge' || n.kind === 'bond'
+                                                        ? (n.label.length > 14 ? n.label.substring(0, 13) + '…' : n.label)
+                                                        : n.label}
+                                                </text>
                                             </g>
                                         );
                                     })}
@@ -5954,11 +6574,16 @@
                         const br = await authFetch(`${API_URL}/clusters/${clusterId}/nodes/${nodeName}/networks`);
                         if (br && br.ok) {
                             const d = await br.json();
-                            const items = (d.data || d || []).filter(n =>
-                                n.type === 'bridge' ||
-                                n.type === 'OVSBridge' ||
-                                n.iface?.startsWith('vmbr')
-                            );
+                            const items = (d.data || d || []).filter(n => {
+                                // NS May 2026 (#385): an OVSIntPort or OVSPort references its
+                                // parent bridge via n.ovs_bridge — the entry itself is a port
+                                // INSIDE a bridge, not a bridge. Without this guard, OVS access
+                                // ports like 'mgmt'/'iscsi*' showed up as connectable bridges.
+                                if (n.type === 'OVSIntPort' || n.type === 'OVSPort' || n.type === 'OVSBond') return false;
+                                if (n.ovs_bridge) return false;  // points to parent → is itself a port
+                                return n.type === 'bridge' || n.type === 'OVSBridge'
+                                    || n.iface?.startsWith('vmbr');
+                            });
                             items.forEach(n => collected.push({ iface: n.iface, type: n.type || 'bridge' }));
                         }
                         // SDN vnets live on a separate endpoint and don't show up under /nodes/.../network
@@ -6613,6 +7238,10 @@
             const [showAddDropdown, setShowAddDropdown] = useState(false);
             const [addClusterType, setAddClusterType] = useState('proxmox');
             const [showCreateVm, setShowCreateVm] = useState(null); // 'qemu' or 'lxc'
+            // NS May 2026 — when right-click "Create VM" jumps the user to a different
+            // cluster, defer the modal until that cluster's metrics actually arrived.
+            // Otherwise the modal mounts with the *previous* cluster's nodes/storages.
+            const [pendingCreateVm, setPendingCreateVm] = useState(null);  // {type, clusterId}
             const [loading, setLoading] = useState(false);
             const [error, setError] = useState(null);
             const [toasts, setToasts] = useState([]);
@@ -6624,6 +7253,12 @@
             const [showProfile, setShowProfile] = useState(false);
             // LW Apr 2026 — global fuzzy-search palette (Ctrl/Cmd+K)
             const [showCommandPalette, setShowCommandPalette] = useState(false);
+            // MK May 2026 — shortcuts overlay (`?`)
+            const [showShortcutsModal, setShowShortcutsModal] = useState(false);
+            // NS May 2026 — bulk-action selection state for VM list
+            const [bulkSelection, setBulkSelection] = useState({});  // { 'clusterId:vmid': true }
+            // LW May 2026 — VM quick filter chips
+            const [vmQuickFilter, setVmQuickFilter] = useState([]);  // ['running','stopped','snap','tag:foo']
             const [wsConnected, setWsConnected] = useState(false);
             const wsConnectedRef = useRef(false);  // NS: Ref for health check access
             const [tasks, setTasks] = useState([]);
@@ -6669,6 +7304,32 @@
             const [pbsTasks, setPbsTasks] = useState([]);
             const [pbsJobs, setPbsJobs] = useState({});
             const [pbsActiveTab, setPbsActiveTab] = useState('dashboard');
+            // NS May 2026 — VM backup status map (vmid -> {status, last_age, ...})
+            const [vmsBackupStatus, setVmsBackupStatus] = useState({});
+            // NS May 2026 — running backup progress pane (UPID + node)
+            const [activeBackupProgress, setActiveBackupProgress] = useState(null);  // {upid, node}
+            // listen for cross-component events to open the progress pane
+            useEffect(() => {
+                const onShow = (e) => { if (e.detail?.upid && e.detail?.node) setActiveBackupProgress(e.detail); };
+                window.addEventListener('pegaprox-show-backup-progress', onShow);
+                return () => window.removeEventListener('pegaprox-show-backup-progress', onShow);
+            }, []);
+
+            // NS May 2026 — open the deferred Create-VM modal once the new cluster's
+            // metrics have been fetched (so we don't pass stale node/storage props).
+            useEffect(() => {
+                if (!pendingCreateVm) return;
+                if (selectedCluster?.id !== pendingCreateVm.clusterId) return;
+                if (Object.keys(clusterMetrics || {}).length === 0) return;  // wait for fetch
+                setShowCreateVm(pendingCreateVm.type);
+                setPendingCreateVm(null);
+            }, [pendingCreateVm, selectedCluster?.id, clusterMetrics]);
+            // NS May 2026 — restore wizard state
+            const [showRestoreWizard, setShowRestoreWizard] = useState(null);  // {snapshot, datastoreName}
+            // LW May 2026 — encryption key modal
+            const [showEncryptionKeyModal, setShowEncryptionKeyModal] = useState(false);
+            // NS May 2026 — auto-verify-schedule modal
+            const [showVerifyScheduleModal, setShowVerifyScheduleModal] = useState(false);
             // MK Apr 2026: #273 — PBS Reports state
             const [pbsReportDays, setPbsReportDays] = useState(30);
             const [pbsReportSummary, setPbsReportSummary] = useState(null);
@@ -6961,6 +7622,12 @@
             const expandedSidebarClustersRef = useRef({});
             const sseClientIdRef = useRef(null);  // capture from SSE connected msg
             const sidebarClusterDataRef = useRef({});
+            // NS May 2026 — per-cluster fail counter + skip-until timestamp
+            // to suppress 503 spam when a cluster keeps failing.
+            const clusterFailureRef = useRef({});  // {clusterId: {fails, skip_until}}
+            // NS May 2026 — last SSE message timestamp; watchdog force-reconnects
+            // if no message (incl. heartbeat) for >30s
+            const lastSseMessageAt = useRef(0);
             const selectedVMwareRef = useRef(null);  // for SSE VMware events
             const vmwareSelectedVmRef = useRef(null);  // for SSE VMware VM detail
             const vmwareSelectedMigrationRef = useRef(null);  // for SSE migration updates
@@ -7166,6 +7833,20 @@
             const removeToast = (id) => {
                 setToasts(prev => prev.filter(toast => toast.id !== id));
             };
+
+            // MK May 2026 — one-time discoverability hint for the new ?-shortcuts.
+            // localStorage flag survives reloads; per-browser, not per-user (simple).
+            useEffect(() => {
+                if (!user) return;
+                try {
+                    if (localStorage.getItem('pegaprox-shortcuts-hint-shown')) return;
+                    const id = setTimeout(() => {
+                        addToast(t('shortcutsHint') || 'Press ? for keyboard shortcuts', 'info');
+                        try { localStorage.setItem('pegaprox-shortcuts-hint-shown', '1'); } catch (_) {}
+                    }, 3500);
+                    return () => clearTimeout(id);
+                } catch (_) { /* localStorage may be blocked */ }
+            }, [user?.id]);
 
             // LW: Feb 2026 - corporate sidebar resize handlers
             const handleSidebarResizeStart = (e) => {
@@ -7671,6 +8352,12 @@
                         >
                             <Icons.Database className="w-3.5 h-3.5 flex-shrink-0" style={{color: isActive ? '#e5a00d' : '#728b9a'}} />
                             <span className="truncate flex-1" style={{opacity: isActive ? 1 : 0.5}}>{store.storage}</span>
+                            {/* NS May 2026 — node-offline marker so user sees why size is empty */}
+                            {store.node_offline && (
+                                <span className="text-[10px] px-1 rounded ml-1" style={{background: 'rgba(245,79,71,0.15)', color: '#f54f47'}}>
+                                    {t('offline') || 'offline'}
+                                </span>
+                            )}
                             {isActive && store.total > 0 && (
                                 <span className="flex items-center gap-1 ml-auto flex-shrink-0">
                                     <span className="w-12 h-1 rounded-full overflow-hidden" style={{background: 'var(--corp-bar-track, #1a2e38)'}}>
@@ -7703,11 +8390,17 @@
                                 .filter(s => !sharedNames.has(s.storage))
                                 .sort((a, b) => (a.storage || '').localeCompare(b.storage || ''));
                             if (nodeStores.length === 0) return null;
+                            const nodeIsOffline = nodeStores.length > 0 && nodeStores.every(s => s.node_offline);
                             return (
                                 <React.Fragment key={`dsn-${clusterId}-${nodeName}`}>
-                                    <div className="flex items-center gap-1.5 pl-1 py-0.5 mt-0.5 text-[11px] uppercase tracking-wider" style={{color: '#5a7a8a'}}>
+                                    <div className="flex items-center gap-1.5 pl-1 py-0.5 mt-0.5 text-[11px] uppercase tracking-wider" style={{color: nodeIsOffline ? '#f54f47' : '#5a7a8a'}}>
                                         <Icons.Server className="w-3 h-3 flex-shrink-0" />
                                         <span>{nodeName}</span>
+                                        {nodeIsOffline && (
+                                            <span className="ml-1 normal-case tracking-normal" style={{color: '#f54f47', fontSize: '10px'}}>
+                                                · {t('offline') || 'offline'}
+                                            </span>
+                                        )}
                                     </div>
                                     <div className="ml-2">
                                         {nodeStores.map(s => renderStoreItem(s, nodeName))}
@@ -7932,22 +8625,65 @@
             // NS: Ctrl/Cmd+K opens the command palette (LW Apr 2026 — promoted from
             // plain header-search-focus to a proper fullscreen palette with actions).
             // The header input still focuses with "/"  for the old flow.
+            // MK May 2026 — extended with `?` (shortcuts), `g` two-key chords, `r` refresh
+            const gKeyTimerRef = useRef(null);
+            const gKeyArmedRef = useRef(false);
             React.useEffect(() => {
+                const isTextual = (el) => el && (['INPUT','TEXTAREA','SELECT'].includes(el.tagName) || el.isContentEditable);
+                const armG = () => {
+                    gKeyArmedRef.current = true;
+                    if (gKeyTimerRef.current) clearTimeout(gKeyTimerRef.current);
+                    gKeyTimerRef.current = setTimeout(() => { gKeyArmedRef.current = false; }, 1200);
+                };
                 const handleKeyDown = (e) => {
                     if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
                         e.preventDefault();
                         setShowCommandPalette(true);
-                    } else if (e.key === '/' && !['INPUT', 'TEXTAREA'].includes(e.target.tagName)) {
+                        return;
+                    }
+                    if (e.key === '/' && !isTextual(e.target)) {
                         e.preventDefault();
                         if (globalSearchRef.current) {
                             globalSearchRef.current.focus();
                             setShowGlobalSearch(true);
                         }
+                        return;
+                    }
+                    if (isTextual(e.target) || e.ctrlKey || e.metaKey || e.altKey) return;
+                    if (e.key === '?') { e.preventDefault(); setShowShortcutsModal(true); return; }
+                    // two-key chord: g d / g r / g s / g a / g p / g ,
+                    if (gKeyArmedRef.current) {
+                        gKeyArmedRef.current = false;
+                        if (gKeyTimerRef.current) clearTimeout(gKeyTimerRef.current);
+                        const map = { d: 'overview', r: 'resources', s: 'datacenter', a: 'automation', p: 'reports' };
+                        if (map[e.key]) { e.preventDefault(); setActiveTab(map[e.key]); return; }
+                        if (e.key === ',') { e.preventDefault(); setShowSettings(true); return; }
+                        return;
+                    }
+                    if (e.key === 'g') { e.preventDefault(); armG(); return; }
+                    if (e.key === 'r' && selectedCluster) {
+                        e.preventDefault();
+                        try { fetchClusterMetrics(selectedCluster.id); } catch (_) {}
+                        try { fetchClusterResources(selectedCluster.id); } catch (_) {}
+                        return;
+                    }
+                    if (e.key === 't') {
+                        e.preventDefault();
+                        const cur = document.body?.dataset?.corpTheme === 'light' ? 'light' : 'dark';
+                        const next = cur === 'light' ? 'dark' : 'light';
+                        try {
+                            document.body.dataset.corpTheme = next;
+                            localStorage.setItem('pegaprox-corp-theme', next);
+                        } catch (_) {}
+                        return;
                     }
                 };
                 document.addEventListener('keydown', handleKeyDown);
-                return () => document.removeEventListener('keydown', handleKeyDown);
-            }, []);
+                return () => {
+                    document.removeEventListener('keydown', handleKeyDown);
+                    if (gKeyTimerRef.current) clearTimeout(gKeyTimerRef.current);
+                };
+            }, [selectedCluster]);
             
             // LW: jump to VM in the right cluster when clicking a search result
             // LW: Mar 2026 - navigate directly to VM detail instead of just selecting cluster
@@ -8305,6 +9041,19 @@
                 if (resourcesSubTab !== 'logs') return;
                 fetchLogEvents();
             }, [resourcesSubTab, logEventsPage, logEventsSortBy, logEventsSortDir, appliedLogEventFilters, selectedCluster?.id]);
+
+            // NS May 2026 (#387): when the user enters the Logs subtab while a specific
+            // node is in scope (sidebar selection), auto-populate the hostname filter
+            // so they see only that node's syslog instead of every host PegaProx ingests.
+            // User can clear / change the filter in the UI if they want the wider view.
+            useEffect(() => {
+                if (resourcesSubTab !== 'logs') return;
+                const nodeName = selectedSidebarNode?.name;
+                if (!nodeName) return;
+                if (logEventFilters.hostname === nodeName) return;  // already set
+                setLogEventFilters(prev => ({ ...prev, hostname: nodeName }));
+                setAppliedLogEventFilters(prev => ({ ...prev, hostname: nodeName }));
+            }, [resourcesSubTab, selectedSidebarNode?.name]);
             
             // ============================================
             // Scheduled Actions Functions - MK Jan 2026  
@@ -9034,10 +9783,15 @@
                     };
                     
                     eventSource.onmessage = (event) => {
+                        // NS May 2026 — track last-message-at for the watchdog
+                        lastSseMessageAt.current = Date.now();
                         try {
                             const data = JSON.parse(event.data);
                             const currentCluster = selectedClusterRef.current;
-                            
+
+                            // heartbeat is just a ping — nothing else to do
+                            if (data.type === 'heartbeat') return;
+
                             if (data.type === 'connected') {
                                 sseClientIdRef.current = data.client_id;
                                 console.log('SSE authenticated, client:', data.client_id);
@@ -9374,13 +10128,22 @@
                 connectSSE();
                 
                 // NS: Health check - if disconnected for >30 seconds, force reconnect
+                // NS May 2026 — also: if SSE looks "open" but no messages for >30s,
+                // server-side broadcast loop is stuck — force-reconnect anyway.
                 const healthCheckInterval = setInterval(() => {
-                    if (!wsConnectedRef.current && !isClosing && eventSource?.readyState === EventSource.CLOSED) {
-                        console.log('SSE: Health check detected closed connection, reconnecting...');
-                        reconnectAttempts = 0;  // Reset attempts
+                    if (isClosing) return;
+                    const sinceLast = Date.now() - (lastSseMessageAt.current || 0);
+                    const looksClosed = eventSource?.readyState === EventSource.CLOSED;
+                    const wedged = lastSseMessageAt.current > 0 && sinceLast > 30000;
+                    if (looksClosed || wedged) {
+                        console.log(`SSE: ${looksClosed ? 'closed' : 'wedged ('+Math.round(sinceLast/1000)+'s no msg)'}, reconnecting`);
+                        reconnectAttempts = 0;
+                        if (eventSource) {
+                            try { eventSource.close(); } catch (_) {}
+                        }
                         connectSSE();
                     }
-                }, 30000);
+                }, 10000);
                 
                 return () => {
                     isClosing = true;
@@ -9489,6 +10252,33 @@
             };
 
             // MK Apr 2026: #273 — PBS Reports fetchers
+            // NS May 2026 — vm-name lookup for PBS views. PBS only stores VMID,
+            // PegaProx knows the names from the linked PVE clusters. Memoised by
+            // the dependency triple (linked clusters of selected PBS, plus the
+            // cached guests-per-cluster map). Returns name or '' (never undefined).
+            const pbsVmNameLookup = React.useMemo(() => {
+                const map = new Map();
+                const clusterIds = selectedPBS?.linked_clusters?.length
+                    ? selectedPBS.linked_clusters
+                    : Object.keys(allClusterGuests || {});
+                for (const cid of clusterIds) {
+                    const guests = allClusterGuests?.[cid] || [];
+                    for (const g of guests) {
+                        if (g.vmid != null) {
+                            const k = `${g.type === 'lxc' ? 'ct' : 'vm'}/${g.vmid}`;
+                            // first-seen wins, prevents flapping when same VMID
+                            // exists across clusters (uncommon but possible)
+                            if (!map.has(k)) map.set(k, g.name || '');
+                        }
+                    }
+                }
+                return map;
+            }, [selectedPBS?.id, selectedPBS?.linked_clusters, allClusterGuests]);
+            const pbsLookupName = (backupType, backupId) => {
+                const k = `${backupType}/${backupId}`;
+                return pbsVmNameLookup.get(k) || '';
+            };
+
             const fetchPBSReportSummary = async (pbsId, days) => {
                 setPbsReportLoading(true);
                 try {
@@ -10588,6 +11378,11 @@
                         const allGuests = [];
                         
                         for (const cluster of connectedClusters) {
+                            // NS May 2026 — skip clusters that recently 503'd until cooldown
+                            const failState = clusterFailureRef.current[cluster.id];
+                            if (failState && failState.skip_until > Date.now()) {
+                                continue;
+                            }
                             try {
                                 // datacenter status
                                 const statusResp = await authFetch(`${API_URL}/clusters/${cluster.id}/datacenter/status`);
@@ -10600,6 +11395,15 @@
                                             lastUpdate: new Date()
                                         }
                                     }));
+                                    // success — clear failure state
+                                    delete clusterFailureRef.current[cluster.id];
+                                } else if (statusResp && (statusResp.status === 503 || statusResp.status === 504 || statusResp.status === 502)) {
+                                    // backoff — cooldown grows with consecutive fails
+                                    const f = clusterFailureRef.current[cluster.id] || { fails: 0 };
+                                    f.fails = Math.min(f.fails + 1, 6);
+                                    // 5s, 10s, 20s, 40s, 80s, 160s
+                                    f.skip_until = Date.now() + (5000 * Math.pow(2, f.fails - 1));
+                                    clusterFailureRef.current[cluster.id] = f;
                                 }
                                 
                                 // get vms/cts for the top guests table + topology
@@ -10696,7 +11500,23 @@
                 }
             };
 
+            // NS May 2026 — backup status fetcher; called in parallel with resources
+            const fetchVmsBackupStatus = async (clusterId) => {
+                try {
+                    const r = await authFetch(`${API_URL}/clusters/${clusterId}/vms-backup-status`);
+                    if (r && r.ok) {
+                        const arr = await r.json();
+                        const map = {};
+                        for (const x of arr) map[x.vmid] = x;
+                        if (selectedClusterRef.current?.id !== clusterId) return;
+                        setVmsBackupStatus(map);
+                    }
+                } catch (_) { /* keep last */ }
+            };
+
             const fetchClusterResources = async (clusterId) => {
+                // fire backup-status fetch in parallel — independent of /resources
+                fetchVmsBackupStatus(clusterId);
                 try {
                     const response = await authFetch(`${API_URL}/clusters/${clusterId}/resources`);
                     if (response && response.ok) {
@@ -11458,8 +12278,42 @@
                 }
             };
 
-            const [consoleVm, setConsoleVm] = useState(null);
-            const [consoleInfo, setConsoleInfo] = useState(null);
+            // NS May 2026 — multi-console stack. Several consoles stay mounted in
+            // parallel; the active one is visible, the rest are hidden but keep
+            // their RFB/term state alive. consoleVm/consoleInfo kept for callsites
+            // that still treat the active console as the one source-of-truth.
+            const [consoleStack, setConsoleStack] = useState([]);  // [{id, vm, info}]
+            const [activeConsoleId, setActiveConsoleId] = useState(null);
+            const consoleVm = consoleStack.find(c => c.id === activeConsoleId)?.vm || null;
+            const consoleInfo = consoleStack.find(c => c.id === activeConsoleId)?.info || null;
+            // legacy setters used by a handful of call sites — keep semantics close
+            const setConsoleVm = (vm) => {
+                if (!vm) {
+                    setConsoleStack([]);
+                    setActiveConsoleId(null);
+                    return;
+                }
+                // pretend we always reuse — caller will follow up with setConsoleInfo
+                const id = `${vm._clusterId || ''}:${vm.type}:${vm.vmid}:${vm.node}`;
+                setConsoleStack(prev => prev.some(c => c.id === id)
+                    ? prev
+                    : [...prev, { id, vm, info: null }]);
+                setActiveConsoleId(id);
+            };
+            const setConsoleInfo = (info) => {
+                if (!info) return;
+                setConsoleStack(prev => {
+                    if (!prev.length) return prev;
+                    const last = prev[prev.length - 1];
+                    if (last.info) return prev;  // already populated
+                    return [...prev.slice(0, -1), { ...last, info }];
+                });
+            };
+            // NS May 2026 — LXC dedicated terminal (pct enter via SSH WS).
+            // Lives next to the existing VNC console; both are exposed as
+            // separate, always-visible entries (button + right-click menu)
+            // so the user picks at click-time without an extra dialog.
+            const [lxcShellVm, setLxcShellVm] = useState(null);
             const [corpMetricsVm, setCorpMetricsVm] = useState(null); // LW: Feb 2026 - metrics modal for corporate view
             const [configVm, setConfigVm] = useState(null);
             // NS: Mar 2026 - dashboard-level modals triggered from context menu + CorporateVmDetailView
@@ -11482,18 +12336,29 @@
                 if (!cId) return;
                 // NS: Feb 2026 - Use correct cluster's host for cross-cluster console
                 const cluster = clusters.find(c => c.id === cId) || selectedCluster;
-                setConsoleInfo({
+                const info = {
                     vmid: resource.vmid,
                     node: resource.node,
                     type: resource.type,
-                    host: cluster?.host
-                });
-                setConsoleVm(resource);
+                    host: cluster?.host,
+                };
+                const id = `${cId}:${resource.type}:${resource.vmid}:${resource.node}`;
+                setConsoleStack(prev => prev.some(c => c.id === id)
+                    ? prev  // re-activate existing tab
+                    : [...prev, { id, vm: { ...resource, _clusterId: cId }, info }]);
+                setActiveConsoleId(id);
             };
 
-            const handleCloseConsole = () => {
-                setConsoleVm(null);
-                setConsoleInfo(null);
+            const handleCloseConsole = (id = null) => {
+                setConsoleStack(prev => {
+                    const targetId = id || activeConsoleId;
+                    const filtered = prev.filter(c => c.id !== targetId);
+                    if (targetId === activeConsoleId) {
+                        const next = filtered[filtered.length - 1];
+                        setActiveConsoleId(next ? next.id : null);
+                    }
+                    return filtered;
+                });
             };
 
             const handleOpenConfig = (resource) => {
@@ -11513,8 +12378,19 @@
                 if (type === 'cluster') {
                     const cluster = target;
                     return [
-                        { label: t('newVm') || 'New VM', icon: <Icons.Monitor className="w-3.5 h-3.5" />, onClick: () => { setSelectedCluster(cluster); setShowCreateVm('qemu'); } },
-                        { label: t('newContainer') || 'New Container', icon: <Icons.Box className="w-3.5 h-3.5" />, onClick: () => { setSelectedCluster(cluster); setShowCreateVm('lxc'); } },
+                        { label: t('newVm') || 'New VM', icon: <Icons.Monitor className="w-3.5 h-3.5" />, onClick: () => {
+                            // NS May 2026 — if cluster is changing, defer modal until new metrics loaded
+                            if (selectedCluster?.id === cluster.id) { setShowCreateVm('qemu'); return; }
+                            setClusterMetrics({}); setClusterResources([]); setClusterDatastores({shared:[], local:{}});
+                            setSelectedCluster(cluster);
+                            setPendingCreateVm({ type: 'qemu', clusterId: cluster.id });
+                        }},
+                        { label: t('newContainer') || 'New Container', icon: <Icons.Box className="w-3.5 h-3.5" />, onClick: () => {
+                            if (selectedCluster?.id === cluster.id) { setShowCreateVm('lxc'); return; }
+                            setClusterMetrics({}); setClusterResources([]); setClusterDatastores({shared:[], local:{}});
+                            setSelectedCluster(cluster);
+                            setPendingCreateVm({ type: 'lxc', clusterId: cluster.id });
+                        }},
                         { separator: true },
                         { label: t('renameCluster') || 'Rename', icon: <Icons.Edit className="w-3.5 h-3.5" />, onClick: () => { setRenamingCluster(cluster); setRenameValue(cluster.display_name || cluster.name || ''); } },
                         { label: t('assignToGroup') || 'Assign to Group', icon: <Icons.FolderPlus className="w-3.5 h-3.5" />, onClick: () => setShowAssignGroup(cluster) },
@@ -11530,9 +12406,18 @@
                 if (type === 'node') {
                     const { nodeName, clusterId, online, maintenance } = target;
                     const selectCluster = () => { const c = clusters.find(cl => cl.id === clusterId); if (c && (!selectedCluster || selectedCluster.id !== clusterId)) setSelectedCluster(c); };
+                    // NS May 2026 — open Create modal in node context; defer if cluster changes
+                    const openCreateOnCluster = (vmType) => {
+                        if (selectedCluster?.id === clusterId) { setShowCreateVm(vmType); return; }
+                        const c = clusters.find(cl => cl.id === clusterId);
+                        if (!c) return;
+                        setClusterMetrics({}); setClusterResources([]); setClusterDatastores({shared:[], local:{}});
+                        setSelectedCluster(c);
+                        setPendingCreateVm({ type: vmType, clusterId });
+                    };
                     return [
-                        { label: t('newVm') || 'New VM', icon: <Icons.Monitor className="w-3.5 h-3.5" />, onClick: () => { selectCluster(); setShowCreateVm('qemu'); } },
-                        { label: t('newContainer') || 'New Container', icon: <Icons.Box className="w-3.5 h-3.5" />, onClick: () => { selectCluster(); setShowCreateVm('lxc'); } },
+                        { label: t('newVm') || 'New VM', icon: <Icons.Monitor className="w-3.5 h-3.5" />, onClick: () => openCreateOnCluster('qemu') },
+                        { label: t('newContainer') || 'New Container', icon: <Icons.Box className="w-3.5 h-3.5" />, onClick: () => openCreateOnCluster('lxc') },
                         { separator: true },
                         { label: maintenance ? (t('exitMaintenance') || 'Exit Maintenance') : (t('enterMaintenance') || 'Enter Maintenance'), icon: <Icons.Wrench className="w-3.5 h-3.5" />, onClick: async () => {
                             // NS: Mar 2026 - inline API call with known clusterId to avoid stale closure on selectedCluster
@@ -11616,6 +12501,8 @@
                         { label: t('power') || 'Power', icon: <Icons.Power className="w-3.5 h-3.5" />, submenu: powerItems },
                         { separator: true },
                         { label: t('console') || 'Console', icon: <Icons.Terminal className="w-3.5 h-3.5" />, onClick: () => handleOpenConsole(vm), disabled: !isRunning },
+                        // NS May 2026 — VNC ↔ Term toggle now lives inside the Console modal,
+                        // so the separate Terminal entry was removed (one entry point = clearer UX).
                         { label: t('editSettings') || 'Settings', icon: <Icons.Settings className="w-3.5 h-3.5" />, onClick: () => handleOpenConfig(vm) },
                     ];
                     // MK May 2026 — recovery action for V2P-migrated VMs whose static
@@ -12149,6 +13036,15 @@
                                                                 {t('pegaproxSettings')}
                                                             </button>
                                                         )}
+                                                        {/* MK May 2026 — discoverability: hotkey list */}
+                                                        <button
+                                                            onClick={() => { setShowUserMenu(false); setShowShortcutsModal(true); }}
+                                                            className="w-full px-4 py-2 text-left text-gray-300 hover:bg-proxmox-hover transition-colors flex items-center gap-2"
+                                                        >
+                                                            <Icons.Keyboard />
+                                                            <span className="flex-1">{t('keyboardShortcuts') || 'Keyboard shortcuts'}</span>
+                                                            <kbd className="text-[10px] opacity-60 px-1 rounded" style={{ border: '1px solid #485764' }}>?</kbd>
+                                                        </button>
                                                         <button
                                                             onClick={() => {
                                                                 setShowUserMenu(false);
@@ -12870,10 +13766,12 @@
                                                     { id: 'settings', labelKey: 'settings', icon: Icons.Settings },
                                                 ];
                                             })().filter(tab => {
-                                                if (tab.id === 'site-recovery') return user?.permissions?.includes('site_recovery.view');
-                                                if (tab.id === 'plugins') return user?.permissions?.includes('plugins.view');
-                                                if (tab.id === 'compliance') return user?.permissions?.includes('admin.audit') || user?.permissions?.includes('node.maintenance');
-                                                if (typeof tab.id === 'string' && tab.id.startsWith('plugin:')) return user?.permissions?.includes('plugins.view');
+                                                // #390 — admin role always passes (matches backend has_permission shortcut).
+                                                const can = (p) => user?.role === 'admin' || (Array.isArray(user?.permissions) && user.permissions.includes(p));
+                                                if (tab.id === 'site-recovery') return can('site_recovery.view');
+                                                if (tab.id === 'plugins') return can('plugins.view');
+                                                if (tab.id === 'compliance') return can('admin.audit') || can('node.maintenance');
+                                                if (typeof tab.id === 'string' && tab.id.startsWith('plugin:')) return can('plugins.view');
                                                 return true;
                                             }).map(tab => (
                                                 <button
@@ -12934,6 +13832,9 @@
                                                             }>
                                                                 {selectedCluster.connected ? t('online') : t('offline')}
                                                             </span>
+                                                            {selectedCluster.connected && (
+                                                                <ClusterHealthBadge clusterId={selectedCluster.id} authFetch={authFetch} apiUrl={API_URL} />
+                                                            )}
                                                         </div>
                                                         <button onClick={() => loadTabData('overview')} className="text-xs" style={{color: 'var(--corp-text-muted)', background: 'none', border: 'none', cursor: 'pointer'}}>
                                                             <Icons.RotateCw className="w-3 h-3 inline mr-1" />{t('refreshData') || 'Refresh'}
@@ -13342,6 +14243,7 @@
                                                         clusterId={selectedSidebarVm._clusterId || selectedCluster.id}
                                                         onAction={handleVmAction}
                                                         onOpenConsole={handleOpenConsole}
+                                                        onOpenLxcShell={(v) => setLxcShellVm(v)}
                                                         onOpenConfig={handleOpenConfig}
                                                         onBack={() => setSelectedSidebarVm(null)}
                                                         onMigrate={(vm) => setDashMigrateVm(vm)}
@@ -13419,6 +14321,7 @@
                                                             sourceCluster={selectedCluster}
                                                             onVmAction={handleVmAction}
                                                             onOpenConsole={handleOpenConsole}
+                                                        onOpenLxcShell={(v) => setLxcShellVm(v)}
                                                             onOpenConfig={handleOpenConfig}
                                                             onMigrate={handleMigrate}
                                                             onBulkMigrate={handleBulkMigrate}
@@ -13440,6 +14343,7 @@
                                                             addToast={addToast}
                                                             pendingVmAction={pendingVmAction}
                                                             onPendingActionConsumed={() => setPendingVmAction(null)}
+                                                            backupStatus={vmsBackupStatus}
                                                             onVmNavigate={isCorporate ? (vm) => {
                                                                 setSelectedSidebarVm({...vm, _clusterId: selectedCluster.id});
                                                                 setSelectedSidebarNode(null);
@@ -13471,6 +14375,35 @@
                                                                 <Icons.Plus className={isCorporate ? 'w-3 h-3' : ''} />
                                                                 {t('createContainer')}
                                                             </button>
+                                                            {/* LW — quick CSV export of the current VM list */}
+                                                            <button
+                                                                onClick={() => {
+                                                                    const rows = (clusterResources || []).filter(r => r.type === 'qemu' || r.type === 'lxc');
+                                                                    if (!rows.length) { addToast?.(t('noResources') || 'No VMs to export', 'info'); return; }
+                                                                    const cols = [
+                                                                        { key: 'vmid', label: 'VMID' },
+                                                                        { key: 'name', label: 'Name' },
+                                                                        { key: 'type', label: 'Type' },
+                                                                        { key: 'node', label: 'Node' },
+                                                                        { key: 'status', label: 'Status' },
+                                                                        { key: 'cpu', label: 'CPU%', map: r => r.cpu != null ? Math.round(r.cpu * 100) : '' },
+                                                                        { key: 'mem', label: 'Mem (MiB)', map: r => r.mem != null ? Math.round(r.mem / 1048576) : '' },
+                                                                        { key: 'maxmem', label: 'MemMax (MiB)', map: r => r.maxmem != null ? Math.round(r.maxmem / 1048576) : '' },
+                                                                        { key: 'tags', label: 'Tags', map: r => Array.isArray(r.tags) ? r.tags.join(';') : (r.tags || '') },
+                                                                    ];
+                                                                    const fname = `pegaprox-${selectedCluster?.name || 'cluster'}-vms-${new Date().toISOString().slice(0,10)}.csv`;
+                                                                    window.PegaProxDownloadCsv?.(fname, rows, cols);
+                                                                    addToast?.(`Exported ${rows.length} rows`, 'success');
+                                                                }}
+                                                                className={isCorporate
+                                                                    ? 'flex items-center gap-1.5 px-3 py-1.5 text-[13px] hover:bg-[#29414e] border border-[#485764]'
+                                                                    : 'flex items-center gap-2 px-4 py-2 bg-proxmox-darker rounded-lg text-gray-200 hover:bg-proxmox-card border border-proxmox-border transition-colors'
+                                                                }
+                                                                title={t('exportCsv') || 'Export CSV'}
+                                                            >
+                                                                <Icons.Download className={isCorporate ? 'w-3 h-3' : 'w-4 h-4'} />
+                                                                {t('exportCsv') || 'Export CSV'}
+                                                            </button>
                                                         </div>
                                                     </div>
                                                 )}
@@ -13478,126 +14411,159 @@
                                                 {/* Snapshot Overview Sub-Tab @gyptazy */}
                                                 {resourcesSubTab === 'snapshots' && (
                                                     <div className={isCorporate
-                                                        ? 'bg-proxmox-card border border-proxmox-border p-4 space-y-3'
+                                                        ? 'corp-snap-overview'
                                                         : 'bg-proxmox-card border border-proxmox-border rounded-xl p-6 space-y-4'
                                                     }>
-                                                        <div className="flex items-center justify-between">
-                                                            <div>
-                                                                <h3 className="text-lg font-semibold text-white">{t('snapshotsOverview') || 'Snapshot Overview'}</h3>
-                                                                <p className="text-sm text-gray-400 mt-1">
-                                                                    {t('snapshotsDesc') || 'Overview of the oldest snapshots in this cluster'}
-                                                                </p>
-                                                            </div>
-                                                            <div className="flex items-center gap-2">
-                                                                <input
-                                                                    type="date"
-                                                                    value={snapshotFilterDate}
-                                                                    onChange={(e) => setSnapshotFilterDate(e.target.value)}
-                                                                    className="rounded-lg bg-proxmox-dark border border-proxmox-border px-3 py-2 text-sm text-white focus:outline-none focus:ring-2 focus:ring-proxmox-orange"
-                                                                />
-                                                                <button
-                                                                    onClick={() => applySnapshotFilter(selectedCluster.id)}
-                                                                    disabled={!snapshotFilterDate}
-                                                                    className="rounded-lg bg-proxmox-orange px-4 py-2 text-sm font-medium text-white hover:bg-proxmox-orange/90 disabled:opacity-50 disabled:cursor-not-allowed"
-                                                                >
-                                                                    {t('filter') || 'Filter'}
-                                                                </button>
-                                                                <button
-                                                                    onClick={() => fetchGlobalSnapshots(selectedCluster.id)}
-                                                                    className="p-2 rounded-lg bg-proxmox-dark border border-proxmox-border text-gray-400 hover:text-white"
-                                                                    title="Refresh"
-                                                                >
-                                                                    <Icons.RotateCw className="w-4 h-4" />
-                                                                </button>
-                                                            </div>
-                                                        </div>
+                                                        {isCorporate ? (
+                                                          <div className="corp-snap-overview-header">
+                                                              <div className="flex items-center gap-3 min-w-0">
+                                                                  <Icons.Camera className="w-5 h-5" style={{color:'var(--corp-accent, #49afd9)'}} />
+                                                                  <div className="min-w-0">
+                                                                      <div className="corp-vm-modal-title">{t('snapshotsOverview') || 'Snapshot Overview'}</div>
+                                                                      <div className="corp-vm-modal-meta">
+                                                                          {Array.isArray(sortedSnapshots) ? `${sortedSnapshots.length} snapshot${sortedSnapshots.length === 1 ? '' : 's'}` : '—'}
+                                                                          {snapshotFilterDate ? ` · before ${snapshotFilterDate}` : ''}
+                                                                      </div>
+                                                                  </div>
+                                                              </div>
+                                                              <div className="flex items-center gap-2">
+                                                                  <input
+                                                                      type="date"
+                                                                      value={snapshotFilterDate}
+                                                                      onChange={(e) => setSnapshotFilterDate(e.target.value)}
+                                                                  />
+                                                                  <button
+                                                                      onClick={() => applySnapshotFilter(selectedCluster.id)}
+                                                                      disabled={!snapshotFilterDate}
+                                                                      className="corp-vm-btn corp-vm-btn-primary"
+                                                                  >
+                                                                      {t('filter') || 'Filter'}
+                                                                  </button>
+                                                                  <button
+                                                                      onClick={() => fetchGlobalSnapshots(selectedCluster.id)}
+                                                                      className="corp-vm-btn corp-vm-btn-ghost"
+                                                                      title="Refresh"
+                                                                  >
+                                                                      <Icons.RotateCw className="w-3.5 h-3.5" />
+                                                                  </button>
+                                                              </div>
+                                                          </div>
+                                                        ) : (
+                                                          <div className="flex items-center justify-between">
+                                                              <div>
+                                                                  <h3 className="text-lg font-semibold text-white">{t('snapshotsOverview') || 'Snapshot Overview'}</h3>
+                                                                  <p className="text-sm text-gray-400 mt-1">
+                                                                      {t('snapshotsDesc') || 'Overview of the oldest snapshots in this cluster'}
+                                                                  </p>
+                                                              </div>
+                                                              <div className="flex items-center gap-2">
+                                                                  <input
+                                                                      type="date"
+                                                                      value={snapshotFilterDate}
+                                                                      onChange={(e) => setSnapshotFilterDate(e.target.value)}
+                                                                      className="rounded-lg bg-proxmox-dark border border-proxmox-border px-3 py-2 text-sm text-white focus:outline-none focus:ring-2 focus:ring-proxmox-orange"
+                                                                  />
+                                                                  <button
+                                                                      onClick={() => applySnapshotFilter(selectedCluster.id)}
+                                                                      disabled={!snapshotFilterDate}
+                                                                      className="rounded-lg bg-proxmox-orange px-4 py-2 text-sm font-medium text-white hover:bg-proxmox-orange/90 disabled:opacity-50 disabled:cursor-not-allowed"
+                                                                  >
+                                                                      {t('filter') || 'Filter'}
+                                                                  </button>
+                                                                  <button
+                                                                      onClick={() => fetchGlobalSnapshots(selectedCluster.id)}
+                                                                      className="p-2 rounded-lg bg-proxmox-dark border border-proxmox-border text-gray-400 hover:text-white"
+                                                                      title="Refresh"
+                                                                  >
+                                                                      <Icons.RotateCw className="w-4 h-4" />
+                                                                  </button>
+                                                              </div>
+                                                          </div>
+                                                        )}
 
                                                         {snapshotsLoading ? (
-                                                            <div className="bg-proxmox-dark rounded-xl p-8 text-center">
-                                                                <div className="animate-spin w-8 h-8 border-2 border-proxmox-orange border-t-transparent rounded-full mx-auto mb-3"></div>
-                                                                <p className="text-gray-400">{t('loadingSnapshots') || 'Loading snapshots...'}</p>
+                                                            <div className={isCorporate ? 'corp-snap-empty' : 'bg-proxmox-dark rounded-xl p-8 text-center'}>
+                                                                <div className={isCorporate
+                                                                    ? 'animate-spin w-6 h-6 border-2 border-t-transparent mx-auto mb-3'
+                                                                    : 'animate-spin w-8 h-8 border-2 border-proxmox-orange border-t-transparent rounded-full mx-auto mb-3'}
+                                                                    style={isCorporate ? {borderColor:'var(--corp-accent)', borderTopColor:'transparent'} : undefined}
+                                                                ></div>
+                                                                <p className={isCorporate ? '' : 'text-gray-400'} style={isCorporate ? {color:'var(--corp-text-secondary)'} : undefined}>
+                                                                    {t('loadingSnapshots') || 'Loading snapshots...'}
+                                                                </p>
                                                             </div>
                                                         ) : !Array.isArray(sortedSnapshots) || sortedSnapshots.length === 0 ? (
-                                                            <div className="bg-proxmox-dark rounded-xl p-8 text-center">
-                                                                <Icons.Camera className="mx-auto mb-3 w-10 h-10 text-gray-600" />
-                                                                <p className="text-gray-500">
+                                                            <div className={isCorporate ? 'corp-snap-empty' : 'bg-proxmox-dark rounded-xl p-8 text-center'}>
+                                                                <Icons.Camera className={isCorporate ? 'mx-auto mb-3 w-9 h-9' : 'mx-auto mb-3 w-10 h-10 text-gray-600'} style={isCorporate ? {color:'var(--corp-text-muted, #728b9a)'} : undefined} />
+                                                                <p className={isCorporate ? '' : 'text-gray-500'} style={isCorporate ? {color:'var(--corp-text-secondary)'} : undefined}>
                                                                     {t('noSnapshots') || 'No snapshots found'}
                                                                 </p>
-                                                                <p className="text-xs text-gray-600 mt-2">
+                                                                <p className={isCorporate ? 'text-[11px] mt-2' : 'text-xs text-gray-600 mt-2'} style={isCorporate ? {color:'var(--corp-text-muted)'} : undefined}>
                                                                     {t('snapshotsHint') || 'Create snapshots on VMs to see them listed here'}
                                                                 </p>
                                                             </div>
                                                         ) : (
-                                                            <div className="overflow-x-auto bg-proxmox-dark rounded-xl border border-gray-800">
-                                                                <table className="min-w-full text-sm">
-                                                                    <thead className="bg-black/40 text-gray-400">
+                                                            <div className={isCorporate
+                                                                ? 'corp-snap-table-wrap'
+                                                                : 'overflow-x-auto bg-proxmox-dark rounded-xl border border-gray-800'}>
+                                                                <table className={isCorporate ? 'corp-snap-table' : 'min-w-full text-sm'}>
+                                                                    <thead className={isCorporate ? '' : 'bg-black/40 text-gray-400'}>
                                                                         <tr>
-                                                                            <th 
-                                                                                className="px-4 py-3 text-left cursor-pointer hover:text-white"
-                                                                                onClick={() => toggleSnapshotSort('vmid')}
-                                                                            >
+                                                                            <th onClick={() => toggleSnapshotSort('vmid')} className={isCorporate ? '' : 'px-4 py-3 text-left cursor-pointer hover:text-white'}>
                                                                                 VM ID {snapshotSortBy === 'vmid' && (snapshotSortDir === 'asc' ? '↑' : '↓')}
                                                                             </th>
-                                                                            <th 
-                                                                                className="px-4 py-3 text-left cursor-pointer hover:text-white"
-                                                                                onClick={() => toggleSnapshotSort('vm_name')}
-                                                                            >
+                                                                            <th onClick={() => toggleSnapshotSort('vm_name')} className={isCorporate ? '' : 'px-4 py-3 text-left cursor-pointer hover:text-white'}>
                                                                                 VM Name {snapshotSortBy === 'vm_name' && (snapshotSortDir === 'asc' ? '↑' : '↓')}
                                                                             </th>
-                                                                            <th 
-                                                                                className="px-4 py-3 text-left cursor-pointer hover:text-white"
-                                                                                onClick={() => toggleSnapshotSort('vm_type')}
-                                                                            >
+                                                                            <th onClick={() => toggleSnapshotSort('vm_type')} className={isCorporate ? '' : 'px-4 py-3 text-left cursor-pointer hover:text-white'}>
                                                                                 {t('snapshotsType') || 'Type'} {snapshotSortBy === 'vm_type' && (snapshotSortDir === 'asc' ? '↑' : '↓')}
                                                                             </th>
-                                                                            <th 
-                                                                                className="px-4 py-3 text-left cursor-pointer hover:text-white"
-                                                                                onClick={() => toggleSnapshotSort('node')}
-                                                                            >
+                                                                            <th onClick={() => toggleSnapshotSort('node')} className={isCorporate ? '' : 'px-4 py-3 text-left cursor-pointer hover:text-white'}>
                                                                                 Node {snapshotSortBy === 'node' && (snapshotSortDir === 'asc' ? '↑' : '↓')}
                                                                             </th>
-                                                                            <th 
-                                                                                className="px-4 py-3 text-left cursor-pointer hover:text-white"
-                                                                                onClick={() => toggleSnapshotSort('snapshot_name')}
-                                                                            >
+                                                                            <th onClick={() => toggleSnapshotSort('snapshot_name')} className={isCorporate ? '' : 'px-4 py-3 text-left cursor-pointer hover:text-white'}>
                                                                                 Snapshot {snapshotSortBy === 'snapshot_name' && (snapshotSortDir === 'asc' ? '↑' : '↓')}
                                                                             </th>
-                                                                            <th 
-                                                                                className="px-4 py-3 text-left cursor-pointer hover:text-white"
-                                                                                onClick={() => toggleSnapshotSort('snapshot_date')}
-                                                                            >
+                                                                            <th onClick={() => toggleSnapshotSort('snapshot_date')} className={isCorporate ? '' : 'px-4 py-3 text-left cursor-pointer hover:text-white'}>
                                                                                 {t('snapshotsDate') || 'Created'} {snapshotSortBy === 'snapshot_date' && (snapshotSortDir === 'asc' ? '↑' : '↓')}
                                                                             </th>
-                                                                            <th 
-                                                                                className="px-4 py-3 text-left cursor-pointer hover:text-white"
-                                                                                onClick={() => toggleSnapshotSort('age')}
-                                                                            >
+                                                                            <th onClick={() => toggleSnapshotSort('age')} className={isCorporate ? '' : 'px-4 py-3 text-left cursor-pointer hover:text-white'}>
                                                                                 {t('snapshotsAge') || 'Age'} {snapshotSortBy === 'age' && (snapshotSortDir === 'asc' ? '↑' : '↓')}
                                                                             </th>
-                                                                            <th className="px-4 py-3 text-right w-12">{t('snapshotsAction') || 'Action'}</th>
+                                                                            <th className={isCorporate ? 'corp-snap-action' : 'px-4 py-3 text-right w-12'}>{t('snapshotsAction') || 'Action'}</th>
                                                                         </tr>
                                                                     </thead>
-                                                                    <tbody className="divide-y divide-gray-800">
+                                                                    <tbody className={isCorporate ? '' : 'divide-y divide-gray-800'}>
                                                                         {sortedSnapshots.map((snap, idx) => (
                                                                             <tr
                                                                                 key={`${snap.vmid}-${snap.snapshot_name}-${idx}`}
-                                                                                className="group hover:bg-white/5 transition-colors"
+                                                                                className={isCorporate ? 'group' : 'group hover:bg-white/5 transition-colors'}
                                                                             >
-                                                                                <td className="px-4 py-3 text-gray-300">{snap.vmid ?? '-'}</td>
-                                                                                <td className="px-4 py-3 text-gray-200">{snap.vm_name ?? '-'}</td>
-                                                                                <td className="px-4 py-3">
-                                                                                    <span className={`px-2 py-1 rounded text-xs ${snap.vm_type === 'qemu' ? 'bg-blue-500/20 text-blue-400' : 'bg-purple-500/20 text-purple-400'}`}>
-                                                                                        {snap.vm_type === 'qemu' ? 'VM' : 'CT'}
-                                                                                    </span>
+                                                                                <td className={isCorporate ? '' : 'px-4 py-3 text-gray-300'}>{snap.vmid ?? '-'}</td>
+                                                                                <td className={isCorporate ? '' : 'px-4 py-3 text-gray-200'}>{snap.vm_name ?? '-'}</td>
+                                                                                <td className={isCorporate ? '' : 'px-4 py-3'}>
+                                                                                    {isCorporate ? (
+                                                                                        <span className="corp-snap-type-pill" style={snap.vm_type === 'qemu'
+                                                                                            ? {background:'rgba(73,175,217,0.12)', color:'var(--corp-accent, #49afd9)', borderColor:'rgba(73,175,217,0.30)'}
+                                                                                            : {background:'rgba(168,85,247,0.12)', color:'#c084fc', borderColor:'rgba(168,85,247,0.30)'}}>
+                                                                                            {snap.vm_type === 'qemu' ? 'VM' : 'CT'}
+                                                                                        </span>
+                                                                                    ) : (
+                                                                                        <span className={`px-2 py-1 rounded text-xs ${snap.vm_type === 'qemu' ? 'bg-blue-500/20 text-blue-400' : 'bg-purple-500/20 text-purple-400'}`}>
+                                                                                            {snap.vm_type === 'qemu' ? 'VM' : 'CT'}
+                                                                                        </span>
+                                                                                    )}
                                                                                 </td>
-                                                                                <td className="px-4 py-3 text-gray-300">{snap.node ?? '-'}</td>
-                                                                                <td className="px-4 py-3 font-mono text-gray-200">{snap.snapshot_name ?? '-'}</td>
-                                                                                <td className="px-4 py-3 text-gray-300">{snap.snapshot_date ?? '-'}</td>
-                                                                                <td className="px-4 py-3 text-yellow-400">{snap.age ?? '-'}</td>
-                                                                                <td className="px-4 py-3 text-right">
+                                                                                <td className={isCorporate ? '' : 'px-4 py-3 text-gray-300'}>{snap.node ?? '-'}</td>
+                                                                                <td className={isCorporate ? 'corp-snap-mono' : 'px-4 py-3 font-mono text-gray-200'}>{snap.snapshot_name ?? '-'}</td>
+                                                                                <td className={isCorporate ? '' : 'px-4 py-3 text-gray-300'}>{snap.snapshot_date ?? '-'}</td>
+                                                                                <td className={isCorporate ? 'corp-snap-age' : 'px-4 py-3 text-yellow-400'}>{snap.age ?? '-'}</td>
+                                                                                <td className={isCorporate ? 'corp-snap-action' : 'px-4 py-3 text-right'}>
                                                                                     <button
                                                                                         onClick={() => deleteGlobalSnapshot(snap, selectedCluster.id)}
-                                                                                        className="opacity-0 group-hover:opacity-100 transition text-red-500 hover:text-red-400"
+                                                                                        className={isCorporate
+                                                                                            ? 'corp-snap-delete'
+                                                                                            : 'opacity-0 group-hover:opacity-100 transition text-red-500 hover:text-red-400'}
                                                                                         title="Delete snapshot"
                                                                                     >
                                                                                         <Icons.Trash className="w-4 h-4" />
@@ -14817,6 +15783,7 @@
                                                         { id: 'costs', label: t('costDashboard') || 'Costs', icon: Icons.DollarSign },
                                                         { id: 'power', label: t('powerTitle') || 'Power & Carbon', icon: Icons.Zap },
                                                         { id: 'topology', label: t('topologyTitle') || 'Topology', icon: Icons.Network },
+                                                        { id: 'api-health', label: t('apiHealth') || 'API Health', icon: Icons.Zap },
                                                     ].map(tab => (
                                                         <button
                                                             key={tab.id}
@@ -15542,6 +16509,16 @@
                                                         t={t}
                                                     />
                                                 )}
+
+                                                {/* MK May 2026 — API latency dashboard */}
+                                                {reportSubTab === 'api-health' && selectedCluster?.id && (
+                                                    <ApiLatencyDashboard
+                                                        clusterId={selectedCluster.id}
+                                                        authFetch={authFetch}
+                                                        apiUrl={API_URL}
+                                                        t={t}
+                                                    />
+                                                )}
                                             </div>
                                         )}
 
@@ -16230,6 +17207,10 @@
                                                             {selectedPBS.connected ? 'Connected' : 'Disconnected'}
                                                         </span>
                                                         {pbsStatus?.version && <span>v{pbsStatus.version.version}</span>}
+                                                        {/* NS May 2026 — PBS health pill */}
+                                                        {selectedPBS.connected && (
+                                                            <PbsHealthBadge pbsId={selectedPBS.id} authFetch={authFetch} apiUrl={API_URL} />
+                                                        )}
                                                     </div>
                                                 </div>
                                             </div>
@@ -16243,6 +17224,22 @@
                                                             <Icons.Trash className="w-4 h-4" /> Delete
                                                         </button>
                                                     </>
+                                                )}
+                                                {/* LW May 2026 — Encryption Key generator */}
+                                                {isAdmin && (
+                                                    <button onClick={() => setShowEncryptionKeyModal(true)}
+                                                        className={isCorporate ? '' : 'px-3 py-2 rounded-lg bg-proxmox-card border border-proxmox-border text-gray-400 hover:text-yellow-400 hover:border-yellow-500/30 transition-all text-sm flex items-center gap-2'}
+                                                        title={t('encryptionKey') || 'Encryption Key'}>
+                                                        <Icons.Lock className="w-4 h-4" /> {t('encryptionKey') || 'Encryption Key'}
+                                                    </button>
+                                                )}
+                                                {/* NS May 2026 — Auto-Verify schedule settings */}
+                                                {isAdmin && (
+                                                    <button onClick={() => setShowVerifyScheduleModal(true)}
+                                                        className={isCorporate ? '' : 'px-3 py-2 rounded-lg bg-proxmox-card border border-proxmox-border text-gray-400 hover:text-cyan-400 hover:border-cyan-500/30 transition-all text-sm flex items-center gap-2'}
+                                                        title={t('autoVerify') || 'Auto Verify'}>
+                                                        <Icons.Clock className="w-4 h-4" /> {t('autoVerify') || 'Auto Verify'}
+                                                    </button>
                                                 )}
                                                 <button onClick={() => { fetchPBSStatus(selectedPBS.id); fetchPBSDatastores(selectedPBS.id); fetchPBSTasks(selectedPBS.id); fetchPBSJobs(selectedPBS.id); }} className={isCorporate ? '' : 'px-3 py-2 rounded-lg bg-proxmox-card border border-proxmox-border text-gray-400 hover:text-white hover:border-proxmox-orange/30 transition-all text-sm flex items-center gap-2'}>
                                                     <Icons.RefreshCw className={`w-4 h-4 ${pbsLoading ? 'animate-spin' : ''}`} /> Refresh
@@ -16618,6 +17615,8 @@
                                                 {/* Datastore List */}
                                                 <div className="w-64 shrink-0 space-y-2">
                                                     <h3 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-2">Datastores</h3>
+                                                    {/* NS May 2026 — Capacity forecast tile */}
+                                                    <PbsCapacityForecast pbsId={selectedPBS.id} authFetch={authFetch} apiUrl={API_URL} />
                                                     {pbsDatastores.map(ds => {
                                                         const name = ds.name || ds.store;
                                                         const used = ds.used || 0;
@@ -16712,7 +17711,7 @@
                                                                     <div className="bg-proxmox-card border border-proxmox-border rounded-xl overflow-hidden">
                                                                         <table className="w-full text-sm">
                                                                             <thead><tr className="border-b border-proxmox-border text-gray-500 text-xs">
-                                                                                <th className="text-left p-3">Type</th><th className="text-left p-3">ID</th><th className="text-left p-3">Backups</th><th className="text-left p-3">Last Backup</th><th className="text-left p-3">Size</th><th className="text-right p-3">Notes</th>
+                                                                                <th className="text-left p-3">{t('type') || 'Type'}</th><th className="text-left p-3">{t('vmid') || 'ID'} / {t('name') || 'Name'}</th><th className="text-left p-3">{t('snapshots') || 'Backups'}</th><th className="text-left p-3">{t('lastBackup') || 'Last Backup'}</th><th className="text-left p-3">{t('size') || 'Size'}</th><th className="text-right p-3">{t('notes') || 'Notes'}</th>
                                                                             </tr></thead>
                                                                             <tbody>
                                                                                 {pbsGroups.sort((a, b) => `${a['backup-type']}/${a['backup-id']}`.localeCompare(`${b['backup-type']}/${b['backup-id']}`)).map((grp, i) => (
@@ -16725,12 +17724,23 @@
                                                                                                 'bg-purple-500/20 text-purple-400'
                                                                                             }`}>{grp['backup-type']}</span>
                                                                                         </td>
-                                                                                        <td className="p-3 text-white font-medium">{grp['backup-id']}</td>
+                                                                                        <td className="p-3 text-white font-medium">
+                                                                                            <span className="font-mono">{grp['backup-id']}</span>
+                                                                                            {(() => {
+                                                                                                const nm = grp.vm_name || pbsLookupName(grp['backup-type'], grp['backup-id']);
+                                                                                                return nm ? <span className="ml-2 text-gray-400 font-normal" title={nm}>· {nm}</span> : null;
+                                                                                            })()}
+                                                                                        </td>
                                                                                         <td className="p-3 text-gray-300">{grp['backup-count'] || grp.count || '-'}</td>
                                                                                         <td className="p-3 text-gray-400">{grp['last-backup'] ? fmtDate(grp['last-backup'] * 1000) : '-'}</td>
                                                                                         <td className="p-3 text-gray-400">{grp.size ? formatBytes(grp.size) : '-'}</td>
                                                                                         <td className="p-3 text-right" onClick={(e) => e.stopPropagation()}>
-                                                                                            <button onClick={() => { setPbsEditingNotes({ type: 'group', params: { 'backup-type': grp['backup-type'], 'backup-id': grp['backup-id'] }, label: `${grp['backup-type']}/${grp['backup-id']}` }); setPbsNotesText(grp.comment || grp.notes || ''); }} className="px-2 py-1 rounded text-xs text-gray-500 hover:text-cyan-400 hover:bg-cyan-500/10 transition-all" title="Group Notes">
+                                                                                            <button onClick={() => {
+                                                                                                const nm = pbsLookupName(grp['backup-type'], grp['backup-id']);
+                                                                                                const lbl = nm ? `${grp['backup-type']}/${grp['backup-id']} (${nm})` : `${grp['backup-type']}/${grp['backup-id']}`;
+                                                                                                setPbsEditingNotes({ type: 'group', params: { 'backup-type': grp['backup-type'], 'backup-id': grp['backup-id'] }, label: lbl });
+                                                                                                setPbsNotesText(grp.comment || grp.notes || '');
+                                                                                            }} className="px-2 py-1 rounded text-xs text-gray-500 hover:text-cyan-400 hover:bg-cyan-500/10 transition-all" title={t('groupNotes') || 'Group Notes'}>
                                                                                                 <Icons.FileText className="w-3.5 h-3.5" />
                                                                                             </button>
                                                                                         </td>
@@ -16748,7 +17758,11 @@
                                                             <div>
                                                                 <div className="flex items-center justify-between mb-3">
                                                                     <h3 className="text-sm font-semibold text-gray-400 uppercase tracking-wider">
-                                                                        Snapshots {pbsSelectedGroup ? `- ${pbsSelectedGroup}` : `(All)`}
+                                                                        {t('snapshots') || 'Snapshots'} {pbsSelectedGroup ? (() => {
+                                                                            const [bt, bid] = pbsSelectedGroup.split('/');
+                                                                            const nm = pbsLookupName(bt, bid);
+                                                                            return ` - ${pbsSelectedGroup}${nm ? ` · ${nm}` : ''}`;
+                                                                        })() : `(${t('all') || 'All'})`}
                                                                     </h3>
                                                                     {pbsSelectedGroup && (
                                                                         <button onClick={() => setPbsSelectedGroup(null)} className="text-xs text-gray-500 hover:text-white transition-colors">Show All</button>
@@ -16763,14 +17777,18 @@
                                                                         <div className="bg-proxmox-card border border-proxmox-border rounded-xl overflow-hidden">
                                                                             <table className="w-full text-sm">
                                                                                 <thead><tr className="border-b border-proxmox-border text-gray-500 text-xs">
-                                                                                    <th className="text-left p-3">Type/ID</th><th className="text-left p-3">Time</th><th className="text-left p-3">Size</th><th className="text-left p-3">Verified</th><th className="text-center p-3">Protected</th>
-                                                                                    <th className="text-right p-3">Actions</th>
+                                                                                    <th className="text-left p-3">{t('type') || 'Type'} / {t('vmid') || 'ID'} / {t('name') || 'Name'}</th><th className="text-left p-3">{t('timestamp') || 'Time'}</th><th className="text-left p-3">{t('size') || 'Size'}</th><th className="text-left p-3">{t('verified') || 'Verified'}</th><th className="text-center p-3">{t('protected') || 'Protected'}</th>
+                                                                                    <th className="text-right p-3">{t('actions') || 'Actions'}</th>
                                                                                 </tr></thead>
                                                                                 <tbody>
                                                                                     {sorted.slice(0, 50).map((snap, i) => (
                                                                                         <tr key={i} className="border-b border-proxmox-border/50 hover:bg-proxmox-hover/30">
                                                                                             <td className="p-3">
-                                                                                                <span className="text-white">{snap['backup-type']}/{snap['backup-id']}</span>
+                                                                                                <span className="text-white font-mono">{snap['backup-type']}/{snap['backup-id']}</span>
+                                                                                                {(() => {
+                                                                                                    const nm = snap.vm_name || pbsLookupName(snap['backup-type'], snap['backup-id']);
+                                                                                                    return nm ? <span className="ml-2 text-gray-400" title={nm}>· {nm}</span> : null;
+                                                                                                })()}
                                                                                             </td>
                                                                                             <td className="p-3 text-gray-300">{snap['backup-time'] ? fmtDate(snap['backup-time'] * 1000) : '-'}</td>
                                                                                             <td className="p-3 text-gray-400">{snap.size ? formatBytes(snap.size) : '-'}</td>
@@ -16796,11 +17814,40 @@
                                                                                                         <Icons.Folder className="w-3.5 h-3.5" />
                                                                                                     </button>
                                                                                                 )}
-                                                                                                <button onClick={() => { setPbsEditingNotes({ type: 'snapshot', params: { 'backup-type': snap['backup-type'], 'backup-id': snap['backup-id'], 'backup-time': snap['backup-time'] }, label: `${snap['backup-type']}/${snap['backup-id']}` }); setPbsNotesText(snap.comment || snap.notes || ''); }} className="px-2 py-1 rounded text-xs text-gray-500 hover:text-cyan-400 hover:bg-cyan-500/10 transition-all" title="Notes">
+                                                                                                <button onClick={() => {
+                                                                                                    const nm = pbsLookupName(snap['backup-type'], snap['backup-id']);
+                                                                                                    const lbl = nm ? `${snap['backup-type']}/${snap['backup-id']} (${nm})` : `${snap['backup-type']}/${snap['backup-id']}`;
+                                                                                                    setPbsEditingNotes({ type: 'snapshot', params: { 'backup-type': snap['backup-type'], 'backup-id': snap['backup-id'], 'backup-time': snap['backup-time'] }, label: lbl });
+                                                                                                    setPbsNotesText(snap.comment || snap.notes || '');
+                                                                                                }} className="px-2 py-1 rounded text-xs text-gray-500 hover:text-cyan-400 hover:bg-cyan-500/10 transition-all" title={t('notes') || 'Notes'}>
                                                                                                     <Icons.FileText className="w-3.5 h-3.5" />
                                                                                                 </button>
+                                                                                                {/* NS May 2026 — Restore Wizard trigger */}
                                                                                                 {isAdmin && (
-                                                                                                    <button onClick={() => { if (confirm(`Delete snapshot ${snap['backup-type']}/${snap['backup-id']} @ ${fmtDate(snap['backup-time'] * 1000)}?`)) pbsAction('delete-snapshot', pbsSelectedStore, { backup_type: snap['backup-type'], backup_id: snap['backup-id'], backup_time: snap['backup-time'] }); }} className="px-2 py-1 rounded text-xs text-gray-500 hover:text-red-400 hover:bg-red-500/10 transition-all" title="Delete">
+                                                                                                    <button onClick={() => {
+                                                                                                        const isoTime = new Date(snap['backup-time'] * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+                                                                                                        setShowRestoreWizard({
+                                                                                                            snapshot: {
+                                                                                                                volid: `pbs-${selectedPBS.name.toLowerCase().replace(/[^a-z0-9-]/g, '-')}:backup/${snap['backup-type']}/${snap['backup-id']}/${isoTime}`,
+                                                                                                                vmid: parseInt(snap['backup-id']),
+                                                                                                                type: snap['backup-type'],
+                                                                                                                backup_time: snap['backup-time'],
+                                                                                                                backup_time_iso: isoTime,
+                                                                                                            },
+                                                                                                            datastoreName: pbsSelectedStore,
+                                                                                                            clusterId: (selectedPBS.linked_clusters || [])[0],
+                                                                                                            nodes: [],
+                                                                                                        });
+                                                                                                    }} className="px-2 py-1 rounded text-xs text-gray-500 hover:text-green-400 hover:bg-green-500/10 transition-all" title={t('restoreBackup') || 'Restore'}>
+                                                                                                        <Icons.RotateCcw className="w-3.5 h-3.5" />
+                                                                                                    </button>
+                                                                                                )}
+                                                                                                {isAdmin && (
+                                                                                                    <button onClick={() => {
+                                                                                                        const nm = pbsLookupName(snap['backup-type'], snap['backup-id']);
+                                                                                                        const label = nm ? `${snap['backup-type']}/${snap['backup-id']} (${nm})` : `${snap['backup-type']}/${snap['backup-id']}`;
+                                                                                                        if (confirm(`${t('deleteSnapshot') || 'Delete snapshot'} ${label} @ ${fmtDate(snap['backup-time'] * 1000)}?`)) pbsAction('delete-snapshot', pbsSelectedStore, { backup_type: snap['backup-type'], backup_id: snap['backup-id'], backup_time: snap['backup-time'] });
+                                                                                                    }} className="px-2 py-1 rounded text-xs text-gray-500 hover:text-red-400 hover:bg-red-500/10 transition-all" title={t('delete') || 'Delete'}>
                                                                                                         <Icons.Trash className="w-3.5 h-3.5" />
                                                                                                     </button>
                                                                                                 )}
@@ -17142,17 +18189,17 @@
                                                             if (pbsReportSubTab === 'summary' && pbsReportSummary) {
                                                                 const r = pbsReportSummary;
                                                                 blocks.push({ type: 'stats', data: [
-                                                                    { label: 'Jobs', value: String(r.totals?.jobs || 0), color: '#3c82c8' },
-                                                                    { label: 'Success', value: String(r.totals?.success || 0), color: '#2a9f2a' },
-                                                                    { label: 'Warning', value: String(r.totals?.warning || 0), color: '#c89600' },
-                                                                    { label: 'Failed', value: String(r.totals?.failed || 0), color: '#dc3232' },
-                                                                    { label: 'Success %', value: `${r.totals?.success_rate || 0}%`, color: '#2a9f2a' },
+                                                                    { label: t('totalJobs') || 'Jobs', value: String(r.totals?.jobs || 0), color: '#3c82c8' },
+                                                                    { label: t('success') || 'Success', value: String(r.totals?.success || 0), color: '#2a9f2a' },
+                                                                    { label: t('warning') || 'Warning', value: String(r.totals?.warning || 0), color: '#c89600' },
+                                                                    { label: t('failed') || 'Failed', value: String(r.totals?.failed || 0), color: '#dc3232' },
+                                                                    { label: (t('successRate') || 'Success rate') + ' %', value: `${r.totals?.success_rate || 0}%`, color: '#2a9f2a' },
                                                                 ]});
                                                                 blocks.push({ type: 'spacer', height: 4 });
                                                                 blocks.push({
                                                                     type: 'table',
-                                                                    title: `Per-VM (window: ${r.window?.days} days)`,
-                                                                    columns: ['Type', 'VMID', 'Name', 'Last backup', 'Status', 'Size', 'Duration', 'Datastore/NS', 'Verified'],
+                                                                    title: `${t('perVmRollup') || 'Per-VM last backup'} (${t('reportWindow') || 'Window'}: ${r.window?.days || pbsReportDays}d)`,
+                                                                    columns: [t('type') || 'Type', t('vmid') || 'VMID', t('name') || 'Name', t('lastBackup') || 'Last backup', t('status') || 'Status', t('size') || 'Size', t('duration') || 'Duration', `${t('datastore') || 'Datastore'}/NS`, t('verified') || 'Verified'],
                                                                     rows: (r.per_vm || []).map(v => [
                                                                         v.type || '-', String(v.vmid || '-'), v.vm_name || '-',
                                                                         fmtD(v.last_backup_ts), v.status || '-', fmtB(v.size),
@@ -17164,13 +18211,13 @@
                                                             } else if (pbsReportSubTab === 'inventory' && pbsReportInventory) {
                                                                 const r = pbsReportInventory;
                                                                 blocks.push({ type: 'stats', data: [
-                                                                    { label: 'Snapshots', value: String(r.count || 0), color: '#3c82c8' },
+                                                                    { label: t('snapshots') || 'Snapshots', value: String(r.count || 0), color: '#3c82c8' },
                                                                 ]});
                                                                 blocks.push({ type: 'spacer', height: 4 });
                                                                 blocks.push({
                                                                     type: 'table',
-                                                                    title: 'Backup Inventory',
-                                                                    columns: ['Type', 'VMID', 'Name', 'Timestamp', 'Datastore', 'Namespace', 'Size', 'Verified', 'Protected'],
+                                                                    title: t('backupInventory') || 'Backup Inventory',
+                                                                    columns: [t('type') || 'Type', t('vmid') || 'VMID', t('name') || 'Name', t('timestamp') || 'Timestamp', t('datastore') || 'Datastore', t('namespace') || 'Namespace', t('size') || 'Size', t('verified') || 'Verified', t('protected') || 'Protected'],
                                                                     rows: (r.entries || []).map(e => [
                                                                         e.type || '-', String(e.vmid || '-'), e.vm_name || '-',
                                                                         fmtD(e.backup_time), e.datastore || '-', e.namespace || '-',
@@ -17182,24 +18229,24 @@
                                                             } else if (pbsReportSubTab === 'gap' && pbsReportGap) {
                                                                 const r = pbsReportGap;
                                                                 blocks.push({ type: 'stats', data: [
-                                                                    { label: 'Protected', value: String(r.counts?.protected || 0), color: '#2a9f2a' },
-                                                                    { label: 'Stale', value: String(r.counts?.stale || 0), color: '#c89600' },
-                                                                    { label: 'Unprotected', value: String(r.counts?.unprotected || 0), color: '#dc3232' },
+                                                                    { label: t('protected') || 'Protected', value: String(r.counts?.protected || 0), color: '#2a9f2a' },
+                                                                    { label: t('stale') || 'Stale', value: String(r.counts?.stale || 0), color: '#c89600' },
+                                                                    { label: t('unprotected') || 'Unprotected', value: String(r.counts?.unprotected || 0), color: '#dc3232' },
                                                                 ]});
                                                                 blocks.push({ type: 'spacer', height: 4 });
                                                                 blocks.push({
-                                                                    type: 'table', title: 'Unprotected VMs',
-                                                                    columns: ['Type', 'VMID', 'Name', 'Node', 'Status'],
+                                                                    type: 'table', title: t('unprotectedVms') || 'Unprotected VMs',
+                                                                    columns: [t('type') || 'Type', t('vmid') || 'VMID', t('name') || 'Name', t('node') || 'Node', t('status') || 'Status'],
                                                                     rows: (r.unprotected || []).map(v => [v.type, v.vmid, v.vm_name || '-', v.node, v.status])
                                                                 });
                                                                 blocks.push({
-                                                                    type: 'table', title: 'Stale (last backup older than window)',
-                                                                    columns: ['Type', 'VMID', 'Name', 'Last backup', 'Datastore/NS'],
+                                                                    type: 'table', title: t('staleBackups') || 'Stale (last backup older than window)',
+                                                                    columns: [t('type') || 'Type', t('vmid') || 'VMID', t('name') || 'Name', t('lastBackup') || 'Last backup', `${t('datastore') || 'Datastore'}/NS`],
                                                                     rows: (r.stale || []).map(v => [v.type, v.vmid, v.vm_name || '-', fmtD(v.last_backup_ts), `${v.datastore}${v.namespace ? '/' + v.namespace : ''}`])
                                                                 });
                                                                 blocks.push({
-                                                                    type: 'table', title: 'Protected',
-                                                                    columns: ['Type', 'VMID', 'Name', 'Last backup', 'Datastore/NS'],
+                                                                    type: 'table', title: t('protected') || 'Protected',
+                                                                    columns: [t('type') || 'Type', t('vmid') || 'VMID', t('name') || 'Name', t('lastBackup') || 'Last backup', `${t('datastore') || 'Datastore'}/NS`],
                                                                     rows: (r.protected || []).map(v => [v.type, v.vmid, v.vm_name || '-', fmtD(v.last_backup_ts), `${v.datastore}${v.namespace ? '/' + v.namespace : ''}`])
                                                                 });
                                                             }
@@ -17302,8 +18349,8 @@
                                                                 <table className="w-full text-xs">
                                                                     <thead className="bg-proxmox-dark text-gray-500 sticky top-0">
                                                                         <tr>
-                                                                            <th className="text-left p-2 pl-4">Type</th>
-                                                                            <th className="text-left p-2">VMID</th>
+                                                                            <th className="text-left p-2 pl-4">{t('type') || 'Type'}</th>
+                                                                            <th className="text-left p-2">{t('vmid') || 'VMID'}</th>
                                                                             <th className="text-left p-2">{t('name') || 'Name'}</th>
                                                                             <th className="text-left p-2">{t('lastBackup') || 'Last backup'}</th>
                                                                             <th className="text-left p-2">{t('status') || 'Status'}</th>
@@ -17370,12 +18417,12 @@
                                                                 <table className="w-full text-xs">
                                                                     <thead className="bg-proxmox-dark text-gray-500 sticky top-0">
                                                                         <tr>
-                                                                            <th className="text-left p-2 pl-4">Type</th>
-                                                                            <th className="text-left p-2">VMID</th>
+                                                                            <th className="text-left p-2 pl-4">{t('type') || 'Type'}</th>
+                                                                            <th className="text-left p-2">{t('vmid') || 'VMID'}</th>
                                                                             <th className="text-left p-2">{t('name') || 'Name'}</th>
                                                                             <th className="text-left p-2">{t('timestamp') || 'Timestamp'}</th>
                                                                             <th className="text-left p-2">{t('datastore') || 'Datastore'}</th>
-                                                                            <th className="text-left p-2">NS</th>
+                                                                            <th className="text-left p-2" title={t('namespace') || 'Namespace'}>{t('namespaceShort') || 'NS'}</th>
                                                                             <th className="text-left p-2">{t('size') || 'Size'}</th>
                                                                             <th className="text-left p-2">{t('verified') || 'Verified'}</th>
                                                                             <th className="text-left p-2">{t('protected') || 'Prot.'}</th>
@@ -17422,30 +18469,36 @@
                                                 )}
                                                 {!pbsReportLoading && pbsReportSubTab === 'gap' && pbsReportGap && (() => {
                                                     const g = pbsReportGap;
+                                                    // NS May 2026 — null-safe defaults; backend may omit empty arrays/counts
+                                                    const counts = g.counts || {};
+                                                    const winDays = g.window?.days ?? pbsReportDays;
+                                                    const unprotectedArr = Array.isArray(g.unprotected) ? g.unprotected : [];
+                                                    const staleArr = Array.isArray(g.stale) ? g.stale : [];
+                                                    const protectedArr = Array.isArray(g.protected) ? g.protected : [];
                                                     return (
                                                     <>
                                                         <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
                                                             <div className="bg-proxmox-card border border-green-500/30 rounded-xl p-4">
-                                                                <div className="text-2xl font-bold text-green-400">{g.counts.protected}</div>
-                                                                <div className="text-xs text-gray-500 mt-1">{t('protected') || 'Protected'} <span className="text-gray-600">(&lt; {g.window.days}d)</span></div>
+                                                                <div className="text-2xl font-bold text-green-400">{counts.protected || 0}</div>
+                                                                <div className="text-xs text-gray-500 mt-1">{t('protected') || 'Protected'} <span className="text-gray-600">(&lt; {winDays}d)</span></div>
                                                             </div>
                                                             <div className="bg-proxmox-card border border-yellow-500/30 rounded-xl p-4">
-                                                                <div className="text-2xl font-bold text-yellow-400">{g.counts.stale}</div>
-                                                                <div className="text-xs text-gray-500 mt-1">{t('stale') || 'Stale'} <span className="text-gray-600">(&gt; {g.window.days}d)</span></div>
+                                                                <div className="text-2xl font-bold text-yellow-400">{counts.stale || 0}</div>
+                                                                <div className="text-xs text-gray-500 mt-1">{t('stale') || 'Stale'} <span className="text-gray-600">(&gt; {winDays}d)</span></div>
                                                             </div>
                                                             <div className="bg-proxmox-card border border-red-500/30 rounded-xl p-4">
-                                                                <div className="text-2xl font-bold text-red-400">{g.counts.unprotected}</div>
+                                                                <div className="text-2xl font-bold text-red-400">{counts.unprotected || 0}</div>
                                                                 <div className="text-xs text-gray-500 mt-1">{t('unprotected') || 'No backups at all'}</div>
                                                             </div>
                                                         </div>
 
-                                                        {g.unprotected.length > 0 && (
+                                                        {unprotectedArr.length > 0 && (
                                                             <div className="bg-proxmox-card border border-red-500/30 rounded-xl overflow-hidden">
-                                                                <div className="px-4 py-2 bg-red-500/10 text-red-300 text-sm font-medium">🔴 {t('unprotected') || 'Unprotected VMs'} ({g.unprotected.length})</div>
+                                                                <div className="px-4 py-2 bg-red-500/10 text-red-300 text-sm font-medium">🔴 {t('unprotectedVms') || 'Unprotected VMs'} ({unprotectedArr.length})</div>
                                                                 <table className="w-full text-xs">
-                                                                    <thead className="text-gray-500"><tr><th className="text-left p-2 pl-4">Type</th><th className="text-left p-2">VMID</th><th className="text-left p-2">{t('name') || 'Name'}</th><th className="text-left p-2">{t('node') || 'Node'}</th><th className="text-left p-2">{t('status') || 'Status'}</th></tr></thead>
+                                                                    <thead className="text-gray-500"><tr><th className="text-left p-2 pl-4">{t('type') || 'Type'}</th><th className="text-left p-2">{t('vmid') || 'VMID'}</th><th className="text-left p-2">{t('name') || 'Name'}</th><th className="text-left p-2">{t('node') || 'Node'}</th><th className="text-left p-2">{t('status') || 'Status'}</th></tr></thead>
                                                                     <tbody>
-                                                                        {g.unprotected.map((v, i) => (
+                                                                        {unprotectedArr.map((v, i) => (
                                                                             <tr key={i} className="border-t border-proxmox-border/30"><td className="p-2 pl-4 text-gray-400 font-mono">{v.type}</td><td className="p-2 text-gray-300 font-mono">{v.vmid}</td><td className="p-2 text-white">{v.vm_name || '—'}</td><td className="p-2 text-gray-400">{v.node}</td><td className="p-2 text-gray-500">{v.status}</td></tr>
                                                                         ))}
                                                                     </tbody>
@@ -17453,13 +18506,13 @@
                                                             </div>
                                                         )}
 
-                                                        {g.stale.length > 0 && (
+                                                        {staleArr.length > 0 && (
                                                             <div className="bg-proxmox-card border border-yellow-500/30 rounded-xl overflow-hidden">
-                                                                <div className="px-4 py-2 bg-yellow-500/10 text-yellow-300 text-sm font-medium">🟡 {t('stale') || 'Stale (last backup older than window)'} ({g.stale.length})</div>
+                                                                <div className="px-4 py-2 bg-yellow-500/10 text-yellow-300 text-sm font-medium">🟡 {t('staleBackups') || 'Stale (last backup older than window)'} ({staleArr.length})</div>
                                                                 <table className="w-full text-xs">
-                                                                    <thead className="text-gray-500"><tr><th className="text-left p-2 pl-4">Type</th><th className="text-left p-2">VMID</th><th className="text-left p-2">{t('name') || 'Name'}</th><th className="text-left p-2">{t('lastBackup') || 'Last backup'}</th><th className="text-left p-2">{t('location') || 'Location'}</th></tr></thead>
+                                                                    <thead className="text-gray-500"><tr><th className="text-left p-2 pl-4">{t('type') || 'Type'}</th><th className="text-left p-2">{t('vmid') || 'VMID'}</th><th className="text-left p-2">{t('name') || 'Name'}</th><th className="text-left p-2">{t('lastBackup') || 'Last backup'}</th><th className="text-left p-2">{t('location') || 'Location'}</th></tr></thead>
                                                                     <tbody>
-                                                                        {g.stale.map((v, i) => (
+                                                                        {staleArr.map((v, i) => (
                                                                             <tr key={i} className="border-t border-proxmox-border/30"><td className="p-2 pl-4 text-gray-400 font-mono">{v.type}</td><td className="p-2 text-gray-300 font-mono">{v.vmid}</td><td className="p-2 text-white">{v.vm_name || '—'}</td><td className="p-2 text-gray-400">{fmtDate(v.last_backup_ts * 1000)}</td><td className="p-2 text-gray-500">{v.datastore}{v.namespace ? `/${v.namespace}` : ''}</td></tr>
                                                                         ))}
                                                                     </tbody>
@@ -17467,14 +18520,14 @@
                                                             </div>
                                                         )}
 
-                                                        {g.protected.length > 0 && (
+                                                        {protectedArr.length > 0 && (
                                                             <div className="bg-proxmox-card border border-green-500/30 rounded-xl overflow-hidden">
-                                                                <div className="px-4 py-2 bg-green-500/10 text-green-300 text-sm font-medium">🟢 {t('protected') || 'Protected'} ({g.protected.length})</div>
+                                                                <div className="px-4 py-2 bg-green-500/10 text-green-300 text-sm font-medium">🟢 {t('protected') || 'Protected'} ({protectedArr.length})</div>
                                                                 <div className="max-h-72 overflow-auto">
                                                                     <table className="w-full text-xs">
-                                                                        <thead className="bg-proxmox-dark text-gray-500 sticky top-0"><tr><th className="text-left p-2 pl-4">Type</th><th className="text-left p-2">VMID</th><th className="text-left p-2">{t('name') || 'Name'}</th><th className="text-left p-2">{t('lastBackup') || 'Last backup'}</th><th className="text-left p-2">{t('location') || 'Location'}</th></tr></thead>
+                                                                        <thead className="bg-proxmox-dark text-gray-500 sticky top-0"><tr><th className="text-left p-2 pl-4">{t('type') || 'Type'}</th><th className="text-left p-2">{t('vmid') || 'VMID'}</th><th className="text-left p-2">{t('name') || 'Name'}</th><th className="text-left p-2">{t('lastBackup') || 'Last backup'}</th><th className="text-left p-2">{t('location') || 'Location'}</th></tr></thead>
                                                                         <tbody>
-                                                                            {g.protected.map((v, i) => (
+                                                                            {protectedArr.map((v, i) => (
                                                                                 <tr key={i} className="border-t border-proxmox-border/30"><td className="p-2 pl-4 text-gray-400 font-mono">{v.type}</td><td className="p-2 text-gray-300 font-mono">{v.vmid}</td><td className="p-2 text-white">{v.vm_name || '—'}</td><td className="p-2 text-gray-400">{fmtDate(v.last_backup_ts * 1000)}</td><td className="p-2 text-gray-500">{v.datastore}{v.namespace ? `/${v.namespace}` : ''}</td></tr>
                                                                             ))}
                                                                         </tbody>
@@ -19072,7 +20125,7 @@
                                                     <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-8 text-center text-gray-500">
                                                         <Icons.Layers className="w-12 h-12 mx-auto mb-3 opacity-30" />
                                                         <p>No compute clusters found</p>
-                                                        <p className="text-xs mt-1">Clusters are only available on vCenter (not standalone ESXi)</p>
+                                                        <p className="text-xs mt-1">Clusters are only available on connected management servers (not on standalone hosts)</p>
                                                     </div>
                                                 ) : (
                                                     vmwareClusters.map(cl => (
@@ -19811,7 +20864,17 @@
 
                                         <div className="border-t border-proxmox-border pt-4">
                                             <div>
-                                                <label className="block text-sm text-gray-400 mb-1">Fingerprint (optional)</label>
+                                                <label className="block text-sm text-gray-400 mb-1 flex items-center justify-between">
+                                                    <span>Fingerprint (optional)</span>
+                                                    {/* NS May 2026 — auto-fetch via /api/pbs/probe-fingerprint */}
+                                                    <FingerprintFetcher
+                                                        host={pbsForm.host}
+                                                        port={pbsForm.port}
+                                                        authFetch={authFetch}
+                                                        apiUrl={API_URL}
+                                                        onFetched={fp => setPbsForm(p => ({...p, fingerprint: fp}))}
+                                                    />
+                                                </label>
                                                 <input value={pbsForm.fingerprint} onChange={e => setPbsForm(p => ({...p, fingerprint: e.target.value}))} placeholder="AA:BB:CC:..." className="w-full bg-proxmox-dark border border-proxmox-border rounded-lg p-2.5 text-sm text-white font-mono text-xs" />
                                             </div>
                                             <div className="flex items-center gap-3 mt-3">
@@ -19971,7 +21034,12 @@
                                             File Browser
                                         </h2>
                                         <p className="text-xs text-gray-500 mt-1">
-                                            {pbsCatalogSnapshot['backup-type']}/{pbsCatalogSnapshot['backup-id']} @ {fmtDate(pbsCatalogSnapshot['backup-time'] * 1000)}
+                                            <span className="font-mono">{pbsCatalogSnapshot['backup-type']}/{pbsCatalogSnapshot['backup-id']}</span>
+                                            {(() => {
+                                                const nm = pbsLookupName(pbsCatalogSnapshot['backup-type'], pbsCatalogSnapshot['backup-id']);
+                                                return nm ? <span className="ml-1 text-gray-300">· {nm}</span> : null;
+                                            })()}
+                                            <span className="ml-2">@ {fmtDate(pbsCatalogSnapshot['backup-time'] * 1000)}</span>
                                         </p>
                                     </div>
                                     <button onClick={() => setShowPbsFileBrowser(false)} className="text-gray-500 hover:text-white transition-colors">
@@ -20097,6 +21165,7 @@
                             dashboardAuthFetch={authFetch}
                             onClose={handleCloseConfig}
                             addToast={addToast}
+                            isCorporate={isCorporate}
                         />
                     )}
 
@@ -20294,13 +21363,83 @@
                         </div>
                     )}
 
-                    {/* Console Modal */}
-                    {consoleVm && consoleInfo && (
-                        <ConsoleModal
-                            vm={consoleVm}
-                            consoleInfo={consoleInfo}
-                            clusterId={consoleVm._clusterId || selectedCluster?.id}
-                            onClose={handleCloseConsole}
+                    {/* NS May 2026 — multi-console: every open tab stays mounted,
+                        only the active one is visible. RFB / term state survives switching. */}
+                    {consoleStack.map(c => (
+                        c.info ? (
+                            <ConsoleModal
+                                key={c.id}
+                                vm={c.vm}
+                                consoleInfo={c.info}
+                                clusterId={c.vm._clusterId || selectedCluster?.id}
+                                onClose={() => handleCloseConsole(c.id)}
+                                hidden={c.id !== activeConsoleId}
+                            />
+                        ) : null
+                    ))}
+
+                    {/* Console tab bar — only when 2+ open or when one is open and minimisable */}
+                    {consoleStack.length >= 2 && (
+                        <div style={{
+                            position: 'fixed', bottom: 0, left: 0, right: 0,
+                            zIndex: 60, pointerEvents: 'none',
+                            display: 'flex', justifyContent: 'center',
+                        }}>
+                            <div style={{
+                                pointerEvents: 'auto',
+                                background: 'var(--corp-surface, #1c2733)',
+                                border: '1px solid var(--corp-border, #29414e)',
+                                borderBottom: 'none',
+                                borderTopLeftRadius: '8px',
+                                borderTopRightRadius: '8px',
+                                boxShadow: '0 -4px 12px rgba(0,0,0,0.3)',
+                                padding: '6px 8px',
+                                display: 'flex', gap: '4px',
+                                maxWidth: '90vw', overflowX: 'auto',
+                            }}>
+                                {consoleStack.map(c => {
+                                    const active = c.id === activeConsoleId;
+                                    const label = c.vm.name || `${c.vm.type === 'qemu' ? 'VM' : c.vm.type === 'lxc' ? 'CT' : ''} ${c.vm.vmid}`;
+                                    return (
+                                        <div
+                                            key={c.id}
+                                            onClick={() => setActiveConsoleId(c.id)}
+                                            className="flex items-center gap-2 px-3 py-1.5 text-xs cursor-pointer"
+                                            style={{
+                                                background: active ? 'var(--corp-accent, #0078a8)' : 'var(--corp-surface-2, #29414e)',
+                                                color: '#fff',
+                                                borderRadius: '4px',
+                                                fontWeight: active ? 600 : 500,
+                                                whiteSpace: 'nowrap',
+                                                userSelect: 'none',
+                                            }}
+                                        >
+                                            <Icons.Monitor className="w-3 h-3" />
+                                            <span style={{maxWidth: '180px', overflow: 'hidden', textOverflow: 'ellipsis'}}>{label}</span>
+                                            <button
+                                                onClick={(e) => { e.stopPropagation(); handleCloseConsole(c.id); }}
+                                                style={{
+                                                    background: 'rgba(255,255,255,0.15)', color: '#fff',
+                                                    border: 'none', borderRadius: '50%',
+                                                    width: '16px', height: '16px', lineHeight: '14px',
+                                                    fontSize: '10px', padding: 0, cursor: 'pointer',
+                                                }}
+                                                title="Close"
+                                            >×</button>
+                                        </div>
+                                    );
+                                })}
+                            </div>
+                        </div>
+                    )}
+
+                    {/* NS May 2026 — LXC dedicated text terminal (pct enter via SSH WS) */}
+                    {lxcShellVm && (
+                        <LxcShellModal
+                            vm={lxcShellVm}
+                            clusterId={lxcShellVm._clusterId || selectedCluster?.id}
+                            addToast={addToast}
+                            onClose={() => setLxcShellVm(null)}
                         />
                     )}
 
@@ -21364,7 +22503,83 @@
                             }}
                         />
                     )}
-                    
+
+                    {/* MK — `?` shortcuts overlay */}
+                    <KeyboardShortcutsModal
+                        open={showShortcutsModal}
+                        onClose={() => setShowShortcutsModal(false)}
+                    />
+
+                    {/* NS — connection-loss banner only after WS is dropped >4s */}
+                    <div style={{ position: 'fixed', top: 0, left: 0, right: 0, zIndex: 95, pointerEvents: 'none' }}>
+                        <div style={{ pointerEvents: 'auto' }}>
+                            <ConnectionLostBanner connected={wsConnected} />
+                        </div>
+                    </div>
+
+                    {/* NS May 2026 — live backup progress pane */}
+                    {activeBackupProgress && selectedCluster && (
+                        <BackupProgressPane
+                            clusterId={selectedCluster.id}
+                            upid={activeBackupProgress.upid}
+                            node={activeBackupProgress.node}
+                            authFetch={authFetch}
+                            apiUrl={API_URL}
+                            onClose={() => setActiveBackupProgress(null)}
+                        />
+                    )}
+
+                    {/* LW May 2026 — encryption key modal */}
+                    {showEncryptionKeyModal && (
+                        <EncryptionKeyModal
+                            authFetch={authFetch}
+                            apiUrl={API_URL}
+                            onClose={() => setShowEncryptionKeyModal(false)}
+                        />
+                    )}
+
+                    {/* NS May 2026 — verify-schedule modal */}
+                    {showVerifyScheduleModal && (
+                        <VerifyScheduleModal
+                            authFetch={authFetch}
+                            apiUrl={API_URL}
+                            onClose={() => setShowVerifyScheduleModal(false)}
+                        />
+                    )}
+
+                    {/* NS May 2026 — restore wizard. clusterId comes from
+                        showRestoreWizard.clusterId (preferred), then selectedCluster,
+                        then the first linked cluster of the active PBS. */}
+                    {showRestoreWizard && (() => {
+                        const cid = showRestoreWizard.clusterId
+                                    || selectedCluster?.id
+                                    || (selectedPBS?.linked_clusters || [])[0];
+                        if (!cid) return null;
+                        const cluster = clusters.find(c => c.id === cid);
+                        return (
+                            <BackupRestoreWizard
+                                clusterId={cid}
+                                snapshot={showRestoreWizard.snapshot}
+                                datastoreName={showRestoreWizard.datastoreName}
+                                nodes={cluster?.id === selectedCluster?.id ? Object.keys(clusterMetrics || {}) : (showRestoreWizard.nodes || [])}
+                                storages={cluster?.id === selectedCluster?.id
+                                    ? (clusterDatastores?.shared || []).map(s => s.storage).concat(
+                                        Object.values(clusterDatastores?.local || {}).flatMap(arr => (arr || []).map(s => s.storage)))
+                                    : []}
+                                authFetch={authFetch}
+                                apiUrl={API_URL}
+                                onClose={() => setShowRestoreWizard(null)}
+                                onStarted={(j) => {
+                                    addToast?.(`Restore started: ${j.mode}`, 'success');
+                                    if (j.upid && j.upid !== 'OK') {
+                                        const node = j.upid.split(':')[1];
+                                        setActiveBackupProgress({ upid: j.upid, node });
+                                    }
+                                }}
+                            />
+                        );
+                    })()}
+
                     {/* Group Manager Modal */}
                     {showGroupManager && (
                         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">

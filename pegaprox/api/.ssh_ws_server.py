@@ -34,7 +34,7 @@ async def ssh_handler(websocket):
     path = websocket.request.path if hasattr(websocket, 'request') else websocket.path
     print(f"SSH WebSocket connection: {path}")
     
-    from urllib.parse import urlparse, parse_qs, unquote
+    from urllib.parse import urlparse, parse_qs, unquote, quote_plus
     parsed = urlparse(path)
     query = parse_qs(parsed.query)
     ws_token = query.get('token', [None])[0]
@@ -43,6 +43,14 @@ async def ssh_handler(websocket):
     if prefetched_ip:
         prefetched_ip = unquote(prefetched_ip)
         print(f"Frontend provided IP: {prefetched_ip}")
+
+    # NS May 2026 — accept both shell and termproxy paths.
+    # termproxy: /api/clusters/<cid>/vms/<node>/<vm_type>/<vmid>/termwebsocket
+    #            with ?ticket=, ?port=, ?user=, ?host= from the frontend.
+    m_term = re.match(r'/api/clusters/([^/]+)/vms/([^/]+)/(qemu|lxc)/([0-9]+)/termwebsocket', parsed.path)
+    if m_term:
+        await termproxy_handler(websocket, query, m_term, ws_token, session_id)
+        return
 
     # Match both /shell and /shellws
     match = re.match(r'/api/clusters/([^/]+)/nodes/([^/]+)/shell(?:ws)?', parsed.path)
@@ -246,9 +254,9 @@ async def ssh_handler(websocket):
         
         channel = ssh.invoke_shell(term='xterm-256color', width=120, height=40)
         channel.settimeout(0.1)
-        
+
         print(f"SSH connected: {cluster_id}/{node}")
-        
+
         # Send connected status - frontend will clear terminal
         await websocket.send('{"status":"connected"}')
         
@@ -301,6 +309,148 @@ async def ssh_handler(websocket):
             pass
         print(f"SSH disconnected: {cluster_id}/{node}")
 
+
+# NS May 2026 — Proxmox termproxy proxy.
+# Frontend has already POSTed /termproxy on the main app and got a ticket.
+# It sends the ticket+port+host+user as query params on the WS open.
+# We connect to PVE's vncwebsocket with that ticket, send the
+# `user:ticket\n` handshake, wait for "OK", then proxy bytes both ways.
+# No SSH, no second login — the cluster auth happens server-side at the
+# /termproxy POST step.
+async def termproxy_handler(client_ws, query, m_term, ws_token, session_id):
+    from urllib.parse import unquote, quote_plus
+    cluster_id, node, vm_type, vmid_str = m_term.groups()
+    print(f"[TERMPROXY] {vm_type}/{vmid_str} on {node} cluster={cluster_id}")
+
+    auth_token = ws_token or session_id
+    if not auth_token:
+        await client_ws.send('{"status":"error","message":"No auth token"}')
+        await client_ws.close(1008, "No auth")
+        return
+
+    # Validate via main server (same as shell)
+    try:
+        if ws_token:
+            validate_url = f"{PEGAPROX_URL}/api/ws/token/validate?token={ws_token}"
+        else:
+            validate_url = f"{PEGAPROX_URL}/api/auth/validate"
+        headers = {'X-Session-ID': session_id} if session_id else {}
+        cookies = {'session': session_id} if session_id else {}
+        r = requests.get(validate_url, cookies=cookies, headers=headers, timeout=5, verify=False)
+        if r.status_code != 200:
+            await client_ws.send('{"status":"error","message":"Invalid session"}')
+            await client_ws.close(1008, "auth")
+            return
+    except Exception as e:
+        print(f"[TERMPROXY] auth validate failed: {e}")
+        await client_ws.send('{"status":"error","message":"Auth server unreachable"}')
+        await client_ws.close(1011, "auth")
+        return
+
+    # Frontend gave us the termproxy ticket+port already (via POST /termproxy)
+    # plus the PVE session auth_ticket (used as PVEAuthCookie header).
+    pve_ticket = query.get('ticket', [None])[0]
+    pve_port = query.get('port', [None])[0]
+    pve_host = query.get('host', [None])[0]
+    pve_user = query.get('user', [None])[0]
+    pve_auth = query.get('auth_ticket', [None])[0]
+    if not (pve_ticket and pve_port and pve_host and pve_user and pve_auth):
+        print(f"[TERMPROXY] missing query params; got: ticket={bool(pve_ticket)} port={pve_port} host={pve_host} user={pve_user} auth={bool(pve_auth)}")
+        await client_ws.send('{"status":"error","message":"Missing termproxy params"}')
+        await client_ws.close(1008, "params")
+        return
+
+    pve_ticket = unquote(pve_ticket)
+    pve_user = unquote(pve_user)
+    pve_host = unquote(pve_host)
+    pve_auth = unquote(pve_auth)
+
+    # Connect to PVE WS — Cookie uses session auth ticket; URL uses termproxy ticket.
+    pve_path = f"/api2/json/nodes/{node}/{vm_type}/{vmid_str}/vncwebsocket?port={pve_port}&vncticket={quote_plus(pve_ticket)}"
+    pve_url = f"wss://{pve_host}:8006{pve_path}"
+    print(f"[TERMPROXY] connecting to PVE: {pve_url}")
+    pve_ssl = ssl.create_default_context()
+    pve_ssl.check_hostname = False
+    pve_ssl.verify_mode = ssl.CERT_NONE
+    try:
+        pve_ws = await websockets.connect(
+            pve_url,
+            additional_headers={'Cookie': f'PVEAuthCookie={pve_auth}'},
+            ssl=pve_ssl,
+            open_timeout=10,
+        )
+    except Exception as e:
+        print(f"[TERMPROXY] PVE WS connect failed: {type(e).__name__}: {e}")
+        await client_ws.send(f'{{"status":"error","message":"PVE WS connect failed: {type(e).__name__}"}}')
+        await client_ws.close(1011, "pve")
+        return
+
+    # Send PVE auth handshake: user:ticket\n
+    try:
+        await pve_ws.send(f"{pve_user}:{pve_ticket}\n")
+        first = await asyncio.wait_for(pve_ws.recv(), timeout=5.0)
+        first_str = first.decode('utf-8', errors='replace') if isinstance(first, (bytes, bytearray)) else (first or '')
+        if not first_str.startswith('OK'):
+            print(f"[TERMPROXY] PVE rejected handshake: {first_str!r}")
+            await client_ws.send(f'{{"status":"error","message":"PVE rejected: {first_str[:80]!r}"}}')
+            await pve_ws.close()
+            await client_ws.close(1011, "pve-auth")
+            return
+        print(f"[TERMPROXY] PVE handshake OK")
+    except Exception as e:
+        print(f"[TERMPROXY] handshake error: {type(e).__name__}: {e}")
+        await client_ws.send(f'{{"status":"error","message":"handshake error: {type(e).__name__}"}}')
+        try: await pve_ws.close()
+        except: pass
+        await client_ws.close(1011, "handshake")
+        return
+
+    await client_ws.send('{"status":"connected"}')
+
+    # Bidirectional proxy
+    async def pve_to_client():
+        try:
+            async for msg in pve_ws:
+                # PVE termproxy sends raw bytes (TTY output)
+                if isinstance(msg, (bytes, bytearray)):
+                    await client_ws.send(msg.decode('utf-8', errors='replace'))
+                else:
+                    await client_ws.send(msg)
+        except Exception as e:
+            print(f"[TERMPROXY] PVE→client: {type(e).__name__}: {e}")
+
+    async def client_to_pve():
+        try:
+            async for msg in client_ws:
+                if isinstance(msg, str):
+                    # Resize protocol: JSON {type:'resize', cols, rows}
+                    if msg.startswith('{'):
+                        try:
+                            j = json.loads(msg)
+                            if j.get('type') == 'resize':
+                                cols = int(j.get('cols', 80))
+                                rows = int(j.get('rows', 24))
+                                await pve_ws.send(f"1:{cols}:{rows}:")
+                                continue
+                        except Exception:
+                            pass
+                    payload_len = len(msg.encode('utf-8'))
+                    await pve_ws.send(f"0:{payload_len}:{msg}")
+                else:
+                    try: text = msg.decode('utf-8')
+                    except Exception: text = msg.decode('latin-1', errors='replace')
+                    await pve_ws.send(f"0:{len(msg)}:{text}")
+        except Exception as e:
+            print(f"[TERMPROXY] client→PVE: {type(e).__name__}: {e}")
+
+    try:
+        await asyncio.gather(pve_to_client(), client_to_pve(), return_exceptions=True)
+    finally:
+        try: await pve_ws.close()
+        except: pass
+        print(f"[TERMPROXY] session ended {vm_type}/{vmid_str}")
+
+
 async def main():
     ssl_context = None
     if SSL_CERT and SSL_KEY and os.path.exists(SSL_CERT) and os.path.exists(SSL_KEY):
@@ -310,14 +460,27 @@ async def main():
     # Issue #71/#95: empty host = all interfaces (dual-stack IPv4+IPv6)
     ws_host = None if not BIND_HOST else BIND_HOST
     display_host = BIND_HOST or '0.0.0.0'
+    # NS May 2026 (#388): wire the lenient_process_request hook so PVE 9.1.x
+    # hosts (and any middlebox that strips the Upgrade token from Connection)
+    # don't trigger InvalidUpgrade at SSH WS handshake. Was only on VNC before.
+    # crcro on issue #388 reported the exact SSH-WS InvalidUpgrade trace this fixes.
+    _lpr_ssh = None
     try:
-        async with websockets.serve(ssh_handler, ws_host, PORT, ssl=ssl_context, ping_interval=30, ping_timeout=10):
-            print(f"SSH WebSocket server ready on {display_host}:{PORT}")
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+        from pegaprox.utils.ws_lenient import lenient_process_request as _lpr_ssh
+    except Exception as _e:
+        print(f"[SSH-WS] WARNING: lenient_process_request not importable ({_e}) — strict handshake only")
+    serve_kwargs = {'ssl': ssl_context, 'ping_interval': 30, 'ping_timeout': 10}
+    if _lpr_ssh is not None:
+        serve_kwargs['process_request'] = _lpr_ssh
+    try:
+        async with websockets.serve(ssh_handler, ws_host, PORT, **serve_kwargs):
+            print(f"SSH WebSocket server ready on {display_host}:{PORT} (lenient-hook={_lpr_ssh is not None})")
             await asyncio.Future()
     except OSError as e:
         if ':' in str(display_host):
             print(f"SSH WebSocket: IPv6 bind failed ({e}), falling back to 0.0.0.0")
-            async with websockets.serve(ssh_handler, '0.0.0.0', PORT, ssl=ssl_context, ping_interval=30, ping_timeout=10):
+            async with websockets.serve(ssh_handler, '0.0.0.0', PORT, **serve_kwargs):
                 print(f"SSH WebSocket server ready on 0.0.0.0:{PORT}")
                 await asyncio.Future()
         else:

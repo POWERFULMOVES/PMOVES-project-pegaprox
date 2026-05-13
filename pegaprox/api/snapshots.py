@@ -163,7 +163,7 @@ def _prune(mgr, node, vmid, vm_type, policy):
     if not snaps:
         # fallback: list via direct API
         try:
-            url = f"https://{mgr.host}:8006/api2/json/nodes/{node}/{vm_type}/{vmid}/snapshot"
+            url = f"https://{mgr.host}:{mgr.api_port}/api2/json/nodes/{node}/{vm_type}/{vmid}/snapshot"
             resp = mgr._api_get(url)
             if resp and resp.status_code == 200:
                 snaps = resp.json().get('data') or []
@@ -197,7 +197,7 @@ def _prune(mgr, node, vmid, vm_type, policy):
             if hasattr(mgr, 'delete_snapshot'):
                 mgr.delete_snapshot(node, vmid, vm_type, name)
             else:
-                url = f"https://{mgr.host}:8006/api2/json/nodes/{node}/{vm_type}/{vmid}/snapshot/{name}"
+                url = f"https://{mgr.host}:{mgr.api_port}/api2/json/nodes/{node}/{vm_type}/{vmid}/snapshot/{name}"
                 mgr._api_delete(url)
             pruned += 1
         except Exception as e:

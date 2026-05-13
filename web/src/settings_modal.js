@@ -17,7 +17,7 @@
             alert:         { order: 120, title: 'Alerts',               icon: '🔔' },
             site_recovery: { order: 130, title: 'Site Recovery',        icon: '🚨' },
             pbs:           { order: 140, title: 'Proxmox Backup Server',icon: '🗄️' },
-            vmware:        { order: 150, title: 'ESXi / vCenter',       icon: '📡' },
+            vmware:        { order: 150, title: 'ESXi',       icon: '📡' },
             xapi:          { order: 160, title: 'XCP-ng',               icon: '🔶' },
             plugins:       { order: 170, title: 'Plugins',              icon: '🧩' },
             admin:         { order: 999, title: 'Administration',       icon: '⚙️' },
@@ -2283,21 +2283,32 @@
             
             return (
                 <>
-                <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/80" onClick={onClose}>
+                <div
+                    className={isCorporate ? "corp-vm-modal-overlay" : "fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/80"}
+                    onClick={onClose}
+                >
                     <div
-                        className={`w-full max-w-5xl max-h-[90vh] bg-proxmox-card border border-proxmox-border overflow-hidden flex flex-col ${
-                            isCorporate ? 'shadow-lg' : 'rounded-2xl shadow-2xl'
-                        }`}
+                        className={isCorporate
+                            ? 'corp-vm-modal'
+                            : 'w-full max-w-5xl max-h-[90vh] bg-proxmox-card border border-proxmox-border overflow-hidden flex flex-col rounded-2xl shadow-2xl'}
+                        style={isCorporate ? {maxWidth: '1100px', width: '100%'} : undefined}
                         onClick={e => e.stopPropagation()}
                     >
-                        {/* Header - LW: Feb 2026 - compact in corporate mode */}
+                        {/* Header - LW: corporate uses unified corporate chrome (matches VM Configure) */}
                         {isCorporate ? (
-                        <div className="corp-modal-header">
-                            <span className="corp-modal-title" style={{display:'flex',alignItems:'center',gap:'8px'}}>
-                                <Icons.Settings className="w-4 h-4" style={{color:'#728b9a'}} />
-                                {t('pegaproxSettings')}
-                            </span>
-                            <button className="corp-modal-close" onClick={onClose}><Icons.X className="w-4 h-4" /></button>
+                        <div className="corp-vm-modal-header">
+                            <div className="flex items-center gap-3 min-w-0 flex-1">
+                                <Icons.Settings className="w-5 h-5" style={{color:'var(--corp-accent, #49afd9)'}} />
+                                <div className="min-w-0">
+                                    <div className="corp-vm-modal-title truncate">{t('pegaproxSettings')}</div>
+                                    <div className="corp-vm-modal-meta">PegaProx {PEGAPROX_VERSION}</div>
+                                </div>
+                            </div>
+                            <div className="corp-vm-modal-actions">
+                                <button onClick={onClose} className="corp-vm-btn corp-vm-btn-ghost" title={t('close') || 'Close'}>
+                                    <Icons.X />
+                                </button>
+                            </div>
                         </div>
                         ) : (
                         <div className="border-b border-proxmox-border flex items-center justify-between p-6">
@@ -2508,8 +2519,8 @@
                             </button>
                         </div>
                         
-                        {/* Content - LW: Feb 2026 - denser in corporate */}
-                        <div className={`flex-1 overflow-auto ${isCorporate ? 'p-4' : 'p-6'}`}>
+                        {/* Content - LW: corporate uses corp-vm-modal-body wrapper */}
+                        <div className={isCorporate ? 'corp-vm-modal-body' : 'flex-1 overflow-auto p-6'}>
                             {activeTab === 'users' && (
                                 <div className="space-y-4">
                                     {/* Add User Button + Folder Management */}

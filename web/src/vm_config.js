@@ -102,7 +102,7 @@
             );
         }
 
-        function ConfigModal({ vm, clusterId, allClusters = [], dashboardAuthFetch, onClose, addToast }) {
+        function ConfigModal({ vm, clusterId, allClusters = [], dashboardAuthFetch, onClose, addToast, isCorporate = false }) {
             const { t } = useTranslation();
             const { getAuthHeaders } = useAuth();
             const [config, setConfig] = useState(null);
@@ -190,6 +190,9 @@
             const [showEditDisk, setShowEditDisk] = useState(null);  // NS: Edit disk bus type
             const [showReattachDisk, setShowReattachDisk] = useState(null);  // MK: Reattach unused disk modal
             const [showMountISO, setShowMountISO] = useState(false);
+            // NS May 2026 — when "Change ISO" is clicked on an existing cdrom row,
+            // we open the same MountISOModal but pre-select that drive.
+            const [mountIsoInitialDrive, setMountIsoInitialDrive] = useState(null);
             const [showImportDisk, setShowImportDisk] = useState(false);  // MK: Import disk from storage
             const [showReassignOwner, setShowReassignOwner] = useState(null);  // MK: Reassign disk to another VM
             const [importableDisks, setImportableDisks] = useState([]);  // MK: List of importable disk images
@@ -1404,75 +1407,169 @@
                     { id: 'options', labelKey: 'optionsTab', icon: Icons.Settings },
                 ];
 
+            // NS May 2026: in Corporate layout we render a corporate flat
+            // chrome (flat, light-weighted typography, underlined tabs, clean
+            // header with explicit Apply / Cancel actions). The Modern dark
+            // pill-tab look feels foreign in the Corporate layout especially
+            // under the light theme. Body markup is shared between layouts.
             return(
-                <div className="fixed inset-0 z-50 flex items-center justify-center p-4 modal-backdrop bg-black/80">
-                    <div className="w-full max-w-4xl max-h-[90vh] bg-proxmox-card border border-proxmox-border rounded-2xl shadow-2xl animate-scale-in overflow-hidden flex flex-col">
+                <div className={isCorporate
+                    ? 'corp-vm-modal-overlay'
+                    : 'fixed inset-0 z-50 flex items-center justify-center p-4 modal-backdrop bg-black/80'}>
+                    <div className={isCorporate
+                        ? 'corp-vm-modal'
+                        : 'w-full max-w-4xl max-h-[90vh] bg-proxmox-card border border-proxmox-border rounded-2xl shadow-2xl animate-scale-in overflow-hidden flex flex-col'}>
                         {/* Header */}
-                        <div className="flex items-center justify-between px-6 py-4 border-b border-proxmox-border bg-proxmox-dark">
-                            <div className="flex items-center gap-3">
-                                <div className={`p-2 rounded-lg ${isQemu ? 'bg-blue-500/10' : 'bg-purple-500/10'}`}>
-                                    {isQemu ? <Icons.VM /> : <Icons.Container />}
+                        {isCorporate ? (
+                            <div className="corp-vm-modal-header">
+                                <div className="corp-vm-modal-header-left">
+                                    <span className={`corp-vm-type-pill ${isQemu ? '' : 'lxc'}`}>{isQemu ? 'VM' : 'CT'}</span>
+                                    <div className="corp-vm-modal-title-block">
+                                        <h2 className="corp-vm-modal-title">{vm.name || `${isQemu ? 'VM' : 'CT'} ${vm.vmid}`}</h2>
+                                        <div className="corp-vm-modal-meta">
+                                            <span>ID {vm.vmid}</span>
+                                            <span className="corp-meta-sep">·</span>
+                                            <span>{vm.node}</span>
+                                            <span className="corp-meta-sep">·</span>
+                                            <span>{isQemu ? 'QEMU' : 'LXC'}</span>
+                                            {vm.status && (
+                                                <>
+                                                    <span className="corp-meta-sep">·</span>
+                                                    <span className={`corp-badge corp-badge-${vm.status === 'running' ? 'running' : 'stopped'}`}>
+                                                        {vm.status}
+                                                    </span>
+                                                </>
+                                            )}
+                                        </div>
+                                    </div>
                                 </div>
-                                <div>
-                                    <h2 className="font-semibold text-white">{vm.name || `${isQemu ? 'VM' : 'CT'} ${vm.vmid}`}</h2>
-                                    <p className="text-xs text-gray-400">
-                                        {isQemu ? 'QEMU Virtual Machine' : 'LXC Container'} · ID {vm.vmid} · {vm.node}
-                                    </p>
-                                </div>
-                            </div>
-                            <div className="flex items-center gap-2">
-                                {hasChanges && (
-                                    <span className="text-xs text-yellow-400 bg-yellow-500/10 px-2 py-1 rounded">
-                                        {t('unsavedChanges') || 'Unsaved Changes'}
-                                    </span>
-                                )}
-                                <button
-                                    onClick={onClose}
-                                    className="p-2 rounded-lg hover:bg-red-500/20 text-gray-400 hover:text-red-400 transition-colors"
-                                >
-                                    <Icons.X />
-                                </button>
-                            </div>
-                        </div>
-
-                        {/* Tabs */}
-                        <div className="flex flex-wrap items-center gap-1 px-6 py-3 border-b border-proxmox-border bg-proxmox-dark/50">
-                            {tabs.map(tab => (
-                                <button
-                                    key={tab.id}
-                                    onClick={() => setActiveTab(tab.id)}
-                                    className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all whitespace-nowrap ${
-                                        activeTab === tab.id
-                                            ? 'bg-proxmox-orange text-white'
-                                            : 'text-gray-400 hover:text-white hover:bg-proxmox-hover'
-                                    }`}
-                                >
-                                    <tab.icon />
-                                    {t(tab.labelKey)}
-                                </button>
-                            ))}
-                        </div>
-
-                        {/* Content */}
-                        <div className="flex-1 overflow-y-auto p-6">
-                            {loading ? (
-                                <div className="flex items-center justify-center h-64">
-                                    <div className="animate-spin w-8 h-8 border-2 border-proxmox-orange border-t-transparent rounded-full"></div>
-                                </div>
-                            ) : configError ? (
-                                /* MK: Show error when config fails to load */
-                                <div className="flex flex-col items-center justify-center h-64 text-center">
-                                    <Icons.AlertTriangle className="w-12 h-12 text-red-400 mb-4" />
-                                    <p className="text-red-400 font-medium mb-2">{configError}</p>
-                                    <p className="text-gray-500 text-sm mb-4">{t('checkConnectionAndRetry') || 'Please check your connection and try again.'}</p>
-                                    <button 
-                                        onClick={() => { setConfigError(null); fetchConfig(); }}
-                                        className="px-4 py-2 bg-proxmox-orange rounded-lg text-white hover:bg-orange-600 flex items-center gap-2"
+                                <div className="corp-vm-modal-actions">
+                                    {hasChanges && (
+                                        <span className="corp-unsaved-pill">{t('unsavedChanges') || 'Unsaved Changes'}</span>
+                                    )}
+                                    {hasChanges && (
+                                        <button
+                                            onClick={handleSave}
+                                            disabled={saving}
+                                            className="corp-vm-btn corp-vm-btn-primary"
+                                            title={t('save') || 'Apply changes'}
+                                        >
+                                            {saving ? (t('saving') || 'Saving...') : (t('apply') || 'Apply')}
+                                        </button>
+                                    )}
+                                    <button
+                                        onClick={onClose}
+                                        className="corp-vm-btn corp-vm-btn-ghost"
                                     >
-                                        <Icons.RotateCw className="w-4 h-4" />
-                                        {t('retry') || 'Retry'}
+                                        {t('close') || 'Close'}
                                     </button>
                                 </div>
+                            </div>
+                        ) : (
+                            <div className="flex items-center justify-between px-6 py-4 border-b border-proxmox-border bg-proxmox-dark">
+                                <div className="flex items-center gap-3">
+                                    <div className={`p-2 rounded-lg ${isQemu ? 'bg-blue-500/10' : 'bg-purple-500/10'}`}>
+                                        {isQemu ? <Icons.VM /> : <Icons.Container />}
+                                    </div>
+                                    <div>
+                                        <h2 className="font-semibold text-white">{vm.name || `${isQemu ? 'VM' : 'CT'} ${vm.vmid}`}</h2>
+                                        <p className="text-xs text-gray-400">
+                                            {isQemu ? 'QEMU Virtual Machine' : 'LXC Container'} · ID {vm.vmid} · {vm.node}
+                                        </p>
+                                    </div>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                    {hasChanges && (
+                                        <span className="text-xs text-yellow-400 bg-yellow-500/10 px-2 py-1 rounded">
+                                            {t('unsavedChanges') || 'Unsaved Changes'}
+                                        </span>
+                                    )}
+                                    <button
+                                        onClick={onClose}
+                                        className="p-2 rounded-lg hover:bg-red-500/20 text-gray-400 hover:text-red-400 transition-colors"
+                                    >
+                                        <Icons.X />
+                                    </button>
+                                </div>
+                            </div>
+                        )}
+
+                        {/* Tabs */}
+                        {isCorporate ? (
+                            <div className="corp-vm-modal-tabs">
+                                {tabs.map(tab => (
+                                    <button
+                                        key={tab.id}
+                                        onClick={() => setActiveTab(tab.id)}
+                                        className={`corp-vm-modal-tab ${activeTab === tab.id ? 'active' : ''}`}
+                                    >
+                                        <tab.icon className="w-3.5 h-3.5" />
+                                        {t(tab.labelKey)}
+                                    </button>
+                                ))}
+                            </div>
+                        ) : (
+                            <div className="flex flex-wrap items-center gap-1 px-6 py-3 border-b border-proxmox-border bg-proxmox-dark/50">
+                                {tabs.map(tab => (
+                                    <button
+                                        key={tab.id}
+                                        onClick={() => setActiveTab(tab.id)}
+                                        className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all whitespace-nowrap ${
+                                            activeTab === tab.id
+                                                ? 'bg-proxmox-orange text-white'
+                                                : 'text-gray-400 hover:text-white hover:bg-proxmox-hover'
+                                        }`}
+                                    >
+                                        <tab.icon />
+                                        {t(tab.labelKey)}
+                                    </button>
+                                ))}
+                            </div>
+                        )}
+
+                        {/* Content */}
+                        <div className={isCorporate ? 'corp-vm-modal-body' : 'flex-1 overflow-y-auto p-6'}>
+                            {loading ? (
+                                isCorporate ? (
+                                    <div className="corp-vm-modal-state">
+                                        <div className="corp-vm-spinner"></div>
+                                    </div>
+                                ) : (
+                                    <div className="flex items-center justify-center h-64">
+                                        <div className="animate-spin w-8 h-8 border-2 border-proxmox-orange border-t-transparent rounded-full"></div>
+                                    </div>
+                                )
+                            ) : configError ? (
+                                /* MK: Show error when config fails to load */
+                                isCorporate ? (
+                                    <div className="corp-vm-modal-state">
+                                        <Icons.AlertTriangle className="w-10 h-10 mb-3" style={{color: '#f54f47'}} />
+                                        <p style={{color: '#f54f47', fontWeight: 500, marginBottom: '6px'}}>{configError}</p>
+                                        <p style={{fontSize: '12px', color: 'var(--corp-text-muted)', marginBottom: '14px'}}>
+                                            {t('checkConnectionAndRetry') || 'Please check your connection and try again.'}
+                                        </p>
+                                        <button
+                                            onClick={() => { setConfigError(null); fetchConfig(); }}
+                                            className="corp-vm-btn corp-vm-btn-primary"
+                                        >
+                                            <Icons.RotateCw className="w-3.5 h-3.5" />
+                                            {t('retry') || 'Retry'}
+                                        </button>
+                                    </div>
+                                ) : (
+                                    <div className="flex flex-col items-center justify-center h-64 text-center">
+                                        <Icons.AlertTriangle className="w-12 h-12 text-red-400 mb-4" />
+                                        <p className="text-red-400 font-medium mb-2">{configError}</p>
+                                        <p className="text-gray-500 text-sm mb-4">{t('checkConnectionAndRetry') || 'Please check your connection and try again.'}</p>
+                                        <button
+                                            onClick={() => { setConfigError(null); fetchConfig(); }}
+                                            className="px-4 py-2 bg-proxmox-orange rounded-lg text-white hover:bg-orange-600 flex items-center gap-2"
+                                        >
+                                            <Icons.RotateCw className="w-4 h-4" />
+                                            {t('retry') || 'Retry'}
+                                        </button>
+                                    </div>
+                                )
                             ) : config ? (
                                 <>
                                     {/* General Tab */}
@@ -2142,18 +2239,40 @@
                                             </div>
                                             
                                             {config.disks?.length > 0 ? (
-                                                config.disks.map((disk) => (
+                                                config.disks.map((disk) => {
+                                                    // NS May 2026 — single source of truth for the cdrom check
+                                                    // (used to swap the row's actions for an ISO-aware set).
+                                                    const isCdrom = isQemu && (
+                                                        String(disk.value || '').includes('media=cdrom') ||
+                                                        disk.media === 'cdrom' ||
+                                                        (disk.volume || '').includes('iso')
+                                                    );
+                                                    return (
                                                     <div key={disk.id} className="p-4 bg-proxmox-dark rounded-lg border border-proxmox-border">
                                                         <div className="flex items-center justify-between mb-3">
                                                             <div className="flex items-center gap-3">
-                                                                <Icons.HardDrive />
+                                                                {isCdrom ? <Icons.Disc /> : <Icons.HardDrive />}
                                                                 <span className="font-medium text-white">{disk.id}</span>
                                                                 <span className="text-xs text-gray-500 bg-proxmox-card px-2 py-0.5 rounded">{disk.storage}</span>
+                                                                {isCdrom && (
+                                                                    <span className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-blue-500/15 text-blue-400 border border-blue-500/30">CD</span>
+                                                                )}
                                                             </div>
                                                             <div className="flex items-center gap-2">
                                                                 <span className="text-sm text-proxmox-orange font-mono mr-2">{disk.size}</span>
-                                                                {/* MK: Edit disk bus type */}
-                                                                {isQemu && disk.id !== 'rootfs' && !disk.id.includes('efidisk') && !disk.id.includes('tpmstate') && (
+                                                                {/* NS May 2026 — direct "Change ISO" entry point so the user
+                                                                    no longer has to detach + remount just to swap the image. */}
+                                                                {isCdrom && (
+                                                                    <button
+                                                                        onClick={() => { setMountIsoInitialDrive(disk.id); setShowMountISO(true); }}
+                                                                        className="p-1.5 rounded hover:bg-proxmox-hover text-gray-400 hover:text-blue-400 transition-colors"
+                                                                        title={t('changeIso') || 'Change ISO'}
+                                                                    >
+                                                                        <Icons.Disc />
+                                                                    </button>
+                                                                )}
+                                                                {/* MK: Edit disk bus type — not for CD-ROMs */}
+                                                                {isQemu && !isCdrom && disk.id !== 'rootfs' && !disk.id.includes('efidisk') && !disk.id.includes('tpmstate') && (
                                                                     <button
                                                                         onClick={() => setShowEditDisk(disk)}
                                                                         className="p-1.5 rounded hover:bg-proxmox-hover text-gray-400 hover:text-yellow-400 transition-colors"
@@ -2162,6 +2281,7 @@
                                                                         <Icons.Edit />
                                                                     </button>
                                                                 )}
+                                                                {!isCdrom && (
                                                                 <button
                                                                     onClick={() => setShowResizeDisk(disk)}
                                                                     className="p-1.5 rounded hover:bg-proxmox-hover text-gray-400 hover:text-green-400 transition-colors"
@@ -2169,6 +2289,8 @@
                                                                 >
                                                                     <Icons.Plus />
                                                                 </button>
+                                                                )}
+                                                                {!isCdrom && (
                                                                 <button
                                                                     onClick={() => setShowMoveDisk(disk)}
                                                                     className="p-1.5 rounded hover:bg-proxmox-hover text-gray-400 hover:text-blue-400 transition-colors"
@@ -2176,6 +2298,7 @@
                                                                 >
                                                                     <Icons.ArrowRight />
                                                                 </button>
+                                                                )}
                                                                 {disk.id !== 'rootfs' && !disk.id.includes('efidisk') && !disk.id.includes('tpmstate') && (
                                                                     <>
                                                                         {/* MK: Only show reassign for real disks, not CD-ROM/ISO */}
@@ -2231,7 +2354,8 @@
                                                             )}
                                                         </div>
                                                     </div>
-                                                ))
+                                                    );
+                                                })
                                             ) : (
                                                 <div className="text-center py-8 text-gray-500">
                                                     {t('noDisksConfigured')}
@@ -5066,6 +5190,7 @@
                     {showMountISO && (
                         <MountISOModal
                             isoList={isoList}
+                            initialDrive={mountIsoInitialDrive}
                             existingDrives={
                                 // Extract existing drives from config.disks array
                                 (config?.disks || []).map(disk => ({
@@ -5074,7 +5199,7 @@
                                 }))
                             }
                             onMount={handleMountISO}
-                            onClose={() => setShowMountISO(false)}
+                            onClose={() => { setShowMountISO(false); setMountIsoInitialDrive(null); }}
                         />
                     )}
 
@@ -6011,11 +6136,22 @@
             );
         }
 
-        function MountISOModal({ isoList, existingDrives, onMount, onClose }) {
+        function MountISOModal({ isoList, existingDrives, onMount, onClose, initialDrive }) {
             const { t } = useTranslation();
             const [iso, setIso] = useState('');
-            const [driveType, setDriveType] = useState('ide');
-            const [driveNum, setDriveNum] = useState('2');
+            // NS May 2026 — when invoked from a per-row "Change ISO" action, parse
+            // initialDrive ('ide2', 'sata0', …) into bus type + slot so we land
+            // directly on the existing CD-ROM instead of forcing the user to
+            // re-pick everything. Falls back to ide2 (PVE convention) otherwise.
+            const _parseInitial = (s) => {
+                if (typeof s !== 'string') return null;
+                const m = s.match(/^(ide|scsi|sata)(\d+)$/);
+                if (!m) return null;
+                return { type: m[1], num: m[2] };
+            };
+            const _parsed = _parseInitial(initialDrive);
+            const [driveType, setDriveType] = useState(_parsed?.type || 'ide');
+            const [driveNum, setDriveNum] = useState(_parsed?.num || '2');
             
             // calc which drives are already in use
             const usedDrives = existingDrives || [];

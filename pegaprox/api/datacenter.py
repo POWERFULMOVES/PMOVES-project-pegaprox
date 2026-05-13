@@ -16,7 +16,7 @@ from pegaprox.core.db import get_db
 
 from pegaprox.utils.auth import require_auth
 from pegaprox.utils.audit import log_audit
-from pegaprox.api.helpers import get_connected_manager, check_cluster_access, safe_error
+from pegaprox.api.helpers import get_connected_manager, check_cluster_access, safe_error, parse_pve_error
 
 bp = Blueprint('datacenter', __name__)
 
@@ -182,10 +182,10 @@ def get_cluster_multipath_status(cluster_id):
         return error
     
     try:
-        host = manager.host
+        host, port = manager.host, manager.api_port
         
         # Get all nodes
-        nodes_url = f"https://{host}:8006/api2/json/nodes"
+        nodes_url = f"https://{host}:{port}/api2/json/nodes"
         nodes_resp = manager._create_session().get(nodes_url, timeout=10)
         
         if nodes_resp.status_code != 200:
@@ -263,11 +263,11 @@ def setup_multipath(cluster_id):
     skip_existing_config = data.get('skipExistingConfig', False)  # Don't overwrite existing config
 
     try:
-        host = manager.host
+        host, port = manager.host, manager.api_port
 
         # Get nodes if not specified
         if not target_nodes:
-            nodes_url = f"https://{host}:8006/api2/json/nodes"
+            nodes_url = f"https://{host}:{port}/api2/json/nodes"
             nodes_resp = manager._create_session().get(nodes_url, timeout=10)
             if nodes_resp.status_code == 200:
                 target_nodes = [n['node'] for n in nodes_resp.json().get('data', []) if n.get('status') == 'online']
@@ -616,10 +616,10 @@ def discover_iscsi_targets(cluster_id, node):
         portal = f"{portal}:3260"
     
     try:
-        host = manager.host
+        host, port = manager.host, manager.api_port
         
         # Use Proxmox API to scan iSCSI targets
-        scan_url = f"https://{host}:8006/api2/json/nodes/{node}/scan/iscsi"
+        scan_url = f"https://{host}:{port}/api2/json/nodes/{node}/scan/iscsi"
         response = manager._create_session().get(scan_url, params={'portal': portal}, timeout=30)
         
         if response.status_code == 200:
@@ -629,7 +629,7 @@ def discover_iscsi_targets(cluster_id, node):
                 'targets': targets
             })
         else:
-            return jsonify({'error': response.text}), response.status_code
+            return jsonify({'error': parse_pve_error(response.text)}), response.status_code
 
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to discover iSCSI targets')}), 500
@@ -781,7 +781,7 @@ def get_sdn_overview(cluster_id):
         return error
     
     try:
-        host = manager.host
+        host, port = manager.host, manager.api_port
         session = manager._create_session()
         
         result = {
@@ -798,7 +798,7 @@ def get_sdn_overview(cluster_id):
         }
         
         # Check if SDN is available
-        sdn_url = f"https://{host}:8006/api2/json/cluster/sdn"
+        sdn_url = f"https://{host}:{port}/api2/json/cluster/sdn"
         try:
             sdn_resp = session.get(sdn_url, timeout=10)
             result['debug']['sdn_status'] = sdn_resp.status_code
@@ -830,7 +830,7 @@ def get_sdn_overview(cluster_id):
             result['available'] = True
         
         # Get zones
-        zones_url = f"https://{host}:8006/api2/json/cluster/sdn/zones"
+        zones_url = f"https://{host}:{port}/api2/json/cluster/sdn/zones"
         try:
             zones_resp = session.get(zones_url, timeout=10)
             result['debug']['zones_status'] = zones_resp.status_code
@@ -852,7 +852,7 @@ def get_sdn_overview(cluster_id):
             result['debug']['zones_exception'] = str(e)
         
         # Get vnets
-        vnets_url = f"https://{host}:8006/api2/json/cluster/sdn/vnets"
+        vnets_url = f"https://{host}:{port}/api2/json/cluster/sdn/vnets"
         vnets_resp = session.get(vnets_url, timeout=10)
         if vnets_resp.status_code == 200:
             result['vnets'] = vnets_resp.json().get('data', [])
@@ -862,7 +862,7 @@ def get_sdn_overview(cluster_id):
         for vnet in result['vnets']:
             vnet_name = vnet.get('vnet', '')
             if vnet_name:
-                subnets_url = f"https://{host}:8006/api2/json/cluster/sdn/vnets/{vnet_name}/subnets"
+                subnets_url = f"https://{host}:{port}/api2/json/cluster/sdn/vnets/{vnet_name}/subnets"
                 subnets_resp = session.get(subnets_url, timeout=10)
                 if subnets_resp.status_code == 200:
                     for subnet in subnets_resp.json().get('data', []):
@@ -872,7 +872,7 @@ def get_sdn_overview(cluster_id):
         
         # Get controllers
         try:
-            ctrl_url = f"https://{host}:8006/api2/json/cluster/sdn/controllers"
+            ctrl_url = f"https://{host}:{port}/api2/json/cluster/sdn/controllers"
             ctrl_resp = session.get(ctrl_url, timeout=10)
             if ctrl_resp.status_code == 200:
                 result['controllers'] = ctrl_resp.json().get('data', [])
@@ -881,7 +881,7 @@ def get_sdn_overview(cluster_id):
         
         # Get IPAM configurations
         try:
-            ipam_url = f"https://{host}:8006/api2/json/cluster/sdn/ipams"
+            ipam_url = f"https://{host}:{port}/api2/json/cluster/sdn/ipams"
             ipam_resp = session.get(ipam_url, timeout=10)
             if ipam_resp.status_code == 200:
                 result['ipams'] = ipam_resp.json().get('data', [])
@@ -890,7 +890,7 @@ def get_sdn_overview(cluster_id):
         
         # Get DNS configurations
         try:
-            dns_url = f"https://{host}:8006/api2/json/cluster/sdn/dns"
+            dns_url = f"https://{host}:{port}/api2/json/cluster/sdn/dns"
             dns_resp = session.get(dns_url, timeout=10)
             if dns_resp.status_code == 200:
                 result['dns'] = dns_resp.json().get('data', [])
@@ -899,7 +899,7 @@ def get_sdn_overview(cluster_id):
         
         # Check for pending changes
         try:
-            pending_url = f"https://{host}:8006/api2/json/cluster/sdn"
+            pending_url = f"https://{host}:{port}/api2/json/cluster/sdn"
             pending_resp = session.get(pending_url, timeout=10)
             if pending_resp.status_code == 200:
                 # If there are pending changes, the running config differs from pending
@@ -928,15 +928,15 @@ def get_sdn_zones(cluster_id):
         return error
     
     try:
-        host = manager.host
-        url = f"https://{host}:8006/api2/json/cluster/sdn/zones"
+        host, port = manager.host, manager.api_port
+        url = f"https://{host}:{port}/api2/json/cluster/sdn/zones"
         response = manager._create_session().get(url, timeout=10)
         
         if response.status_code == 200:
             return jsonify(response.json().get('data', []))
         elif response.status_code == 501:
             return jsonify([])
-        return jsonify({'error': response.text}), response.status_code
+        return jsonify({'error': parse_pve_error(response.text)}), response.status_code
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to get SDN zones')}), 500
 
@@ -954,17 +954,17 @@ def create_sdn_zone(cluster_id):
         return error
     
     try:
-        host = manager.host
+        host, port = manager.host, manager.api_port
         data = request.json or {}
         
-        url = f"https://{host}:8006/api2/json/cluster/sdn/zones"
+        url = f"https://{host}:{port}/api2/json/cluster/sdn/zones"
         response = manager._create_session().post(url, data=data, timeout=10)
         
         if response.status_code in [200, 201]:
             user = getattr(request, 'session', {}).get('user', 'system')
             log_audit(user, 'sdn.zone_created', f"Created SDN zone: {data.get('zone', 'unknown')}", cluster=manager.config.name)
             return jsonify({'success': True, 'message': 'Zone created'})
-        return jsonify({'error': response.text}), response.status_code
+        return jsonify({'error': parse_pve_error(response.text)}), response.status_code
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to create SDN zone')}), 500
 
@@ -981,17 +981,17 @@ def update_sdn_zone(cluster_id, zone_id):
         return error
     
     try:
-        host = manager.host
+        host, port = manager.host, manager.api_port
         data = request.json or {}
         
-        url = f"https://{host}:8006/api2/json/cluster/sdn/zones/{zone_id}"
+        url = f"https://{host}:{port}/api2/json/cluster/sdn/zones/{zone_id}"
         response = manager._create_session().put(url, data=data, timeout=10)
         
         if response.status_code == 200:
             user = getattr(request, 'session', {}).get('user', 'system')
             log_audit(user, 'sdn.zone_updated', f"Updated SDN zone: {zone_id}", cluster=manager.config.name)
             return jsonify({'success': True, 'message': 'Zone updated'})
-        return jsonify({'error': response.text}), response.status_code
+        return jsonify({'error': parse_pve_error(response.text)}), response.status_code
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to update SDN zone')}), 500
 
@@ -1008,16 +1008,16 @@ def delete_sdn_zone(cluster_id, zone_id):
         return error
     
     try:
-        host = manager.host
+        host, port = manager.host, manager.api_port
         
-        url = f"https://{host}:8006/api2/json/cluster/sdn/zones/{zone_id}"
+        url = f"https://{host}:{port}/api2/json/cluster/sdn/zones/{zone_id}"
         response = manager._create_session().delete(url, timeout=10)
         
         if response.status_code == 200:
             user = getattr(request, 'session', {}).get('user', 'system')
             log_audit(user, 'sdn.zone_deleted', f"Deleted SDN zone: {zone_id}", cluster=manager.config.name)
             return jsonify({'success': True, 'message': 'Zone deleted'})
-        return jsonify({'error': response.text}), response.status_code
+        return jsonify({'error': parse_pve_error(response.text)}), response.status_code
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to delete SDN zone')}), 500
 
@@ -1035,15 +1035,15 @@ def get_sdn_vnets(cluster_id):
         return error
     
     try:
-        host = manager.host
-        url = f"https://{host}:8006/api2/json/cluster/sdn/vnets"
+        host, port = manager.host, manager.api_port
+        url = f"https://{host}:{port}/api2/json/cluster/sdn/vnets"
         response = manager._create_session().get(url, timeout=10)
         
         if response.status_code == 200:
             return jsonify(response.json().get('data', []))
         elif response.status_code == 501:
             return jsonify([])
-        return jsonify({'error': response.text}), response.status_code
+        return jsonify({'error': parse_pve_error(response.text)}), response.status_code
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to get SDN vnets')}), 500
 
@@ -1060,17 +1060,17 @@ def create_sdn_vnet(cluster_id):
         return error
     
     try:
-        host = manager.host
+        host, port = manager.host, manager.api_port
         data = request.json or {}
         
-        url = f"https://{host}:8006/api2/json/cluster/sdn/vnets"
+        url = f"https://{host}:{port}/api2/json/cluster/sdn/vnets"
         response = manager._create_session().post(url, data=data, timeout=10)
         
         if response.status_code in [200, 201]:
             user = getattr(request, 'session', {}).get('user', 'system')
             log_audit(user, 'sdn.vnet_created', f"Created SDN VNet: {data.get('vnet', 'unknown')}", cluster=manager.config.name)
             return jsonify({'success': True, 'message': 'VNet created'})
-        return jsonify({'error': response.text}), response.status_code
+        return jsonify({'error': parse_pve_error(response.text)}), response.status_code
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to create SDN vnet')}), 500
 
@@ -1087,17 +1087,17 @@ def update_sdn_vnet(cluster_id, vnet_id):
         return error
     
     try:
-        host = manager.host
+        host, port = manager.host, manager.api_port
         data = request.json or {}
         
-        url = f"https://{host}:8006/api2/json/cluster/sdn/vnets/{vnet_id}"
+        url = f"https://{host}:{port}/api2/json/cluster/sdn/vnets/{vnet_id}"
         response = manager._create_session().put(url, data=data, timeout=10)
         
         if response.status_code == 200:
             user = getattr(request, 'session', {}).get('user', 'system')
             log_audit(user, 'sdn.vnet_updated', f"Updated SDN VNet: {vnet_id}", cluster=manager.config.name)
             return jsonify({'success': True, 'message': 'VNet updated'})
-        return jsonify({'error': response.text}), response.status_code
+        return jsonify({'error': parse_pve_error(response.text)}), response.status_code
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to update SDN vnet')}), 500
 
@@ -1114,16 +1114,16 @@ def delete_sdn_vnet(cluster_id, vnet_id):
         return error
     
     try:
-        host = manager.host
+        host, port = manager.host, manager.api_port
         
-        url = f"https://{host}:8006/api2/json/cluster/sdn/vnets/{vnet_id}"
+        url = f"https://{host}:{port}/api2/json/cluster/sdn/vnets/{vnet_id}"
         response = manager._create_session().delete(url, timeout=10)
         
         if response.status_code == 200:
             user = getattr(request, 'session', {}).get('user', 'system')
             log_audit(user, 'sdn.vnet_deleted', f"Deleted SDN VNet: {vnet_id}", cluster=manager.config.name)
             return jsonify({'success': True, 'message': 'VNet deleted'})
-        return jsonify({'error': response.text}), response.status_code
+        return jsonify({'error': parse_pve_error(response.text)}), response.status_code
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to delete SDN vnet')}), 500
 
@@ -1141,15 +1141,15 @@ def get_sdn_subnets(cluster_id, vnet_id):
         return error
     
     try:
-        host = manager.host
-        url = f"https://{host}:8006/api2/json/cluster/sdn/vnets/{vnet_id}/subnets"
+        host, port = manager.host, manager.api_port
+        url = f"https://{host}:{port}/api2/json/cluster/sdn/vnets/{vnet_id}/subnets"
         response = manager._create_session().get(url, timeout=10)
         
         if response.status_code == 200:
             return jsonify(response.json().get('data', []))
         elif response.status_code == 501:
             return jsonify([])
-        return jsonify({'error': response.text}), response.status_code
+        return jsonify({'error': parse_pve_error(response.text)}), response.status_code
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to get SDN subnets')}), 500
 
@@ -1166,17 +1166,17 @@ def create_sdn_subnet(cluster_id, vnet_id):
         return error
     
     try:
-        host = manager.host
+        host, port = manager.host, manager.api_port
         data = request.json or {}
         
-        url = f"https://{host}:8006/api2/json/cluster/sdn/vnets/{vnet_id}/subnets"
+        url = f"https://{host}:{port}/api2/json/cluster/sdn/vnets/{vnet_id}/subnets"
         response = manager._create_session().post(url, data=data, timeout=10)
         
         if response.status_code in [200, 201]:
             user = getattr(request, 'session', {}).get('user', 'system')
             log_audit(user, 'sdn.subnet_created', f"Created subnet in VNet {vnet_id}: {data.get('subnet', 'unknown')}", cluster=manager.config.name)
             return jsonify({'success': True, 'message': 'Subnet created'})
-        return jsonify({'error': response.text}), response.status_code
+        return jsonify({'error': parse_pve_error(response.text)}), response.status_code
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to create SDN subnet')}), 500
 
@@ -1193,17 +1193,17 @@ def delete_sdn_subnet(cluster_id, vnet_id, subnet_id):
         return error
     
     try:
-        host = manager.host
+        host, port = manager.host, manager.api_port
         
         # Subnet ID needs URL encoding as it contains CIDR notation
-        url = f"https://{host}:8006/api2/json/cluster/sdn/vnets/{vnet_id}/subnets/{subnet_id}"
+        url = f"https://{host}:{port}/api2/json/cluster/sdn/vnets/{vnet_id}/subnets/{subnet_id}"
         response = manager._create_session().delete(url, timeout=10)
         
         if response.status_code == 200:
             user = getattr(request, 'session', {}).get('user', 'system')
             log_audit(user, 'sdn.subnet_deleted', f"Deleted subnet {subnet_id} from VNet {vnet_id}", cluster=manager.config.name)
             return jsonify({'success': True, 'message': 'Subnet deleted'})
-        return jsonify({'error': response.text}), response.status_code
+        return jsonify({'error': parse_pve_error(response.text)}), response.status_code
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to delete SDN subnet')}), 500
 
@@ -1220,16 +1220,16 @@ def apply_sdn_config(cluster_id):
         return error
     
     try:
-        host = manager.host
+        host, port = manager.host, manager.api_port
         
-        url = f"https://{host}:8006/api2/json/cluster/sdn"
+        url = f"https://{host}:{port}/api2/json/cluster/sdn"
         response = manager._create_session().put(url, timeout=30)
         
         if response.status_code == 200:
             user = getattr(request, 'session', {}).get('user', 'system')
             log_audit(user, 'sdn.config_applied', "Applied SDN configuration to cluster", cluster=manager.config.name)
             return jsonify({'success': True, 'message': 'SDN configuration applied'})
-        return jsonify({'error': response.text}), response.status_code
+        return jsonify({'error': parse_pve_error(response.text)}), response.status_code
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to apply SDN config')}), 500
 
@@ -1251,15 +1251,15 @@ def get_sdn_controllers(cluster_id):
         return error
     
     try:
-        host = manager.host
-        url = f"https://{host}:8006/api2/json/cluster/sdn/controllers"
+        host, port = manager.host, manager.api_port
+        url = f"https://{host}:{port}/api2/json/cluster/sdn/controllers"
         response = manager._create_session().get(url, timeout=10)
         
         if response.status_code == 200:
             return jsonify(response.json().get('data', []))
         elif response.status_code == 501:
             return jsonify([])
-        return jsonify({'error': response.text}), response.status_code
+        return jsonify({'error': parse_pve_error(response.text)}), response.status_code
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to get SDN controllers')}), 500
 
@@ -1276,17 +1276,17 @@ def create_sdn_controller(cluster_id):
         return error
     
     try:
-        host = manager.host
+        host, port = manager.host, manager.api_port
         data = request.json or {}
         
-        url = f"https://{host}:8006/api2/json/cluster/sdn/controllers"
+        url = f"https://{host}:{port}/api2/json/cluster/sdn/controllers"
         response = manager._create_session().post(url, data=data, timeout=10)
         
         if response.status_code in [200, 201]:
             user = getattr(request, 'session', {}).get('user', 'system')
             log_audit(user, 'sdn.controller_created', f"Created SDN controller: {data.get('controller', 'unknown')} ({data.get('type', '')})", cluster=manager.config.name)
             return jsonify({'success': True, 'message': 'Controller created'})
-        return jsonify({'error': response.text}), response.status_code
+        return jsonify({'error': parse_pve_error(response.text)}), response.status_code
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to create SDN controller')}), 500
 
@@ -1303,17 +1303,17 @@ def update_sdn_controller(cluster_id, controller_id):
         return error
     
     try:
-        host = manager.host
+        host, port = manager.host, manager.api_port
         data = request.json or {}
         
-        url = f"https://{host}:8006/api2/json/cluster/sdn/controllers/{controller_id}"
+        url = f"https://{host}:{port}/api2/json/cluster/sdn/controllers/{controller_id}"
         response = manager._create_session().put(url, data=data, timeout=10)
         
         if response.status_code == 200:
             user = getattr(request, 'session', {}).get('user', 'system')
             log_audit(user, 'sdn.controller_updated', f"Updated SDN controller: {controller_id}", cluster=manager.config.name)
             return jsonify({'success': True, 'message': 'Controller updated'})
-        return jsonify({'error': response.text}), response.status_code
+        return jsonify({'error': parse_pve_error(response.text)}), response.status_code
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to update SDN controller')}), 500
 
@@ -1330,16 +1330,16 @@ def delete_sdn_controller(cluster_id, controller_id):
         return error
     
     try:
-        host = manager.host
+        host, port = manager.host, manager.api_port
         
-        url = f"https://{host}:8006/api2/json/cluster/sdn/controllers/{controller_id}"
+        url = f"https://{host}:{port}/api2/json/cluster/sdn/controllers/{controller_id}"
         response = manager._create_session().delete(url, timeout=10)
         
         if response.status_code == 200:
             user = getattr(request, 'session', {}).get('user', 'system')
             log_audit(user, 'sdn.controller_deleted', f"Deleted SDN controller: {controller_id}", cluster=manager.config.name)
             return jsonify({'success': True, 'message': 'Controller deleted'})
-        return jsonify({'error': response.text}), response.status_code
+        return jsonify({'error': parse_pve_error(response.text)}), response.status_code
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to delete SDN controller')}), 500
 
@@ -1361,15 +1361,15 @@ def get_sdn_ipams(cluster_id):
         return error
     
     try:
-        host = manager.host
-        url = f"https://{host}:8006/api2/json/cluster/sdn/ipams"
+        host, port = manager.host, manager.api_port
+        url = f"https://{host}:{port}/api2/json/cluster/sdn/ipams"
         response = manager._create_session().get(url, timeout=10)
         
         if response.status_code == 200:
             return jsonify(response.json().get('data', []))
         elif response.status_code == 501:
             return jsonify([])
-        return jsonify({'error': response.text}), response.status_code
+        return jsonify({'error': parse_pve_error(response.text)}), response.status_code
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to get SDN IPAMs')}), 500
 
@@ -1386,17 +1386,17 @@ def create_sdn_ipam(cluster_id):
         return error
     
     try:
-        host = manager.host
+        host, port = manager.host, manager.api_port
         data = request.json or {}
         
-        url = f"https://{host}:8006/api2/json/cluster/sdn/ipams"
+        url = f"https://{host}:{port}/api2/json/cluster/sdn/ipams"
         response = manager._create_session().post(url, data=data, timeout=10)
         
         if response.status_code in [200, 201]:
             user = getattr(request, 'session', {}).get('user', 'system')
             log_audit(user, 'sdn.ipam_created', f"Created IPAM: {data.get('ipam', 'unknown')} ({data.get('type', '')})", cluster=manager.config.name)
             return jsonify({'success': True, 'message': 'IPAM created'})
-        return jsonify({'error': response.text}), response.status_code
+        return jsonify({'error': parse_pve_error(response.text)}), response.status_code
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to create IPAM')}), 500
 
@@ -1413,17 +1413,17 @@ def update_sdn_ipam(cluster_id, ipam_id):
         return error
     
     try:
-        host = manager.host
+        host, port = manager.host, manager.api_port
         data = request.json or {}
         
-        url = f"https://{host}:8006/api2/json/cluster/sdn/ipams/{ipam_id}"
+        url = f"https://{host}:{port}/api2/json/cluster/sdn/ipams/{ipam_id}"
         response = manager._create_session().put(url, data=data, timeout=10)
         
         if response.status_code == 200:
             user = getattr(request, 'session', {}).get('user', 'system')
             log_audit(user, 'sdn.ipam_updated', f"Updated IPAM: {ipam_id}", cluster=manager.config.name)
             return jsonify({'success': True, 'message': 'IPAM updated'})
-        return jsonify({'error': response.text}), response.status_code
+        return jsonify({'error': parse_pve_error(response.text)}), response.status_code
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to update IPAM')}), 500
 
@@ -1440,16 +1440,16 @@ def delete_sdn_ipam(cluster_id, ipam_id):
         return error
     
     try:
-        host = manager.host
+        host, port = manager.host, manager.api_port
         
-        url = f"https://{host}:8006/api2/json/cluster/sdn/ipams/{ipam_id}"
+        url = f"https://{host}:{port}/api2/json/cluster/sdn/ipams/{ipam_id}"
         response = manager._create_session().delete(url, timeout=10)
         
         if response.status_code == 200:
             user = getattr(request, 'session', {}).get('user', 'system')
             log_audit(user, 'sdn.ipam_deleted', f"Deleted IPAM: {ipam_id}", cluster=manager.config.name)
             return jsonify({'success': True, 'message': 'IPAM deleted'})
-        return jsonify({'error': response.text}), response.status_code
+        return jsonify({'error': parse_pve_error(response.text)}), response.status_code
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to delete IPAM')}), 500
 
@@ -1471,15 +1471,15 @@ def get_sdn_dns(cluster_id):
         return error
     
     try:
-        host = manager.host
-        url = f"https://{host}:8006/api2/json/cluster/sdn/dns"
+        host, port = manager.host, manager.api_port
+        url = f"https://{host}:{port}/api2/json/cluster/sdn/dns"
         response = manager._create_session().get(url, timeout=10)
         
         if response.status_code == 200:
             return jsonify(response.json().get('data', []))
         elif response.status_code == 501:
             return jsonify([])
-        return jsonify({'error': response.text}), response.status_code
+        return jsonify({'error': parse_pve_error(response.text)}), response.status_code
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to get SDN DNS configs')}), 500
 
@@ -1496,17 +1496,17 @@ def create_sdn_dns(cluster_id):
         return error
     
     try:
-        host = manager.host
+        host, port = manager.host, manager.api_port
         data = request.json or {}
         
-        url = f"https://{host}:8006/api2/json/cluster/sdn/dns"
+        url = f"https://{host}:{port}/api2/json/cluster/sdn/dns"
         response = manager._create_session().post(url, data=data, timeout=10)
         
         if response.status_code in [200, 201]:
             user = getattr(request, 'session', {}).get('user', 'system')
             log_audit(user, 'sdn.dns_created', f"Created DNS: {data.get('dns', 'unknown')}", cluster=manager.config.name)
             return jsonify({'success': True, 'message': 'DNS created'})
-        return jsonify({'error': response.text}), response.status_code
+        return jsonify({'error': parse_pve_error(response.text)}), response.status_code
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to create DNS config')}), 500
 
@@ -1523,17 +1523,17 @@ def update_sdn_dns(cluster_id, dns_id):
         return error
     
     try:
-        host = manager.host
+        host, port = manager.host, manager.api_port
         data = request.json or {}
         
-        url = f"https://{host}:8006/api2/json/cluster/sdn/dns/{dns_id}"
+        url = f"https://{host}:{port}/api2/json/cluster/sdn/dns/{dns_id}"
         response = manager._create_session().put(url, data=data, timeout=10)
         
         if response.status_code == 200:
             user = getattr(request, 'session', {}).get('user', 'system')
             log_audit(user, 'sdn.dns_updated', f"Updated DNS: {dns_id}", cluster=manager.config.name)
             return jsonify({'success': True, 'message': 'DNS updated'})
-        return jsonify({'error': response.text}), response.status_code
+        return jsonify({'error': parse_pve_error(response.text)}), response.status_code
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to update DNS config')}), 500
 
@@ -1550,16 +1550,16 @@ def delete_sdn_dns(cluster_id, dns_id):
         return error
     
     try:
-        host = manager.host
+        host, port = manager.host, manager.api_port
         
-        url = f"https://{host}:8006/api2/json/cluster/sdn/dns/{dns_id}"
+        url = f"https://{host}:{port}/api2/json/cluster/sdn/dns/{dns_id}"
         response = manager._create_session().delete(url, timeout=10)
         
         if response.status_code == 200:
             user = getattr(request, 'session', {}).get('user', 'system')
             log_audit(user, 'sdn.dns_deleted', f"Deleted DNS: {dns_id}", cluster=manager.config.name)
             return jsonify({'success': True, 'message': 'DNS deleted'})
-        return jsonify({'error': response.text}), response.status_code
+        return jsonify({'error': parse_pve_error(response.text)}), response.status_code
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to delete DNS config')}), 500
 
@@ -1580,13 +1580,13 @@ def get_sdn_zone_details(cluster_id, zone_id):
         return error
     
     try:
-        host = manager.host
-        url = f"https://{host}:8006/api2/json/cluster/sdn/zones/{zone_id}"
+        host, port = manager.host, manager.api_port
+        url = f"https://{host}:{port}/api2/json/cluster/sdn/zones/{zone_id}"
         response = manager._create_session().get(url, timeout=10)
         
         if response.status_code == 200:
             return jsonify(response.json().get('data', {}))
-        return jsonify({'error': response.text}), response.status_code
+        return jsonify({'error': parse_pve_error(response.text)}), response.status_code
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to get SDN zone details')}), 500
 
@@ -1603,13 +1603,13 @@ def get_sdn_vnet_details(cluster_id, vnet_id):
         return error
     
     try:
-        host = manager.host
-        url = f"https://{host}:8006/api2/json/cluster/sdn/vnets/{vnet_id}"
+        host, port = manager.host, manager.api_port
+        url = f"https://{host}:{port}/api2/json/cluster/sdn/vnets/{vnet_id}"
         response = manager._create_session().get(url, timeout=10)
         
         if response.status_code == 200:
             return jsonify(response.json().get('data', {}))
-        return jsonify({'error': response.text}), response.status_code
+        return jsonify({'error': parse_pve_error(response.text)}), response.status_code
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to get SDN vnet details')}), 500
 
@@ -1626,21 +1626,21 @@ def update_sdn_subnet(cluster_id, vnet_id, subnet_id):
         return error
     
     try:
-        host = manager.host
+        host, port = manager.host, manager.api_port
         data = request.json or {}
         
         # URL encode the subnet ID (contains /)
         from urllib.parse import quote
         encoded_subnet = quote(subnet_id, safe='')
         
-        url = f"https://{host}:8006/api2/json/cluster/sdn/vnets/{vnet_id}/subnets/{encoded_subnet}"
+        url = f"https://{host}:{port}/api2/json/cluster/sdn/vnets/{vnet_id}/subnets/{encoded_subnet}"
         response = manager._create_session().put(url, data=data, timeout=10)
         
         if response.status_code == 200:
             user = getattr(request, 'session', {}).get('user', 'system')
             log_audit(user, 'sdn.subnet_updated', f"Updated subnet {subnet_id} in VNet {vnet_id}", cluster=manager.config.name)
             return jsonify({'success': True, 'message': 'Subnet updated'})
-        return jsonify({'error': response.text}), response.status_code
+        return jsonify({'error': parse_pve_error(response.text)}), response.status_code
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to update SDN subnet')}), 500
 

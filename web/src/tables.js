@@ -1291,7 +1291,7 @@
         // NS: Added bulk select for mass operations (migration, etc.)
         // This component does a lot... might need to split it up eventually
         // NS: filtering + sorting uses useMemo below (lines 1320+)
-        function ResourceTable({ resources, clusterId, clusters, sourceCluster, onVmAction, onOpenConsole, onOpenConfig, onMigrate, onBulkMigrate, onDelete, onClone, onForceStop, onCrossClusterMigrate, nodes, onOpenTags, highlightedVm, addToast, pendingVmAction, onPendingActionConsumed, onVmNavigate }) {
+        function ResourceTable({ resources, clusterId, clusters, sourceCluster, onVmAction, onOpenConsole, onOpenConfig, onMigrate, onBulkMigrate, onDelete, onClone, onForceStop, onCrossClusterMigrate, nodes, onOpenTags, highlightedVm, addToast, pendingVmAction, onPendingActionConsumed, onVmNavigate, backupStatus }) {
             const { t } = useTranslation();
             const { getAuthHeaders } = useAuth();
             const { isCorporate } = useLayout(); // LW: Feb 2026 - corporate defaults to table view
@@ -1810,6 +1810,19 @@
                                                     ))}
                                                 </div>
                                             )}
+                                            {/* NS May 2026 — backup status pill */}
+                                            {backupStatus && backupStatus[resource.vmid] && window.PegaProxBackupStatusPill && (
+                                                <div className="flex items-center justify-between text-sm">
+                                                    <span className="text-gray-500 text-xs">Backup</span>
+                                                    {React.createElement(window.PegaProxBackupStatusPill, {
+                                                        status: backupStatus[resource.vmid].status,
+                                                        lastAgeHours: backupStatus[resource.vmid].last_backup_age_hours,
+                                                        encrypted: backupStatus[resource.vmid].encrypted,
+                                                        verifyAgeHours: backupStatus[resource.vmid].last_verify_age_hours,
+                                                        count30d: backupStatus[resource.vmid].count_30d,
+                                                    })}
+                                                </div>
+                                            )}
                                             <div>
                                                 <div className="flex items-center justify-between text-xs mb-1">
                                                     <span className="text-gray-500">{t('ram')}</span>
@@ -2105,7 +2118,17 @@
                                                 </td>
                                                 <td className="px-4 py-3">
                                                     <div>
-                                                        <span className={`font-medium truncate block ${onVmNavigate ? 'text-blue-400 hover:text-blue-300 hover:underline cursor-pointer' : 'text-white'}`} style={{maxWidth:'min(220px, 18vw)'}} onClick={onVmNavigate ? (e) => { e.stopPropagation(); onVmNavigate(resource); } : undefined} title={resource.name}>{resource.name || '-'}</span>
+                                                        <div className="flex items-center gap-1.5">
+                                                            <span className={`font-medium truncate block ${onVmNavigate ? 'text-blue-400 hover:text-blue-300 hover:underline cursor-pointer' : 'text-white'}`} style={{maxWidth:'min(220px, 18vw)'}} onClick={onVmNavigate ? (e) => { e.stopPropagation(); onVmNavigate(resource); } : undefined} title={resource.name}>{resource.name || '-'}</span>
+                                                            {/* NS May 2026 — backup status pill (table-row layout) */}
+                                                            {backupStatus && backupStatus[resource.vmid] && window.PegaProxBackupStatusPill && React.createElement(window.PegaProxBackupStatusPill, {
+                                                                status: backupStatus[resource.vmid].status,
+                                                                lastAgeHours: backupStatus[resource.vmid].last_backup_age_hours,
+                                                                encrypted: backupStatus[resource.vmid].encrypted,
+                                                                verifyAgeHours: backupStatus[resource.vmid].last_verify_age_hours,
+                                                                count30d: backupStatus[resource.vmid].count_30d,
+                                                            })}
+                                                        </div>
                                                         {resource.tags && (
                                                             <div className="flex flex-wrap gap-1 mt-1">
                                                                 {(Array.isArray(resource.tags) ? resource.tags : resource.tags.split(';')).filter(t => t.trim()).slice(0, 3).map((tag, i) => (
@@ -2425,20 +2448,26 @@
                                                     {resource.name || `${resource.type === 'qemu' ? 'VM' : 'CT'} ${resource.vmid}`}
                                                 </div>
                                                 <div className="text-xs text-gray-500">ID: {resource.vmid} · {resource.node}</div>
-                                                {resource.tags && (
-                                                    <div className="flex flex-wrap gap-1 mt-1">
-                                                        {(Array.isArray(resource.tags) ? resource.tags : resource.tags.split(';')).filter(t => t.trim()).slice(0, 2).map((tag, i) => (
-                                                            <span key={i} className="px-1 py-0.5 text-xs rounded bg-proxmox-orange/20 text-proxmox-orange">
-                                                                {tag.trim()}
-                                                            </span>
-                                                        ))}
-                                                        {(Array.isArray(resource.tags) ? resource.tags : resource.tags.split(';')).filter(t => t.trim()).length > 2 && (
-                                                            <span className="px-1 py-0.5 text-xs rounded bg-gray-500/20 text-gray-400">
-                                                                +{(Array.isArray(resource.tags) ? resource.tags : resource.tags.split(';')).filter(t => t.trim()).length - 2}
-                                                            </span>
-                                                        )}
-                                                    </div>
-                                                )}
+                                                <div className="flex flex-wrap gap-1 mt-1 items-center">
+                                                    {/* NS May 2026 — backup status pill (mobile stack layout) */}
+                                                    {backupStatus && backupStatus[resource.vmid] && window.PegaProxBackupStatusPill && React.createElement(window.PegaProxBackupStatusPill, {
+                                                        status: backupStatus[resource.vmid].status,
+                                                        lastAgeHours: backupStatus[resource.vmid].last_backup_age_hours,
+                                                        encrypted: backupStatus[resource.vmid].encrypted,
+                                                        verifyAgeHours: backupStatus[resource.vmid].last_verify_age_hours,
+                                                        count30d: backupStatus[resource.vmid].count_30d,
+                                                    })}
+                                                    {resource.tags && (Array.isArray(resource.tags) ? resource.tags : resource.tags.split(';')).filter(t => t.trim()).slice(0, 2).map((tag, i) => (
+                                                        <span key={i} className="px-1 py-0.5 text-xs rounded bg-proxmox-orange/20 text-proxmox-orange">
+                                                            {tag.trim()}
+                                                        </span>
+                                                    ))}
+                                                    {resource.tags && (Array.isArray(resource.tags) ? resource.tags : resource.tags.split(';')).filter(t => t.trim()).length > 2 && (
+                                                        <span className="px-1 py-0.5 text-xs rounded bg-gray-500/20 text-gray-400">
+                                                            +{(Array.isArray(resource.tags) ? resource.tags : resource.tags.split(';')).filter(t => t.trim()).length - 2}
+                                                        </span>
+                                                    )}
+                                                </div>
                                             </div>
                                             {getProxmoxObjectUrl(getVmProxmoxTarget(resource)) && (
                                                 <button

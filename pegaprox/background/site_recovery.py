@@ -39,6 +39,14 @@ def _fire_webhook(url):
     if not url:
         return
     try:
+        # NS May 2026 — SSRF guard: failover webhooks are admin-set; refuse
+        # internal/metadata targets so a misconfig doesn't ping AWS metadata.
+        try:
+            from pegaprox.utils.url_security import sanitize_outbound_url, SsrfError
+            sanitize_outbound_url(url, allowed_schemes=('https', 'http'))
+        except SsrfError as guard_err:
+            logger.warning(f"[SR] webhook URL rejected: {guard_err}")
+            return
         requests.post(url, json={'event': 'site_recovery', 'timestamp': datetime.utcnow().isoformat()}, timeout=30)
     except Exception as e:
         logger.warning(f"[SR] Webhook failed: {url} - {e}")
@@ -267,7 +275,7 @@ def _start_replicated_vm(tgt_mgr, vmid, vm_type='qemu'):
         # find target node for the VM via cluster resources (one call vs N)
         try:
             res = tgt_mgr._api_get(
-                f"https://{tgt_mgr.host}:8006/api2/json/cluster/resources",
+                f"https://{tgt_mgr.host}:{tgt_mgr.api_port}/api2/json/cluster/resources",
                 params={'type': 'vm'}
             )
             if res.status_code != 200:
@@ -550,7 +558,7 @@ def cleanup_test(plan_id):
             # NS Apr 2026: locate test VM via cluster resources (was iterating all nodes)
             try:
                 res = tgt_mgr._api_get(
-                    f"https://{tgt_mgr.host}:8006/api2/json/cluster/resources",
+                    f"https://{tgt_mgr.host}:{tgt_mgr.api_port}/api2/json/cluster/resources",
                     params={'type': 'vm'}
                 )
                 target_node = None

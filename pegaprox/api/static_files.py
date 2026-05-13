@@ -18,7 +18,7 @@ from pegaprox.utils.rbac import (
     get_user_effective_role, get_role_permissions_for_user,
     DEFAULT_TENANT_ID,
 )
-from pegaprox.api.helpers import check_cluster_access, safe_error
+from pegaprox.api.helpers import check_cluster_access, safe_error, parse_pve_error
 
 bp = Blueprint('static_files', __name__)
 
@@ -56,8 +56,8 @@ def create_pool(cluster_id):
     
     try:
         # Create pool via Proxmox API
-        host = manager.host
-        url = f"https://{host}:8006/api2/json/pools"
+        host, port = manager.host, manager.api_port
+        url = f"https://{host}:{port}/api2/json/pools"
         
         api_data = {'poolid': poolid}
         if comment:
@@ -104,12 +104,12 @@ def update_pool(cluster_id, pool_id):
             return jsonify({'error': 'Failed to connect to Proxmox cluster'}), 503
     
     try:
-        host = manager.host
-        url = f"https://{host}:8006/api2/json/pools/{pool_id}"
+        host, port = manager.host, manager.api_port
+        url = f"https://{host}:{port}/api2/json/pools/{pool_id}"
         response = manager._api_put(url, data={'comment': comment})
         
         if response.status_code != 200:
-            return jsonify({'error': f'Proxmox API error: {response.text}'}), 500
+            return jsonify({'error': f'Proxmox API error: {parse_pve_error(response.text)}'}), 500
         
         audit_log(request.session.get('user'), 'pool.update', f'Updated pool {pool_id}', {'cluster': cluster_id, 'poolid': pool_id})
         
@@ -136,8 +136,8 @@ def delete_pool(cluster_id, pool_id):
             return jsonify({'error': 'Failed to connect to Proxmox cluster'}), 503
     
     try:
-        host = manager.host
-        url = f"https://{host}:8006/api2/json/pools/{pool_id}"
+        host, port = manager.host, manager.api_port
+        url = f"https://{host}:{port}/api2/json/pools/{pool_id}"
         response = manager._api_delete(url)
         
         if response.status_code != 200:
@@ -200,8 +200,8 @@ def add_pool_member(cluster_id, pool_id):
     
     try:
         # Add VM to pool - Proxmox uses 'vms' parameter
-        host = manager.host
-        url = f"https://{host}:8006/api2/json/pools/{pool_id}"
+        host, port = manager.host, manager.api_port
+        url = f"https://{host}:{port}/api2/json/pools/{pool_id}"
 
         logging.info(f"Adding VM {vmid} to pool {pool_id} on {host}")
 
@@ -266,15 +266,15 @@ def remove_pool_member(cluster_id, pool_id, vmid):
     
     try:
         # Remove VM from pool using DELETE parameter
-        host = manager.host
-        url = f"https://{host}:8006/api2/json/pools/{pool_id}"
+        host, port = manager.host, manager.api_port
+        url = f"https://{host}:{port}/api2/json/pools/{pool_id}"
         response = manager._api_put(url, data={
             'vms': str(vmid),
             'delete': 1
         })
         
         if response.status_code != 200:
-            return jsonify({'error': f'Proxmox API error: {response.text}'}), 500
+            return jsonify({'error': f'Proxmox API error: {parse_pve_error(response.text)}'}), 500
         
         # Invalidate cache
         invalidate_pool_cache(cluster_id)

@@ -21,7 +21,7 @@ from pegaprox.core.db import get_db
 from pegaprox.utils.auth import require_auth
 from pegaprox.utils.audit import log_audit
 from pegaprox.core.cache import APIRateLimiter, StorageDataCache
-from pegaprox.api.helpers import get_connected_manager, check_cluster_access, safe_error
+from pegaprox.api.helpers import get_connected_manager, check_cluster_access, safe_error, parse_pve_error
 from pegaprox.utils.ssh import get_paramiko, _ssh_track_connection
 from pegaprox import globals as _g
 
@@ -135,7 +135,7 @@ def get_esxi_hosts(cluster_id):
         try:
             # LW: query proxmox to see if the esxi storage is working
             storage_status = mgr._api_get(
-                f"https://{mgr.host}:8006/api2/json/storage/{storage_id}"
+                f"https://{mgr.host}:{mgr.api_port}/api2/json/storage/{storage_id}"
             )
             if storage_status and storage_status.status_code == 200:
                 connected = True
@@ -197,7 +197,7 @@ def connect_esxi_host(cluster_id):
             storage_data['skip-cert-verification'] = 1
         
         response = mgr._api_post(
-            f"https://{mgr.host}:8006/api2/json/storage",
+            f"https://{mgr.host}:{mgr.api_port}/api2/json/storage",
             data=storage_data
         )
         
@@ -262,7 +262,7 @@ def disconnect_esxi_host(cluster_id, host_id):
         # remove storage from proxmox
         if storage_name:
             response = mgr._api_delete(
-                f"https://{mgr.host}:8006/api2/json/storage/{storage_name}"
+                f"https://{mgr.host}:{mgr.api_port}/api2/json/storage/{storage_name}"
             )
             # dont care too much if it fails, maybe already removed
             if response.status_code not in [200, 404]:
@@ -306,8 +306,8 @@ def get_esxi_vms(cluster_id, host_id):
     
     try:
         # get a node to query from (any node works for shared storage queries)
-        host = mgr.host
-        nodes_resp = mgr._api_get(f"https://{host}:8006/api2/json/nodes")
+        host, port = mgr.host, mgr.api_port
+        nodes_resp = mgr._api_get(f"https://{host}:{port}/api2/json/nodes")
         nodes = []
         if nodes_resp.status_code == 200:
             nodes = [n['node'] for n in nodes_resp.json().get('data', [])]
@@ -320,7 +320,7 @@ def get_esxi_vms(cluster_id, host_id):
         # query storage content from proxmox
         # NS: this returns the VMs available for import
         response = mgr._api_get(
-            f"https://{host}:8006/api2/json/nodes/{node}/storage/{storage_name}/content"
+            f"https://{host}:{port}/api2/json/nodes/{node}/storage/{storage_name}/content"
         )
         
         if response.status_code != 200:
@@ -348,7 +348,7 @@ def get_esxi_vms(cluster_id, host_id):
             # MK: try to get import metadata for more details
             try:
                 meta_resp = mgr._api_get(
-                    f"https://{host}:8006/api2/json/nodes/{node}/storage/{storage_name}/import-metadata",
+                    f"https://{host}:{port}/api2/json/nodes/{node}/storage/{storage_name}/import-metadata",
                     params={'volume': volid}
                 )
                 if meta_resp.status_code == 200:
@@ -647,7 +647,7 @@ def get_storage_cluster_status(cluster_id, sc_id):
         return jsonify({'error': 'Storage cluster not found'}), 404
     
     try:
-        host = manager.host
+        host, port = manager.host, manager.api_port
         
         # Try to get storage stats from cache first
         cache_key = f"storage_stats:{sc_id}"
@@ -662,7 +662,7 @@ def get_storage_cluster_status(cluster_id, sc_id):
             nodes = []
             
             # Get nodes
-            nodes_url = f"https://{host}:8006/api2/json/nodes"
+            nodes_url = f"https://{host}:{port}/api2/json/nodes"
             nodes_response = manager._create_session().get(nodes_url, timeout=10)
             if nodes_response.status_code == 200:
                 nodes = [n['node'] for n in nodes_response.json().get('data', [])]
@@ -673,7 +673,7 @@ def get_storage_cluster_status(cluster_id, sc_id):
                     return jsonify({'error': 'API rate limit exceeded'}), 429
                 
                 node = nodes[0]
-                storage_url = f"https://{host}:8006/api2/json/nodes/{node}/storage"
+                storage_url = f"https://{host}:{port}/api2/json/nodes/{node}/storage"
                 storage_response = manager._create_session().get(storage_url, timeout=10)
                 
                 if storage_response.status_code == 200:
@@ -735,7 +735,7 @@ def get_storage_cluster_status(cluster_id, sc_id):
                     })
                 
                 # Find VMs on the source storage that could be moved
-                resources_url = f"https://{host}:8006/api2/json/cluster/resources?type=vm"
+                resources_url = f"https://{host}:{port}/api2/json/cluster/resources?type=vm"
                 resources_response = manager._create_session().get(resources_url, timeout=15)
                 
                 if resources_response.status_code == 200:
@@ -774,7 +774,7 @@ def get_storage_cluster_status(cluster_id, sc_id):
                     
                     # Check VM has active tasks (snapshot, backup, etc.)
                     try:
-                        status_url = f"https://{host}:8006/api2/json/nodes/{vm_node}/{vm_type}/{vmid}/status/current"
+                        status_url = f"https://{host}:{port}/api2/json/nodes/{vm_node}/{vm_type}/{vmid}/status/current"
                         status_response = manager._create_session().get(status_url, timeout=5)
                         if status_response.status_code == 200:
                             status_data = status_response.json().get('data', {})
@@ -784,7 +784,7 @@ def get_storage_cluster_status(cluster_id, sc_id):
                         pass
                     
                     # Get VM config to find disks
-                    config_url = f"https://{host}:8006/api2/json/nodes/{vm_node}/{vm_type}/{vmid}/config"
+                    config_url = f"https://{host}:{port}/api2/json/nodes/{vm_node}/{vm_type}/{vmid}/config"
                     config_response = manager._create_session().get(config_url, timeout=5)
                     
                     if config_response.status_code == 200:
@@ -878,10 +878,10 @@ def execute_storage_migration(cluster_id):
         return jsonify({'error': 'Missing required parameters: vmid, disk, target'}), 400
     
     try:
-        host = manager.host
+        host, port = manager.host, manager.api_port
         
         # Find the VM
-        resources_url = f"https://{host}:8006/api2/json/cluster/resources?type=vm"
+        resources_url = f"https://{host}:{port}/api2/json/cluster/resources?type=vm"
         resources_response = manager._create_session().get(resources_url, timeout=5)
         
         vm_node = None
@@ -894,7 +894,7 @@ def execute_storage_migration(cluster_id):
                     vm_type = 'qemu' if vm.get('type') == 'qemu' else 'lxc'
                     
                     # Check for lock
-                    status_url = f"https://{host}:8006/api2/json/nodes/{vm_node}/{vm_type}/{vmid}/status/current"
+                    status_url = f"https://{host}:{port}/api2/json/nodes/{vm_node}/{vm_type}/{vmid}/status/current"
                     status_response = manager._create_session().get(status_url, timeout=5)
                     if status_response.status_code == 200:
                         status_data = status_response.json().get('data', {})
@@ -920,7 +920,7 @@ def execute_storage_migration(cluster_id):
             logging.warning(f"Could not check efficient snapshots for VM {vmid}: {e}")
 
         # Execute disk move
-        move_url = f"https://{host}:8006/api2/json/nodes/{vm_node}/{vm_type}/{vmid}/move_disk"
+        move_url = f"https://{host}:{port}/api2/json/nodes/{vm_node}/{vm_type}/{vmid}/move_disk"
         move_data = {
             'disk': disk,
             'storage': target_storage,
@@ -1061,12 +1061,12 @@ def run_auto_storage_balance():
                                 upid = m.get('upid')
                                 if upid and manager.is_connected:
                                     try:
-                                        host = manager.host
+                                        host, port = manager.host, manager.api_port
                                         # UPID format: UPID:node:..., extract node
                                         parts = upid.split(':')
                                         task_node = parts[1] if len(parts) > 1 else None
                                         if task_node:
-                                            task_url = f"https://{host}:8006/api2/json/nodes/{task_node}/tasks/{upid}/status"
+                                            task_url = f"https://{host}:{port}/api2/json/nodes/{task_node}/tasks/{upid}/status"
                                             resp = manager._create_session().get(task_url, timeout=5)
                                             if resp.status_code == 200:
                                                 task_status = resp.json().get('data', {}).get('status')
@@ -1085,7 +1085,7 @@ def run_auto_storage_balance():
                             logging.debug(f"Auto-balance skipped for {sc['name']} - rate limited")
                             continue
                         
-                        host = manager.host
+                        host, port = manager.host, manager.api_port
                         
                         # Try to get storage stats from cache first
                         cache_key = f"auto_balance_storage:{sc['id']}"
@@ -1093,7 +1093,7 @@ def run_auto_storage_balance():
                         
                         if not cache_hit:
                             storage_stats = []
-                            nodes_url = f"https://{host}:8006/api2/json/nodes"
+                            nodes_url = f"https://{host}:{port}/api2/json/nodes"
                             nodes_response = manager._create_session().get(nodes_url, timeout=10)
                             nodes = []
                             if nodes_response.status_code == 200:
@@ -1103,7 +1103,7 @@ def run_auto_storage_balance():
                                 if not _api_rate_limiter.acquire(cluster_id, timeout=5):
                                     continue
                                     
-                                storage_url = f"https://{host}:8006/api2/json/nodes/{nodes[0]}/storage"
+                                storage_url = f"https://{host}:{port}/api2/json/nodes/{nodes[0]}/storage"
                                 storage_response = manager._create_session().get(storage_url, timeout=10)
                                 
                                 if storage_response.status_code == 200:
@@ -1154,7 +1154,7 @@ def run_auto_storage_balance():
                             if not _api_rate_limiter.acquire(cluster_id, timeout=5):
                                 continue
                             
-                            resources_url = f"https://{host}:8006/api2/json/cluster/resources?type=vm"
+                            resources_url = f"https://{host}:{port}/api2/json/cluster/resources?type=vm"
                             resources_response = manager._create_session().get(resources_url, timeout=15)
                             
                             if resources_response.status_code == 200:
@@ -1169,14 +1169,14 @@ def run_auto_storage_balance():
                         
                         if not ns_cache_hit:
                             node_storages = {}
-                            nodes_url = f"https://{host}:8006/api2/json/nodes"
+                            nodes_url = f"https://{host}:{port}/api2/json/nodes"
                             nodes_resp = manager._create_session().get(nodes_url, timeout=10)
                             if nodes_resp.status_code == 200:
                                 for node_info in nodes_resp.json().get('data', []):
                                     node = node_info['node']
                                     if not _api_rate_limiter.acquire(cluster_id, timeout=2):
                                         break
-                                    node_storage_url = f"https://{host}:8006/api2/json/nodes/{node}/storage"
+                                    node_storage_url = f"https://{host}:{port}/api2/json/nodes/{node}/storage"
                                     ns_resp = manager._create_session().get(node_storage_url, timeout=5)
                                     if ns_resp.status_code == 200:
                                         node_storages[node] = [s['storage'] for s in ns_resp.json().get('data', [])]
@@ -1234,7 +1234,7 @@ def run_auto_storage_balance():
 
                             # Check for lock (API-level lock field)
                             try:
-                                status_url = f"https://{host}:8006/api2/json/nodes/{vm_node}/{vm_type}/{vmid}/status/current"
+                                status_url = f"https://{host}:{port}/api2/json/nodes/{vm_node}/{vm_type}/{vmid}/status/current"
                                 status_response = manager._create_session().get(status_url, timeout=5)
                                 if status_response.status_code == 200:
                                     status_data = status_response.json().get('data', {})
@@ -1251,7 +1251,7 @@ def run_auto_storage_balance():
                             if not config_hit:
                                 if not _api_rate_limiter.acquire(cluster_id, timeout=2):
                                     break
-                                config_url = f"https://{host}:8006/api2/json/nodes/{vm_node}/{vm_type}/{vmid}/config"
+                                config_url = f"https://{host}:{port}/api2/json/nodes/{vm_node}/{vm_type}/{vmid}/config"
                                 config_response = manager._create_session().get(config_url, timeout=5)
                                 
                                 if config_response.status_code == 200:
@@ -1274,7 +1274,7 @@ def run_auto_storage_balance():
                                     if not _api_rate_limiter.acquire(cluster_id, timeout=5):
                                         break
                                     
-                                    move_url = f"https://{host}:8006/api2/json/nodes/{vm_node}/{vm_type}/{vmid}/move_disk"
+                                    move_url = f"https://{host}:{port}/api2/json/nodes/{vm_node}/{vm_type}/{vmid}/move_disk"
                                     move_data = {
                                         'disk': key,
                                         'storage': target_storage,
@@ -1354,8 +1354,8 @@ def create_storage(cluster_id):
         return error
     
     try:
-        host = manager.host
-        url = f"https://{host}:8006/api2/json/storage"
+        host, port = manager.host, manager.api_port
+        url = f"https://{host}:{port}/api2/json/storage"
         data = request.json or {}
         
         # Validate required fields
@@ -1414,7 +1414,10 @@ def create_storage(cluster_id):
         logging.info(f"Creating storage {storage_id} of type {storage_type}")
         logging.debug(f"Storage data: {pve_data}")
         
-        response = manager._create_session().post(url, data=pve_data, timeout=15)
+        # NS May 2026 — bumped to 60s. PVE blocks the create call while it
+        # verifies remote target (especially PBS — it pulls the cert + auths
+        # against the datastore). 15s wasn't enough.
+        response = manager._create_session().post(url, data=pve_data, timeout=60)
         
         if response.status_code == 200:
             result = response.json()
@@ -1422,19 +1425,25 @@ def create_storage(cluster_id):
             log_audit(user, 'storage.created', f"Created storage '{storage_id}' of type {storage_type}", cluster=manager.config.name)
             return jsonify({'success': True, 'message': 'Storage created', 'data': result.get('data')})
         else:
-            # Parse Proxmox error
+            # NS May 2026 — surface the raw PVE body when errors[]/message is empty.
+            # PVE returns 595 with no body in some setups (e.g. PBS unreachable from
+            # the node). Without the raw text, the UI shows a useless empty toast.
+            error_msg = ''
             try:
                 error_data = response.json()
-                error_msg = error_data.get('errors', {})
-                if isinstance(error_msg, dict):
-                    error_msg = ', '.join([f"{k}: {v}" for k, v in error_msg.items()])
-                elif not error_msg:
-                    error_msg = error_data.get('message', response.text)
-            except:
-                error_msg = response.text
-            
-            logging.error(f"Failed to create storage: {error_msg}")
-            return jsonify({'error': error_msg}), response.status_code
+                if isinstance(error_data.get('errors'), dict) and error_data['errors']:
+                    error_msg = ', '.join([f"{k}: {v}" for k, v in error_data['errors'].items()])
+                elif error_data.get('message'):
+                    error_msg = error_data.get('message')
+            except Exception:
+                pass
+            if not error_msg:
+                # fall back to raw text + status hint
+                raw = (response.text or '').strip()
+                error_msg = f'PVE {response.status_code}: {raw[:300] if raw else "no body"}'
+
+            logging.error(f"Failed to create storage [{response.status_code}]: {error_msg}; raw_body={response.text[:500]!r}")
+            return jsonify({'error': error_msg, 'pve_status': response.status_code, 'pve_body': response.text[:500]}), response.status_code
             
     except Exception as e:
         logging.error(f"Error creating storage: {e}")
@@ -1453,8 +1462,8 @@ def get_storage_config(cluster_id, storage_id):
         return error
     
     try:
-        host = manager.host
-        url = f"https://{host}:8006/api2/json/storage/{storage_id}"
+        host, port = manager.host, manager.api_port
+        url = f"https://{host}:{port}/api2/json/storage/{storage_id}"
         
         response = manager._create_session().get(url, timeout=10)
         
@@ -1480,8 +1489,8 @@ def update_storage(cluster_id, storage_id):
         return error
     
     try:
-        host = manager.host
-        url = f"https://{host}:8006/api2/json/storage/{storage_id}"
+        host, port = manager.host, manager.api_port
+        url = f"https://{host}:{port}/api2/json/storage/{storage_id}"
         data = request.json or {}
         
         # Remove fields that cannot be updated
@@ -1539,8 +1548,8 @@ def delete_storage(cluster_id, storage_id):
         return error
     
     try:
-        host = manager.host
-        url = f"https://{host}:8006/api2/json/storage/{storage_id}"
+        host, port = manager.host, manager.api_port
+        url = f"https://{host}:{port}/api2/json/storage/{storage_id}"
         
         response = manager._create_session().delete(url, timeout=10)
         
@@ -1576,17 +1585,17 @@ def get_storage_status(cluster_id, storage_id):
         return error
     
     try:
-        host = manager.host
+        host, port = manager.host, manager.api_port
         
         # Get storage config first
-        config_url = f"https://{host}:8006/api2/json/storage/{storage_id}"
+        config_url = f"https://{host}:{port}/api2/json/storage/{storage_id}"
         config_resp = manager._create_session().get(config_url, timeout=5)
         config = {}
         if config_resp.status_code == 200:
             config = config_resp.json().get('data', {})
         
         # Get nodes
-        nodes_url = f"https://{host}:8006/api2/json/nodes"
+        nodes_url = f"https://{host}:{port}/api2/json/nodes"
         nodes_resp = manager._create_session().get(nodes_url, timeout=5)
         nodes = []
         if nodes_resp.status_code == 200:
@@ -1596,7 +1605,7 @@ def get_storage_status(cluster_id, storage_id):
         node_status = []
         for node in nodes:
             try:
-                status_url = f"https://{host}:8006/api2/json/nodes/{node}/storage/{storage_id}/status"
+                status_url = f"https://{host}:{port}/api2/json/nodes/{node}/storage/{storage_id}/status"
                 status_resp = manager._create_session().get(status_url, timeout=5)
                 if status_resp.status_code == 200:
                     status = status_resp.json().get('data', {})
@@ -1637,7 +1646,7 @@ def rescan_storage(cluster_id, storage_id):
     username = request.session.get('user', 'unknown')
     
     try:
-        host = manager.host
+        host, port = manager.host, manager.api_port
         session = manager._create_session()
         data = request.json or {}
         target_nodes = data.get('nodes', [])  # Optional: specific nodes to rescan
@@ -1645,7 +1654,7 @@ def rescan_storage(cluster_id, storage_id):
         auto_pvresize = data.get('pvresize', True)  # Auto pvresize for LVM
         
         # Get storage config to determine type
-        config_url = f"https://{host}:8006/api2/json/storage/{storage_id}"
+        config_url = f"https://{host}:{port}/api2/json/storage/{storage_id}"
         config_resp = session.get(config_url, timeout=5)
         if config_resp.status_code != 200:
             return jsonify({'error': f'Storage {storage_id} not found'}), 404
@@ -1656,7 +1665,7 @@ def rescan_storage(cluster_id, storage_id):
         base_path = storage_config.get('base', '')  # For iscsi LVM base device
         
         # Get online nodes
-        nodes_url = f"https://{host}:8006/api2/json/nodes"
+        nodes_url = f"https://{host}:{port}/api2/json/nodes"
         nodes_resp = session.get(nodes_url, timeout=5)
         if nodes_resp.status_code != 200:
             return jsonify({'error': 'Could not get nodes'}), 500
@@ -1859,7 +1868,7 @@ def rescan_storage(cluster_id, storage_id):
                 
                 # 1. For iSCSI storage: rescan iSCSI sessions via API
                 if storage_type in ['iscsi', 'iscsidirect']:
-                    scsi_url = f"https://{host}:8006/api2/json/nodes/{node}/disks/scsi"
+                    scsi_url = f"https://{host}:{port}/api2/json/nodes/{node}/disks/scsi"
                     scsi_resp = session.post(scsi_url, timeout=30)
                     if scsi_resp.status_code in [200, 204]:
                         node_result['actions'].append({'action': 'scsi_rescan_api', 'status': 'success'})
@@ -1868,7 +1877,7 @@ def rescan_storage(cluster_id, storage_id):
                 
                 # 2. For LVM/shared LVM: trigger LVM rescan via API
                 if storage_type in ['lvm', 'lvmthin']:
-                    lvm_url = f"https://{host}:8006/api2/json/nodes/{node}/disks/lvm"
+                    lvm_url = f"https://{host}:{port}/api2/json/nodes/{node}/disks/lvm"
                     lvm_resp = session.get(lvm_url, timeout=30)
                     if lvm_resp.status_code == 200:
                         node_result['actions'].append({'action': 'lvm_scan_api', 'status': 'success'})
@@ -1877,7 +1886,7 @@ def rescan_storage(cluster_id, storage_id):
                 
                 # 3. For ZFS: refresh pool status via API
                 if storage_type in ['zfspool', 'zfs']:
-                    zfs_url = f"https://{host}:8006/api2/json/nodes/{node}/disks/zfs"
+                    zfs_url = f"https://{host}:{port}/api2/json/nodes/{node}/disks/zfs"
                     zfs_resp = session.get(zfs_url, timeout=30)
                     if zfs_resp.status_code == 200:
                         node_result['actions'].append({'action': 'zfs_scan_api', 'status': 'success'})
@@ -1885,7 +1894,7 @@ def rescan_storage(cluster_id, storage_id):
                         node_result['actions'].append({'action': 'zfs_scan_api', 'status': 'failed', 'error': zfs_resp.text[:100]})
                 
                 # 4. Always: Refresh storage status to update cache
-                status_url = f"https://{host}:8006/api2/json/nodes/{node}/storage/{storage_id}/status"
+                status_url = f"https://{host}:{port}/api2/json/nodes/{node}/storage/{storage_id}/status"
                 status_resp = session.get(status_url, timeout=10)
                 if status_resp.status_code == 200:
                     status_data = status_resp.json().get('data', {})
@@ -1945,12 +1954,12 @@ def scan_storage(cluster_id):
         return error
     
     try:
-        host = manager.host
+        host, port = manager.host, manager.api_port
         data = request.json or {}
         storage_type = data.get('type', 'iscsi')
         
         # Get a node to run the scan on
-        nodes_url = f"https://{host}:8006/api2/json/nodes"
+        nodes_url = f"https://{host}:{port}/api2/json/nodes"
         nodes_resp = manager._create_session().get(nodes_url, timeout=5)
         if nodes_resp.status_code != 200:
             return jsonify({'error': 'Could not get nodes'}), 500
@@ -1966,14 +1975,14 @@ def scan_storage(cluster_id):
             portal = data.get('portal')
             if not portal:
                 return jsonify({'error': 'Portal address required for iSCSI scan'}), 400
-            scan_url = f"https://{host}:8006/api2/json/nodes/{node}/scan/iscsi"
+            scan_url = f"https://{host}:{port}/api2/json/nodes/{node}/scan/iscsi"
             scan_resp = manager._create_session().get(scan_url, params={'portal': portal}, timeout=30)
             
         elif storage_type == 'nfs':
             server = data.get('server')
             if not server:
                 return jsonify({'error': 'Server address required for NFS scan'}), 400
-            scan_url = f"https://{host}:8006/api2/json/nodes/{node}/scan/nfs"
+            scan_url = f"https://{host}:{port}/api2/json/nodes/{node}/scan/nfs"
             scan_resp = manager._create_session().get(scan_url, params={'server': server}, timeout=30)
             
         elif storage_type == 'cifs':
@@ -1987,22 +1996,22 @@ def scan_storage(cluster_id):
                 params['password'] = data['password']
             if data.get('domain'):
                 params['domain'] = data['domain']
-            scan_url = f"https://{host}:8006/api2/json/nodes/{node}/scan/cifs"
+            scan_url = f"https://{host}:{port}/api2/json/nodes/{node}/scan/cifs"
             scan_resp = manager._create_session().get(scan_url, params=params, timeout=30)
             
         elif storage_type == 'lvm':
-            scan_url = f"https://{host}:8006/api2/json/nodes/{node}/scan/lvm"
+            scan_url = f"https://{host}:{port}/api2/json/nodes/{node}/scan/lvm"
             scan_resp = manager._create_session().get(scan_url, timeout=30)
             
         elif storage_type == 'lvmthin':
             vgname = data.get('vgname')
             if not vgname:
                 return jsonify({'error': 'Volume group name required for LVM-thin scan'}), 400
-            scan_url = f"https://{host}:8006/api2/json/nodes/{node}/scan/lvmthin"
+            scan_url = f"https://{host}:{port}/api2/json/nodes/{node}/scan/lvmthin"
             scan_resp = manager._create_session().get(scan_url, params={'vg': vgname}, timeout=30)
             
         elif storage_type == 'zfs':
-            scan_url = f"https://{host}:8006/api2/json/nodes/{node}/scan/zfs"
+            scan_url = f"https://{host}:{port}/api2/json/nodes/{node}/scan/zfs"
             scan_resp = manager._create_session().get(scan_url, timeout=30)
             
         else:
@@ -2046,11 +2055,11 @@ def get_available_templates(cluster_id):
         return error
     
     try:
-        host = manager.host
+        host, port = manager.host, manager.api_port
         template_type = request.args.get('type', 'lxc')
         
         # Get a node to query
-        nodes_url = f"https://{host}:8006/api2/json/nodes"
+        nodes_url = f"https://{host}:{port}/api2/json/nodes"
         nodes_resp = manager._create_session().get(nodes_url, timeout=5)
         if nodes_resp.status_code != 200:
             return jsonify({'error': 'Could not get nodes'}), 500
@@ -2064,7 +2073,7 @@ def get_available_templates(cluster_id):
         
         # Get LXC container templates (aplinfo)
         if template_type in ['lxc', 'all']:
-            apl_url = f"https://{host}:8006/api2/json/nodes/{node}/aplinfo"
+            apl_url = f"https://{host}:{port}/api2/json/nodes/{node}/aplinfo"
             apl_resp = manager._create_session().get(apl_url, timeout=30)
             if apl_resp.status_code == 200:
                 for tmpl in apl_resp.json().get('data', []):
@@ -2111,7 +2120,7 @@ def download_template(cluster_id):
         return error
     
     try:
-        host = manager.host
+        host, port = manager.host, manager.api_port
         data = request.json or {}
         
         storage = data.get('storage')
@@ -2125,7 +2134,7 @@ def download_template(cluster_id):
         
         # Get a node if not specified
         if not target_node:
-            nodes_url = f"https://{host}:8006/api2/json/nodes"
+            nodes_url = f"https://{host}:{port}/api2/json/nodes"
             nodes_resp = manager._create_session().get(nodes_url, timeout=5)
             if nodes_resp.status_code != 200:
                 return jsonify({'error': 'Could not get nodes'}), 500
@@ -2136,7 +2145,7 @@ def download_template(cluster_id):
             target_node = nodes[0]
         
         # Download template using aplinfo/download endpoint
-        download_url = f"https://{host}:8006/api2/json/nodes/{target_node}/aplinfo"
+        download_url = f"https://{host}:{port}/api2/json/nodes/{target_node}/aplinfo"
         download_data = {
             'storage': storage,
             'template': template
@@ -2185,10 +2194,10 @@ def get_node_storage_content(cluster_id, node, storage):
         return error
     
     try:
-        host = manager.host
+        host, port = manager.host, manager.api_port
         content_type = request.args.get('content', '')
         
-        url = f"https://{host}:8006/api2/json/nodes/{node}/storage/{storage}/content"
+        url = f"https://{host}:{port}/api2/json/nodes/{node}/storage/{storage}/content"
         if content_type:
             url += f"?content={content_type}"
         
@@ -2223,7 +2232,7 @@ def download_from_url(cluster_id, node, storage):
         return error
     
     try:
-        host = manager.host
+        host, port = manager.host, manager.api_port
         data = request.json or {}
         
         url = data.get('url')
@@ -2237,7 +2246,7 @@ def download_from_url(cluster_id, node, storage):
             return jsonify({'error': 'Filename is required'}), 400
         
         # Use Proxmox download-url API
-        download_url = f"https://{host}:8006/api2/json/nodes/{node}/storage/{storage}/download-url"
+        download_url = f"https://{host}:{port}/api2/json/nodes/{node}/storage/{storage}/download-url"
         download_data = {
             'url': url,
             'filename': filename,
@@ -2287,8 +2296,8 @@ def get_backup_jobs(cluster_id):
         return error
     
     try:
-        host = manager.host
-        url = f"https://{host}:8006/api2/json/cluster/backup"
+        host, port = manager.host, manager.api_port
+        url = f"https://{host}:{port}/api2/json/cluster/backup"
         r = manager._create_session().get(url, timeout=5)
         
         if r.status_code == 200:
@@ -2309,17 +2318,26 @@ def create_backup_job(cluster_id):
         return error
     
     try:
-        host = manager.host
-        url = f"https://{host}:8006/api2/json/cluster/backup"
+        host, port = manager.host, manager.api_port
+        url = f"https://{host}:{port}/api2/json/cluster/backup"
         data = request.json or {}
-        
-        r = manager._create_session().post(url, data=data, timeout=10)
-        
+        # NS May 2026 — PVE backup-job create can take >10s when it has to
+        # validate the destination (PBS in particular). Bumped to 60s.
+        r = manager._create_session().post(url, data=data, timeout=60)
+
         if r.status_code == 200:
             usr = getattr(request, 'session', {}).get('user', 'system')
             log_audit(usr, 'backup.job_created', f"Created backup job", cluster=manager.config.name)
-            return jsonify({'success': True, 'message': 'Backup job created'})
-        return jsonify({'error': r.text}), r.status_code
+            return jsonify({'success': True, 'message': 'Backup job created', 'data': r.json().get('data')})
+        # surface the actual PVE response so the UI shows useful errors
+        try:
+            err_body = r.json()
+            err_msg = err_body.get('errors') or err_body.get('message') or r.text
+            if isinstance(err_msg, dict):
+                err_msg = ', '.join(f'{k}: {v}' for k, v in err_msg.items())
+        except Exception:
+            err_msg = r.text or f'PVE {r.status_code}'
+        return jsonify({'error': err_msg, 'pve_status': r.status_code}), r.status_code
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to create backup job')}), 500
 
@@ -2335,8 +2353,8 @@ def update_backup_job(cluster_id, job_id):
         return error
     
     try:
-        host = manager.host
-        url = f"https://{host}:8006/api2/json/cluster/backup/{job_id}"
+        host, port = manager.host, manager.api_port
+        url = f"https://{host}:{port}/api2/json/cluster/backup/{job_id}"
         data = dict(request.json or {})
 
         # MK Apr 2026 (#338) — sanitise the payload before bouncing back to PVE.
@@ -2402,8 +2420,8 @@ def delete_backup_job(cluster_id, job_id):
         return error
     
     try:
-        host = manager.host
-        url = f"https://{host}:8006/api2/json/cluster/backup/{job_id}"
+        host, port = manager.host, manager.api_port
+        url = f"https://{host}:{port}/api2/json/cluster/backup/{job_id}"
         
         response = manager._create_session().delete(url, timeout=10)
         
@@ -2411,7 +2429,7 @@ def delete_backup_job(cluster_id, job_id):
             user = getattr(request, 'session', {}).get('user', 'system')
             log_audit(user, 'backup.job_deleted', f"Deleted backup job {job_id}", cluster=manager.config.name)
             return jsonify({'success': True, 'message': 'Backup job deleted'})
-        return jsonify({'error': response.text}), response.status_code
+        return jsonify({'error': parse_pve_error(response.text)}), response.status_code
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to delete backup job')}), 500
 

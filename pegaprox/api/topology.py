@@ -38,7 +38,7 @@ bp = Blueprint('topology', __name__)
 def _net_state_for_node(mgr, node):
     """Return the per-node network list (bridges, bonds, eth, etc.)."""
     try:
-        url = f"https://{mgr.host}:8006/api2/json/nodes/{node}/network"
+        url = f"https://{mgr.host}:{mgr.api_port}/api2/json/nodes/{node}/network"
         r = mgr._api_get(url)
         if r and r.status_code == 200:
             return r.json().get('data') or []
@@ -128,7 +128,7 @@ def topology(cluster_id):
 
     # ── SDN VNets (cluster-wide, may attach to any node's vmbr)
     try:
-        url = f"https://{mgr.host}:8006/api2/json/cluster/sdn/vnets"
+        url = f"https://{mgr.host}:{mgr.api_port}/api2/json/cluster/sdn/vnets"
         r = mgr._api_get(url)
         if r and r.status_code == 200:
             for v in (r.json().get('data') or []):
@@ -168,7 +168,7 @@ def topology(cluster_id):
 
         # fetch VM config to get net0/net1/...
         try:
-            cfg_url = f"https://{mgr.host}:8006/api2/json/nodes/{node}/{r['type']}/{vmid}/config"
+            cfg_url = f"https://{mgr.host}:{mgr.api_port}/api2/json/nodes/{node}/{r['type']}/{vmid}/config"
             cfg_resp = mgr._api_get(cfg_url)
             cfg = cfg_resp.json().get('data') if cfg_resp and cfg_resp.status_code == 200 else {}
         except Exception:

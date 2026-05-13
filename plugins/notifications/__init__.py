@@ -77,6 +77,13 @@ def _send_ntfy(alert_data, cfg):
         headers['Authorization'] = f"Bearer {token}"
 
     try:
+        # NS May 2026 — SSRF guard: ntfy URLs are admin-supplied and could
+        # accidentally (or maliciously) point at metadata / internal services.
+        try:
+            from pegaprox.utils.url_security import sanitize_outbound_url, SsrfError
+            sanitize_outbound_url(url, allowed_schemes=('https', 'http'))
+        except SsrfError as guard_err:
+            return False, f"ntfy URL rejected: {guard_err}"
         r = requests.post(url, data=alert_data.get('message', ''), headers=headers, timeout=10)
         if r.status_code in (200, 201):
             return True, None

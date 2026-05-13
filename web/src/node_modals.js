@@ -33,22 +33,42 @@
                 statusRef.current = status;
             }, [status]);
 
-            const sendCredentials = () => {
+            // NS May 2026 — staging area for credentials submitted before the
+            // WS finished opening. Air-gap users hit this when the dialog
+            // shows up before the handshake (which is now intentional).
+            const pendingCredsRef = useRef(null);
+
+            const _flushAuth = (authData) => {
                 if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-                    const authData = {
-                        username: credentials.username,
-                        password: credentials.authMethod === 'password' ? credentials.password : '',
-                        privateKey: credentials.authMethod === 'key' ? credentials.privateKey : '',
-                        host: credentials.host || nodeInfo.ip  // Send host/IP
-                    };
                     wsRef.current.send(JSON.stringify(authData));
+                    pendingCredsRef.current = null;
                     setShowLogin(false);
                     setStatus('connecting');
                     if (termRef.current) {
-                        const targetHost = credentials.host || nodeInfo.ip;
-                        const method = credentials.authMethod === 'key' ? '(SSH Key)' : '';
-                        termRef.current.write(`\r\nVerbinde als ${credentials.username}@${targetHost} ${method}...\r\n`);
+                        const method = authData.privateKey ? '(SSH Key)' : '';
+                        termRef.current.write(`\r\nVerbinde als ${authData.username}@${authData.host} ${method}...\r\n`);
                     }
+                    return true;
+                }
+                return false;
+            };
+
+            const sendCredentials = () => {
+                const authData = {
+                    username: credentials.username,
+                    password: credentials.authMethod === 'password' ? credentials.password : '',
+                    privateKey: credentials.authMethod === 'key' ? credentials.privateKey : '',
+                    host: credentials.host || nodeInfo.ip,
+                };
+                // If WS already open, send now. Otherwise queue and let the
+                // onopen handler flush as soon as the handshake completes.
+                if (!_flushAuth(authData)) {
+                    pendingCredsRef.current = authData;
+                    if (termRef.current) {
+                        termRef.current.write('\r\n\x1b[33mWarte auf WebSocket-Verbindung...\x1b[0m\r\n');
+                    }
+                    setStatus('connecting');
+                    setShowLogin(false);
                 }
             };
 
@@ -170,6 +190,20 @@
                             term.write(`\x1b[33m${t('ipFetchFailed')}: ${e.message}\x1b[0m\r\n`);
                         }
 
+                        // NS May 2026 — show the SSH auth dialog as soon as we
+                        // know (or fail to know) the node IP, NOT when the
+                        // WebSocket sends `need_credentials`. Air-gap deployments
+                        // were hitting silent WS handshake failures (self-signed
+                        // cert on port +2 not yet trusted, or reverse-proxy not
+                        // forwarding the secondary port) — the prior flow gated
+                        // the form on a server message that never arrived, so
+                        // the user just saw a blank terminal with no way to
+                        // enter credentials. Proactive form ⇒ always visible.
+                        setNodeInfo({ node, ip: nodeIp || '', allowManualIp: !nodeIp });
+                        setCredentials(prev => ({ ...prev, host: nodeIp || prev.host || '' }));
+                        setShowLogin(true);
+                        setStatus('login');
+
                         // NS: Mar 2026 - get short-lived WS token instead of exposing session in URL
                         let wsToken = '';
                         try {
@@ -203,6 +237,11 @@
                         ws.onopen = () => {
                             console.log('SSH WebSocket connected');
                             term.write(`${t('wsConnected')}\r\n`);
+                            // NS May 2026 — if the user already submitted creds
+                            // while we were still handshaking, send them now.
+                            if (pendingCredsRef.current) {
+                                _flushAuth(pendingCredsRef.current);
+                            }
                         };
 
                         ws.onmessage = (event) => {
@@ -217,14 +256,18 @@
                                         // console.log('ws msg:', msg);  // very spammy
                                         
                                         if (msg.status === 'need_credentials') {
-                                            setNodeInfo({ 
-                                                node: msg.node, 
+                                            // NS May 2026 — dialog may already be visible (we open
+                                            // it proactively after IP fetch). Refresh metadata but
+                                            // don't trample a host the user has already edited.
+                                            setNodeInfo({
+                                                node: msg.node,
                                                 ip: msg.ip || '',
                                                 allowManualIp: msg.allowManualIp || !msg.ip
                                             });
-                                            // Pre-fill host if we have an IP
                                             if (msg.ip) {
-                                                setCredentials(prev => ({...prev, host: msg.ip}));
+                                                setCredentials(prev => (
+                                                    !prev.host ? { ...prev, host: msg.ip } : prev
+                                                ));
                                             }
                                             setShowLogin(true);
                                             setStatus('login');
@@ -546,6 +589,287 @@
                             </div>
                         </div>
                     )}
+                </div>
+            );
+        }
+
+        // NS May 2026 — Proxmox termproxy terminal (xterm.js native).
+        // Connects directly via PVE's built-in termproxy — no second SSH login.
+        // The PegaProx session is already authorized to act as the cluster
+        // user, so the backend WS proxy fetches a termproxy ticket and does
+        // the `user:ticket\n` handshake on our behalf.
+        //
+        // Wire protocol:
+        //   client → server: raw xterm input as text
+        //                    {type:'resize',cols,rows} as JSON for resize
+        //   server → client: raw TTY bytes (already framed by PVE → server)
+        //                    {status:'connected'|'error', ...} for control
+        function PveTermProxyTerminal({ vm, clusterId, addToast }) {
+            const { t } = useTranslation();
+            const containerRef = useRef(null);
+            const initRef = useRef(false);
+            const [status, setStatus] = useState('loading');
+            const wsRef = useRef(null);
+            const termRef = useRef(null);
+            const { sessionId, reverseProxyEnabled } = useAuth();
+
+            useEffect(() => {
+                if (initRef.current || !containerRef.current) return;
+                initRef.current = true;
+                let term = null, ws = null, fitAddon = null, cleanup = false;
+
+                const _airGap = (() => {
+                    try { return localStorage.getItem('pegaprox-air-gap') === '1'; }
+                    catch (_) { return false; }
+                })();
+
+                const loadXterm = async () => {
+                    if (!document.getElementById('xterm-css')) {
+                        const link = document.createElement('link');
+                        link.id = 'xterm-css'; link.rel = 'stylesheet';
+                        link.href = '/static/css/xterm.min.css';
+                        link.onerror = () => {
+                            if (!_airGap) link.href = 'https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css';
+                        };
+                        document.head.appendChild(link);
+                    }
+                    if (!window.Terminal) {
+                        await new Promise((res, rej) => {
+                            const s = document.createElement('script');
+                            s.src = '/static/js/xterm.min.js';
+                            s.onload = res;
+                            s.onerror = () => {
+                                if (_airGap) { rej(new Error('xterm missing in air-gap mode')); return; }
+                                s.src = 'https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js';
+                                if (SRI_HASHES['xterm@5.3.0']) {
+                                    s.integrity = SRI_HASHES['xterm@5.3.0'];
+                                    s.crossOrigin = 'anonymous';
+                                }
+                                s.onload = res; s.onerror = rej;
+                            };
+                            document.head.appendChild(s);
+                        });
+                    }
+                    if (!window.FitAddon) {
+                        await new Promise((res, rej) => {
+                            const s = document.createElement('script');
+                            s.src = '/static/js/xterm-addon-fit.min.js';
+                            s.onload = res;
+                            s.onerror = () => {
+                                if (_airGap) { rej(new Error('xterm-addon-fit missing in air-gap mode')); return; }
+                                s.src = 'https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js';
+                                if (SRI_HASHES['xterm-addon-fit@0.8.0']) {
+                                    s.integrity = SRI_HASHES['xterm-addon-fit@0.8.0'];
+                                    s.crossOrigin = 'anonymous';
+                                }
+                                s.onload = res; s.onerror = rej;
+                            };
+                            document.head.appendChild(s);
+                        });
+                    }
+                };
+
+                const start = async () => {
+                    try {
+                        await loadXterm();
+                        if (cleanup) return;
+
+                        term = new window.Terminal({
+                            cursorBlink: true,
+                            fontSize: 14,
+                            fontFamily: 'Menlo, Monaco, "Courier New", monospace',
+                            theme: { background: '#1a1a2e', foreground: '#e4e4e7', cursor: '#e4e4e7' },
+                        });
+                        termRef.current = term;
+                        fitAddon = new window.FitAddon.FitAddon();
+                        term.loadAddon(fitAddon);
+                        term.open(containerRef.current);
+                        setTimeout(() => fitAddon && fitAddon.fit(), 50);
+                        term.write(`${t('connectingWs') || 'Connecting'}...\r\n`);
+
+                        // Step 1: get PVE termproxy ticket via main app (server-side login)
+                        let termInfo = null;
+                        try {
+                            const r = await fetch(`${API_URL}/clusters/${clusterId}/vms/${vm.node}/${vm.type}/${vm.vmid}/termproxy`, {
+                                method: 'POST', credentials: 'include',
+                                headers: { 'X-Session-ID': sessionId },
+                            });
+                            if (!r.ok) {
+                                const e = await r.json().catch(() => ({}));
+                                throw new Error(e.error || `HTTP ${r.status}`);
+                            }
+                            termInfo = await r.json();
+                            if (!termInfo.success) throw new Error(termInfo.error || 'termproxy failed');
+                        } catch (e) {
+                            term.write(`\r\n\x1b[31mFailed to get termproxy ticket: ${e.message}\x1b[0m\r\n`);
+                            setStatus('error');
+                            return;
+                        }
+
+                        // Step 2: get short-lived WS token (avoids leaking session in URL)
+                        let wsToken = '';
+                        try {
+                            const r = await fetch(`${API_URL}/ws/token`, {
+                                method: 'POST', credentials: 'include',
+                                headers: { 'X-Session-ID': sessionId }
+                            });
+                            if (r.ok) wsToken = (await r.json()).token;
+                        } catch (_) {}
+
+                        // Step 3: open WS to standalone server (port +2)
+                        // Same server as /shellws — clean `websockets` lib, no flask-sock framing bug.
+                        const wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                        const mainPort = parseInt(window.location.port) || (window.location.protocol === 'https:' ? 443 : 80);
+                        const sshPort = (window.__pegaproxReverseProxy === true) ? mainPort : (mainPort + 2);
+                        const params = new URLSearchParams({
+                            token: wsToken,
+                            ticket: termInfo.ticket,
+                            port: String(termInfo.port),
+                            host: termInfo.host,
+                            user: termInfo.user || '',
+                            auth_ticket: termInfo.auth_ticket || '',
+                        }).toString();
+                        const wsUrl = `${wsProto}//${window.location.hostname}:${sshPort}/api/clusters/${clusterId}/vms/${vm.node}/${vm.type}/${vm.vmid}/termwebsocket?${params}`;
+
+                        ws = new WebSocket(wsUrl);
+                        wsRef.current = ws;
+
+                        ws.onopen = () => { /* server will send 'connected' status JSON */ };
+                        ws.onmessage = (ev) => {
+                            const data = ev.data;
+                            // Try JSON status first
+                            if (typeof data === 'string' && data.length > 0 && data[0] === '{') {
+                                try {
+                                    const msg = JSON.parse(data);
+                                    if (msg.status === 'connected') {
+                                        setStatus('connected');
+                                        term.clear();
+                                        // initial resize
+                                        if (fitAddon && ws.readyState === WebSocket.OPEN) {
+                                            fitAddon.fit();
+                                            ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+                                        }
+                                        return;
+                                    }
+                                    if (msg.status === 'error') {
+                                        term.write(`\r\n\x1b[31m${msg.message || 'Error'}\x1b[0m\r\n`);
+                                        setStatus('error');
+                                        return;
+                                    }
+                                } catch (_) { /* fall through, raw bytes */ }
+                            }
+                            // Raw TTY data → write to xterm
+                            if (typeof data === 'string') term.write(data);
+                            else if (data instanceof ArrayBuffer) term.write(new TextDecoder().decode(data));
+                            else if (data instanceof Blob) data.arrayBuffer().then(b => term.write(new TextDecoder().decode(b)));
+                        };
+                        ws.onerror = (ev) => {
+                            if (cleanup) return;
+                            console.error('[term] ws error:', ev);
+                            term.write('\r\n\x1b[31mWebSocket error\x1b[0m\r\n');
+                            setStatus('error');
+                        };
+                        ws.onclose = (ev) => {
+                            if (cleanup) return;
+                            // NS May 2026 — surface close code so debugging
+                            // a silent close (cert / route / auth) doesn't
+                            // require pulling browser devtools open every time.
+                            const code = ev && ev.code ? ev.code : '?';
+                            const reason = ev && ev.reason ? ` — ${ev.reason}` : '';
+                            term.write(`\r\n\x1b[33mSession ended (code ${code}${reason})\x1b[0m\r\n`);
+                            if (code === 1006) {
+                                term.write('\x1b[90m  → 1006 = abnormal closure. Likely route mismatch, untrusted cert, or backend exception.\x1b[0m\r\n');
+                            }
+                            setStatus('disconnected');
+                        };
+
+                        // Terminal input → PVE termproxy via server
+                        term.onData((d) => {
+                            if (ws.readyState === WebSocket.OPEN) ws.send(d);
+                        });
+                        const handleResize = () => {
+                            if (!fitAddon) return;
+                            fitAddon.fit();
+                            if (ws.readyState === WebSocket.OPEN) {
+                                ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+                            }
+                        };
+                        window.addEventListener('resize', handleResize);
+                    } catch (err) {
+                        console.error('[term] startup error:', err);
+                        setStatus('error');
+                    }
+                };
+                start();
+                return () => {
+                    cleanup = true;
+                    if (ws) try { ws.close(); } catch (_) {}
+                    if (term) try { term.dispose(); } catch (_) {}
+                };
+            }, [vm.vmid, vm.node, vm.type, clusterId]);
+
+            return (
+                <div className="w-full h-full relative">
+                    <div ref={containerRef} className="w-full h-full" />
+                    {status === 'loading' && (
+                        <div className="absolute inset-0 flex items-center justify-center bg-black/80">
+                            <div className="text-center">
+                                <div className="animate-spin w-8 h-8 border-2 border-proxmox-orange border-t-transparent rounded-full mx-auto mb-2"></div>
+                                <span className="text-gray-400">{t('connectingWs') || 'Connecting'}…</span>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        // NS May 2026 — LXC container terminal modal. Uses Proxmox's built-in
+        // termproxy → no second login. Falls through to the same xterm.js the
+        // node shell uses, just over a different transport.
+        function LxcShellModal({ vm, clusterId, onClose, addToast }) {
+            const { t } = useTranslation();
+            const { isCorporate } = useLayout();
+            if (!vm || vm.type !== 'lxc') return null;
+            const title = vm.name ? `${vm.name} (CT ${vm.vmid})` : `CT ${vm.vmid}`;
+            return (
+                <div className={isCorporate ? "corp-vm-modal-overlay" : "fixed inset-0 z-50 flex items-center justify-center p-4 modal-backdrop bg-black/80"}>
+                    <div className={isCorporate
+                        ? "corp-vm-modal"
+                        : "w-full max-w-5xl h-[80vh] bg-proxmox-card border border-proxmox-border rounded-2xl shadow-2xl overflow-hidden flex flex-col"}
+                        style={isCorporate ? {maxWidth: '1280px', width: '100%', height: '82vh', maxHeight: '82vh'} : undefined}>
+                        {isCorporate ? (
+                            <div className="corp-vm-modal-header">
+                                <div className="flex items-center gap-3 min-w-0 flex-1">
+                                    <Icons.Terminal className="w-5 h-5" style={{color: 'var(--corp-accent, #49afd9)'}} />
+                                    <div className="min-w-0">
+                                        <div className="corp-vm-modal-title truncate">{title}</div>
+                                        <div className="corp-vm-modal-meta">{t('lxcTerminal') || 'LXC Container Terminal'} · {vm.node}</div>
+                                    </div>
+                                </div>
+                                <div className="corp-vm-modal-actions">
+                                    <button onClick={onClose} className="corp-vm-btn corp-vm-btn-ghost" title={t('close') || 'Close'}>
+                                        <Icons.X />
+                                    </button>
+                                </div>
+                            </div>
+                        ) : (
+                            <div className="flex items-center justify-between px-4 py-3 border-b border-proxmox-border bg-proxmox-dark">
+                                <div className="flex items-center gap-3">
+                                    <Icons.Terminal />
+                                    <div>
+                                        <h2 className="font-semibold text-white">{title}</h2>
+                                        <p className="text-xs text-gray-400">{t('lxcTerminal') || 'LXC Container Terminal'} · {vm.node}</p>
+                                    </div>
+                                </div>
+                                <button onClick={onClose} className="p-2 rounded-lg hover:bg-red-500/20 text-gray-400 hover:text-red-400">
+                                    <Icons.X />
+                                </button>
+                            </div>
+                        )}
+                        <div className="flex-1 bg-black overflow-hidden" style={{minHeight: 0}}>
+                            <PveTermProxyTerminal vm={vm} clusterId={clusterId} addToast={addToast} />
+                        </div>
+                    </div>
                 </div>
             );
         }
@@ -1129,17 +1453,28 @@
             };
 
             return (
-                <div className="fixed inset-0 z-50 flex items-center justify-center p-4 modal-backdrop bg-black/80">
+                <div className={isCorporate ? "corp-vm-modal-overlay" : "fixed inset-0 z-50 flex items-center justify-center p-4 modal-backdrop bg-black/80"}>
                     <DiskCreateModal />
-                    <div className="w-full max-w-6xl max-h-[90vh] bg-proxmox-card border border-proxmox-border rounded-2xl shadow-2xl animate-scale-in overflow-hidden flex flex-col">
+                    <div
+                        className={isCorporate
+                            ? "corp-vm-modal"
+                            : "w-full max-w-6xl max-h-[90vh] bg-proxmox-card border border-proxmox-border rounded-2xl shadow-2xl animate-scale-in overflow-hidden flex flex-col"}
+                        style={isCorporate ? {maxWidth: '1320px', width: '100%'} : undefined}
+                    >
                         {isCorporate ? (
-                        <div className="corp-modal-header">
-                            <span className="corp-modal-title" style={{display:'flex',alignItems:'center',gap:'8px'}}>
-                                <Icons.Server className="w-4 h-4" style={{color:'#60b515'}} />
-                                {node}
-                                <span style={{fontSize:11,fontWeight:400,color:'#728b9a'}}>Proxmox Node</span>
-                            </span>
-                            <button className="corp-modal-close" onClick={onClose}><Icons.X className="w-4 h-4" /></button>
+                        <div className="corp-vm-modal-header">
+                            <div className="flex items-center gap-3 min-w-0 flex-1">
+                                <Icons.Server className="w-5 h-5" style={{color: isXcpng ? '#f97316' : '#60b515'}} />
+                                <div className="min-w-0">
+                                    <div className="corp-vm-modal-title truncate">{node}</div>
+                                    <div className="corp-vm-modal-meta">{isXcpng ? 'XCP-ng Host' : 'Proxmox Node'}</div>
+                                </div>
+                            </div>
+                            <div className="corp-vm-modal-actions">
+                                <button onClick={onClose} className="corp-vm-btn corp-vm-btn-ghost" title={t('close') || 'Close'}>
+                                    <Icons.X />
+                                </button>
+                            </div>
                         </div>
                         ) : (
                         <div className="flex items-center justify-between px-6 py-4 border-b border-proxmox-border bg-proxmox-dark">
@@ -1152,10 +1487,11 @@
                         )}
 
                         {isCorporate ? (
-                        <div className="corp-tab-strip" style={{paddingLeft: 16}}>
+                        <div className="corp-vm-modal-tabs">
                             {tabs.map(tab => (
-                                <button key={tab.id} onClick={() => setActiveTab(tab.id)} className={activeTab === tab.id ? 'active' : ''}>
-                                    <tab.icon style={{width: 14, height: 14, display: 'inline', marginRight: 6}} />{tab.label}
+                                <button key={tab.id} onClick={() => setActiveTab(tab.id)}
+                                    className={`corp-vm-modal-tab${activeTab === tab.id ? ' active' : ''}`}>
+                                    <tab.icon style={{width: 14, height: 14}} />{tab.label}
                                 </button>
                             ))}
                         </div>
@@ -1170,7 +1506,7 @@
                         </div>
                         )}
 
-                        <div className="flex-1 overflow-y-auto p-6">
+                        <div className={isCorporate ? "corp-vm-modal-body" : "flex-1 overflow-y-auto p-6"}>
                             {loading ? (
                                 <div className="flex items-center justify-center h-64"><div className="animate-spin w-8 h-8 border-2 border-proxmox-orange border-t-transparent rounded-full"></div></div>
                             ) : (
@@ -1415,7 +1751,10 @@
                                                         <div className="absolute top-full left-0 mt-1 bg-proxmox-card border border-proxmox-border rounded-lg shadow-xl z-10 min-w-[160px]">
                                                             {['bridge', 'bond', 'vlan', 'OVSBridge', 'OVSBond', 'OVSIntPort'].map(ifaceType => (
                                                                 <button key={ifaceType} onClick={() => {
-                                                                    setData({...data, showCreateMenu: false, editIface: { type: ifaceType, iface: '', isNew: true }});
+                                                                    // NS May 2026 — autostart:1 mirrors the checkbox default; without
+                                                                    // it the state stayed undefined and the payload was missing the
+                                                                    // field, so PVE silently created the iface with autostart=0.
+                                                                    setData({...data, showCreateMenu: false, editIface: { type: ifaceType, iface: '', isNew: true, autostart: 1 }});
                                                                 }} className="w-full px-4 py-2 text-left text-sm text-gray-300 hover:bg-proxmox-hover hover:text-white">
                                                                     Linux {ifaceType.charAt(0).toUpperCase() + ifaceType.slice(1)}
                                                                 </button>
@@ -2809,8 +3148,12 @@
         // Console Modal Component with noVNC
         // NS: Getting noVNC to work in a React component was... interesting
         // The cleanup logic is important - otherwise you get zombie connections
-        function ConsoleModal({ vm, consoleInfo, clusterId, onClose }) {
+        // NS May 2026 — `hidden` lets multiple consoles stay mounted while only one is
+        // visible (multi-console tabs). When hidden the overlay backdrop is suppressed
+        // via display:none on the wrapper.
+        function ConsoleModal({ vm, consoleInfo, clusterId, onClose, hidden = false, onMinimize = null }) {
             const { t } = useTranslation();
+            const { isCorporate } = useLayout(); // LW: corporate corporate chrome
             const canvasRef = useRef(null);
             const [isFullscreen, setIsFullscreen] = useState(false);
             const [connectionStatus, setConnectionStatus] = useState('connecting');
@@ -2821,9 +3164,34 @@
             const retryCount = useRef(0);
             const maxRetries = 3;
             const { getAuthHeaders, sessionId, reverseProxyEnabled } = useAuth();
+            // NS May 2026 — view-mode toggle. 'vnc' = noVNC graphical (default,
+            // existing behaviour); 'term' = xterm.js via PVE termproxy. Per-modal
+            // state so each open starts on the user's preferred mode.
+            // NS May 2026 — term mode only makes sense for LXC. For QEMU we always
+            // force VNC (PVE's termproxy on qemu is the serial console which most VMs
+            // don't have configured, so it would just show a confusing blank).
+            const isLxc = vm?.type === 'lxc';
+            const [viewMode, setViewMode] = useState(() => {
+                if (!isLxc) return 'vnc';
+                try { return localStorage.getItem('pegaprox-console-view-pref') === 'term' ? 'term' : 'vnc'; }
+                catch (_) { return 'vnc'; }
+            });
+            // if vm.type changes (different tab activated), snap back to vnc on non-LXC
+            useEffect(() => {
+                if (!isLxc && viewMode !== 'vnc') setViewMode('vnc');
+            }, [isLxc]);  // eslint-disable-line react-hooks/exhaustive-deps
+            const setMode = (m) => {
+                if (m === 'term' && !isLxc) return;  // ignore on non-LXC
+                setViewMode(m);
+                try { localStorage.setItem('pegaprox-console-view-pref', m); } catch (_) {}
+            };
 
             useEffect(() => {
                 if(!consoleInfo || !canvasRef.current) return;
+                // NS May 2026 — skip noVNC bootstrap entirely when the user is
+                // viewing the xterm terminal. Switching back ('term' → 'vnc')
+                // re-runs this effect via the [viewMode] dep below.
+                if (viewMode !== 'vnc') return;
 
                 let cancelled = false;
 
@@ -3109,7 +3477,7 @@
                         rfbRef.current = null;
                     }
                 };
-            }, [consoleInfo, clusterId, vm]);
+            }, [consoleInfo, clusterId, vm, viewMode]);
 
             // resize handling - observer for container changes, window event for monitor switches
             useEffect(() => {
@@ -3171,28 +3539,122 @@
                 window.open(url, '_blank');
             };
 
+            // LW May 2026 — corporate chrome for corporate, original for modern.
+            // NS 2026-05-10 — connectionStatus tracks ONLY noVNC. When the user
+            // is on the Term tab, hide the noVNC status entirely (the embedded
+            // terminal shows its own loading state). Earlier code rendered a
+            // stale "Connection Error" in term mode whenever a prior noVNC
+            // attempt had failed or been skipped.
+            const statusColor = viewMode === 'term' ? '#49afd9'
+                : connectionStatus === 'connected' ? '#60b515'
+                : (connectionStatus === 'connecting' || connectionStatus === 'reconnecting') ? '#efc006'
+                : '#f54f47';
+            const statusLabel = viewMode === 'term' ? 'Terminal'
+                : connectionStatus === 'connected' ? 'Connected'
+                : connectionStatus === 'connecting' ? 'Connecting…'
+                : connectionStatus === 'reconnecting' ? 'Reconnecting…'
+                : 'Error';
+
             return (
-                <div className="fixed inset-0 z-50 flex items-center justify-center p-4 modal-backdrop bg-black/80">
-                    <div 
+                <div className={isCorporate ? "corp-vm-modal-overlay" : "fixed inset-0 z-50 flex items-center justify-center p-4 modal-backdrop bg-black/80"}
+                     style={hidden ? {display: 'none'} : undefined}>
+                    <div
                         ref={containerRef}
-                        className={`bg-proxmox-card border border-proxmox-border rounded-2xl shadow-2xl animate-scale-in overflow-hidden flex flex-col ${
-                            isFullscreen ? 'w-full h-full rounded-none' : 'w-full max-w-5xl h-[80vh]'
-                        }`}
+                        className={isCorporate
+                            ? "corp-vm-modal"
+                            : `bg-proxmox-card border border-proxmox-border rounded-2xl shadow-2xl animate-scale-in overflow-hidden flex flex-col ${isFullscreen ? 'w-full h-full rounded-none' : 'w-full max-w-5xl h-[80vh]'}`}
+                        style={isCorporate
+                            ? (isFullscreen
+                                ? {maxWidth: '100vw', width: '100vw', height: '100vh', maxHeight: '100vh'}
+                                : {maxWidth: '1280px', width: '100%', height: '82vh', maxHeight: '82vh'})
+                            : undefined}
                     >
                         {/* Header */}
+                        {isCorporate ? (
+                        <div className="corp-vm-modal-header">
+                            <div className="flex items-center gap-3 min-w-0 flex-1">
+                                <Icons.Monitor className="w-5 h-5" style={{color: 'var(--corp-accent, #49afd9)'}} />
+                                <div className="min-w-0">
+                                    <div className="corp-vm-modal-title truncate">{vm.name || `VM ${vm.vmid}`}</div>
+                                    <div className="corp-vm-modal-meta flex items-center gap-2">
+                                        <span>{vm.type.toUpperCase()} · {vm.node}</span>
+                                        <span style={{display:'inline-flex', alignItems:'center', gap:4}}>
+                                            <span style={{display:'inline-block', width:6, height:6, borderRadius:'50%', background: statusColor}}></span>
+                                            <span style={{color: statusColor}}>{statusLabel}</span>
+                                        </span>
+                                    </div>
+                                </div>
+                            </div>
+                            <div className="corp-vm-modal-actions">
+                                {/* NS May 2026 — VNC ↔ xterm.js toggle (PVE termproxy) — LXC only */}
+                                {isLxc && (
+                                    <div className="flex border border-proxmox-border" style={{borderRadius:0}}>
+                                        <button
+                                            onClick={() => setMode('vnc')}
+                                            className={'px-2.5 py-1 text-[12px] flex items-center gap-1 ' + (viewMode === 'vnc' ? 'bg-blue-500/15 text-blue-400' : 'text-gray-400 hover:text-white')}
+                                            title={t('consoleVnc') || 'VNC graphical console'}
+                                        >
+                                            <Icons.Monitor className="w-3.5 h-3.5" />
+                                            VNC
+                                        </button>
+                                        <button
+                                            onClick={() => setMode('term')}
+                                            className={'px-2.5 py-1 text-[12px] flex items-center gap-1 ' + (viewMode === 'term' ? 'bg-emerald-500/15 text-emerald-400' : 'text-gray-400 hover:text-white')}
+                                            title={t('consolePct') || 'xterm terminal (PVE termproxy)'}
+                                        >
+                                            <Icons.Terminal className="w-3.5 h-3.5" />
+                                            Term
+                                        </button>
+                                    </div>
+                                )}
+                                {viewMode === 'vnc' && vm.type === 'qemu' && connectionStatus === 'connected' && (
+                                    <button onClick={handleCtrlAltDel} className="corp-vm-btn corp-vm-btn-ghost">
+                                        Ctrl+Alt+Del
+                                    </button>
+                                )}
+                                {viewMode === 'vnc' && connectionStatus === 'connected' && (
+                                    <button
+                                        onClick={() => {
+                                            const conn = rfbRef.current;
+                                            if (!conn) return;
+                                            const text = prompt('Paste text:');
+                                            if (text) typeTextToVM(conn, text);
+                                        }}
+                                        className="corp-vm-btn corp-vm-btn-ghost flex items-center gap-1"
+                                        title={t('pasteClipboard') || 'Paste from clipboard'}
+                                    >
+                                        <Icons.ClipboardList className="w-3.5 h-3.5" />
+                                        Paste
+                                    </button>
+                                )}
+                                <button onClick={openInProxmox} className="corp-vm-btn corp-vm-btn-ghost">
+                                    External
+                                </button>
+                                <button onClick={handleFullscreen} className="corp-vm-btn corp-vm-btn-ghost"
+                                    title={isFullscreen ? (t('exitFullscreen') || 'Exit fullscreen') : (t('fullscreen') || 'Fullscreen')}>
+                                    {isFullscreen ? <Icons.Minimize /> : <Icons.Maximize />}
+                                </button>
+                                <button onClick={onClose} className="corp-vm-btn corp-vm-btn-ghost" title={t('close') || 'Close'}>
+                                    <Icons.X />
+                                </button>
+                            </div>
+                        </div>
+                        ) : (
                         <div className="flex items-center justify-between px-4 py-3 border-b border-proxmox-border bg-proxmox-dark">
                             <div className="flex items-center gap-3">
                                 <Icons.Monitor />
                                 <div>
                                     <h2 className="font-semibold text-white">{vm.name || `VM ${vm.vmid}`}</h2>
                                     <p className="text-xs text-gray-400">
-                                        {vm.type.toUpperCase()} · {vm.node} · 
-                                        <span className={`ml-1 ${
+                                        {vm.type.toUpperCase()} · {vm.node} ·
+                                        <span className={'ml-1 ' + (
+                                            viewMode === 'term' ? 'text-blue-400' :
                                             connectionStatus === 'connected' ? 'text-green-400' :
                                             (connectionStatus === 'connecting' || connectionStatus === 'reconnecting') ? 'text-yellow-400' :
                                             'text-red-400'
-                                        }`}>
-                                            {connectionStatus === 'connected' ? 'Connected' :
+                                        )}>
+                                            {viewMode === 'term' ? 'Terminal' :
+                                             connectionStatus === 'connected' ? 'Connected' :
                                              connectionStatus === 'connecting' ? 'Connecting...' :
                                              connectionStatus === 'reconnecting' ? 'Reconnecting...' :
                                              'Error'}
@@ -3201,8 +3663,25 @@
                                 </div>
                             </div>
                             <div className="flex items-center gap-2">
-
-                                {vm.type === 'qemu' && connectionStatus === 'connected' && (
+                                {isLxc && (
+                                    <div className="flex border border-proxmox-border rounded-lg overflow-hidden">
+                                        <button
+                                            onClick={() => setMode('vnc')}
+                                            className={'px-3 py-1.5 text-xs flex items-center gap-1 ' + (viewMode === 'vnc' ? 'bg-blue-500/20 text-blue-400' : 'bg-proxmox-dark text-gray-400 hover:text-white')}
+                                            title="VNC console"
+                                        >
+                                            <Icons.Monitor className="w-3.5 h-3.5" />VNC
+                                        </button>
+                                        <button
+                                            onClick={() => setMode('term')}
+                                            className={'px-3 py-1.5 text-xs flex items-center gap-1 ' + (viewMode === 'term' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-proxmox-dark text-gray-400 hover:text-white')}
+                                            title="xterm terminal"
+                                        >
+                                            <Icons.Terminal className="w-3.5 h-3.5" />Term
+                                        </button>
+                                    </div>
+                                )}
+                                {viewMode === 'vnc' && vm.type === 'qemu' && connectionStatus === 'connected' && (
                                     <button
                                         onClick={handleCtrlAltDel}
                                         className="px-3 py-1.5 bg-proxmox-dark border border-proxmox-border rounded-lg text-xs text-gray-300 hover:text-white hover:border-proxmox-orange transition-colors"
@@ -3210,7 +3689,7 @@
                                         Ctrl+Alt+Del
                                     </button>
                                 )}
-                                {connectionStatus === 'connected' && (
+                                {viewMode === 'vnc' && connectionStatus === 'connected' && (
                                     <button
                                         onClick={() => {
                                             const conn = rfbRef.current;
@@ -3244,10 +3723,22 @@
                                 </button>
                             </div>
                         </div>
+                        )}
 
                         {/* Console Area */}
-                        <div className="flex-1 bg-black relative overflow-hidden">
-                            {(connectionStatus === 'connecting' || connectionStatus === 'reconnecting') && (
+                        <div className="flex-1 bg-black relative overflow-hidden" style={{minHeight: 0}}>
+                            {/* NS May 2026 — xterm terminal mode (PVE termproxy).
+                                The PveTermProxyTerminal component is fully self-contained:
+                                fetches its own ticket, opens its own WS, renders xterm. */}
+                            {viewMode === 'term' && (
+                                <PveTermProxyTerminal
+                                    key={`term-${vm.vmid}`}
+                                    vm={vm}
+                                    clusterId={clusterId}
+                                    addToast={(_m) => {}}
+                                />
+                            )}
+                            {viewMode === 'vnc' && (connectionStatus === 'connecting' || connectionStatus === 'reconnecting') && (
                                 <div className="absolute inset-0 flex items-center justify-center bg-proxmox-darker">
                                     <div className="text-center">
                                         <div className="animate-spin w-8 h-8 border-2 border-proxmox-orange border-t-transparent rounded-full mx-auto mb-4"></div>
@@ -3255,7 +3746,7 @@
                                     </div>
                                 </div>
                             )}
-                            {(connectionStatus === 'error' || connectionStatus === 'load_error' || connectionStatus === 'auth_failed') && (
+                            {viewMode === 'vnc' && (connectionStatus === 'error' || connectionStatus === 'load_error' || connectionStatus === 'auth_failed') && (
                                 <div className="absolute inset-0 flex items-center justify-center bg-proxmox-darker">
                                     <div className="text-center max-w-md p-6">
                                         <div className="text-red-400 text-xl mb-4">⚠️ {t('connectionError')}</div>
@@ -3299,7 +3790,10 @@
                                     </div>
                                 </div>
                             )}
-                            <div ref={canvasRef} className="w-full h-full" />
+                            {/* noVNC canvas — kept mounted but hidden when in term mode so
+                                a quick switch back doesn't trigger a full re-init. */}
+                            <div ref={canvasRef} className="w-full h-full"
+                                style={{display: viewMode === 'vnc' ? 'block' : 'none'}} />
                         </div>
                     </div>
                 </div>
@@ -3806,7 +4300,7 @@
                                                                 {data.showCreateMenu && (
                                                                     <div className="absolute top-full right-0 mt-1 z-10 min-w-[160px]" style={{background: 'var(--corp-header-bg)', border: '1px solid var(--corp-border-medium)'}}>
                                                                         {['bridge', 'bond', 'vlan', 'OVSBridge', 'OVSBond', 'OVSIntPort'].map(ifType => (
-                                                                            <button key={ifType} onClick={() => setData(prev => ({...prev, showCreateMenu: false, editIface: { type: ifType, iface: '', isNew: true }}))}
+                                                                            <button key={ifType} onClick={() => setData(prev => ({...prev, showCreateMenu: false, editIface: { type: ifType, iface: '', isNew: true, autostart: 1 }}))}
                                                                                 className="w-full px-3 py-1.5 text-left text-[12px] hover:bg-[#324f61]" style={{color: 'var(--corp-text-secondary)'}}>
                                                                                 Linux {ifType.charAt(0).toUpperCase() + ifType.slice(1)}
                                                                             </button>

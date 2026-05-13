@@ -131,11 +131,19 @@ def broadcast_resources_loop():
             def broadcast_for_cluster(cid, mgr):
                 """Broadcast updates for a single cluster - runs in own thread"""
                 try:
+                    # NS May 2026 — when a cluster's API calls have been timing out,
+                    # back off so we don't spawn 1 thread per second waiting on the
+                    # same dead TCP connection. Cooldown is per-mgr.
+                    now = time.time()
+                    cooldown_until = getattr(mgr, '_sse_cooldown_until', 0)
+                    if now < cooldown_until:
+                        # still in cooldown — don't poke, but tell client we're alive
+                        broadcast_sse('tasks', [], cid)
+                        return
                     # NS: Feb 2026 - AUTO-RECONNECT disconnected clusters
                     # Without this, a network reload (ifreload) permanently kills the connection
                     # until PegaProx is restarted. Now we retry every 10 seconds.
                     if not mgr.is_connected:
-                        now = time.time()
                         if now - mgr._last_reconnect_attempt >= 10:
                             mgr._last_reconnect_attempt = now
                             logging.info(f"[SSE] Cluster '{cid}' is disconnected, attempting reconnect...")
@@ -162,7 +170,16 @@ def broadcast_resources_loop():
                             return
                     
                     # Get tasks every loop - but only broadcast if changed
-                    tasks = mgr.get_tasks(limit=50)
+                    # NS May 2026 — wrap in try/except so a single hung call
+                    # doesn't kill the whole broadcast for this cluster.
+                    try:
+                        tasks = mgr.get_tasks(limit=50)
+                    except Exception as e:
+                        logging.debug(f"[SSE] {cid} get_tasks failed: {e}")
+                        # cooldown so we don't hammer a hung host
+                        mgr._sse_cooldown_until = time.time() + 15
+                        broadcast_sse('tasks', [], cid)
+                        return
                     task_list = tasks or []
 
                     # NS: Apr 2026 - Inject recent portal/audit actions as virtual tasks
@@ -186,8 +203,10 @@ def broadcast_resources_loop():
                         metrics = mgr.get_node_status()
                         if metrics:
                             broadcast_sse('metrics', metrics, cid)
-                    except:
-                        pass
+                    except Exception as e:
+                        # NS May 2026 — surface this in debug; cooldown if frequent
+                        logging.debug(f"[SSE] {cid} get_node_status failed: {e}")
+                        mgr._sse_cooldown_until = time.time() + 15
                     
                     # NS: Resources every loop now (was every 2nd loop)
                     # This makes VM status update much faster in the UI
@@ -306,10 +325,19 @@ def broadcast_resources_loop():
                         logging.debug(f"[SSE] VMware detail broadcast error: {e}")
                 threading.Thread(target=_vmware_detail_push, daemon=True).start()
             
+            # NS May 2026 — periodic heartbeat. Lets the frontend distinguish
+            # "server still ticking, just no data" from "server dead". Frontend
+            # watchdog force-reconnects if no message for >30s.
+            if loop_count % 5 == 0:
+                try:
+                    broadcast_sse('heartbeat', {'ts': time.time(), 'loop': loop_count})
+                except Exception:
+                    pass
+
             # NS: Reduced to 1 second for faster task updates
             # Proxmox API can handle this - it's just GET requests
             time.sleep(1)
-                    
+
         except Exception as e:
             logging.error(f"Broadcast loop error: {e}")
             time.sleep(5)

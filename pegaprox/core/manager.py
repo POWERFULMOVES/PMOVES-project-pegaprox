@@ -439,6 +439,15 @@ class PegaProxManager:
         return self.current_host or self.config.host
 
     @property
+    def api_port(self) -> int:
+        """Proxmox API port — defaults to 8006 but overridable per-cluster.
+        MK May 2026 — added so deployments with non-standard PVE listen ports
+        (firewall constraints, jumpbox setups) can use PegaProx without
+        forcing a reverse-proxy in front of PVE (which would terminate TLS
+        and create a MitM-able intermediate hop)."""
+        return getattr(self.config, 'api_port', 8006)
+
+    @property
     def nodes(self) -> dict:
         """Return cached node status dict (node_name -> info). Lazy-populated with 30s TTL."""
         now = time.time()
@@ -447,7 +456,7 @@ class PegaProxManager:
         if not self.is_connected or not self.session:
             return self._cached_node_dict or {}
         try:
-            url = f"https://{self.host}:8006/api2/json/nodes"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes"
             resp = self._api_get(url)
             if resp.status_code == 200:
                 self._cached_node_dict = {n['node']: n for n in resp.json().get('data', [])}
@@ -463,8 +472,41 @@ class PegaProxManager:
     
     # LW: All API methods go through these wrappers for consistent error handling
     # MK: Jan 2026 - Fixed timeout handling, was marking cluster offline too eagerly
+    # NS May 2026 — instrumented for the API latency dashboard. Cheap (deque, monotonic).
+    def _record_api_sample(self, method, url, duration_ms, status):
+        try:
+            from collections import deque
+            from urllib.parse import urlparse
+            if not hasattr(self, '_api_latency') or self._api_latency is None:
+                self._api_latency = deque(maxlen=500)
+            # template the path: /api2/json/nodes/foo/qemu/100/status → /nodes/{node}/qemu/{id}/status
+            try:
+                p = urlparse(url)
+                segs = [s for s in p.path.split('/') if s and s not in ('api2', 'json')]
+                # crude templating: digits → {id}, second seg after type → {name}
+                tpl = []
+                for i, s in enumerate(segs):
+                    if s.isdigit():
+                        tpl.append('{id}')
+                    elif i > 0 and segs[i - 1] in ('nodes', 'storage', 'pools', 'sdn'):
+                        tpl.append('{name}')
+                    else:
+                        tpl.append(s)
+                ep = '/' + '/'.join(tpl) if tpl else p.path[:60]
+            except Exception:
+                ep = url[:60]
+            self._api_latency.append({
+                'method': method, 'endpoint': ep,
+                'duration_ms': float(duration_ms),
+                'status': int(status) if status else 0,
+                'ts': time.time(),
+            })
+        except Exception:
+            pass  # never let metrics break the request
+
     def _api_get(self, url, **kwargs):
         kwargs.setdefault('timeout', self.api_timeout)
+        t0 = time.monotonic()
         try:
             session = self._create_session()
             response = session.get(url, **kwargs)
@@ -473,10 +515,12 @@ class PegaProxManager:
             self.last_successful_request = datetime.now()
             self.connection_error = None
             self._consecutive_failures = 0  # reset failure counter on success
+            self._record_api_sample('GET', url, (time.monotonic() - t0) * 1000.0, response.status_code)
             return response
         except requests.exceptions.Timeout as e:
             # MK: Timeout != offline. Proxmox might just be slow (happens a lot with ZFS)
             self.connection_error = f"Request timed out: {e}"
+            self._record_api_sample('GET', url, (time.monotonic() - t0) * 1000.0, 0)
             raise
         except requests.exceptions.ConnectionError as e:
             # LW: Only mark disconnected after 3 consecutive failures to avoid flapping
@@ -484,10 +528,12 @@ class PegaProxManager:
             if self._consecutive_failures >= 3:
                 self.is_connected = False
                 self.connection_error = str(e)
+            self._record_api_sample('GET', url, (time.monotonic() - t0) * 1000.0, 0)
             raise
     
     def _api_post(self, url, **kwargs):
         kwargs.setdefault('timeout', self.api_timeout)
+        t0 = time.monotonic()
         try:
             sess = self._create_session()
             resp = sess.post(url, **kwargs)
@@ -496,20 +542,24 @@ class PegaProxManager:
             self.connection_error = None
             self._consecutive_failures = 0
             self._auto_capture_upid(resp)  # MK May 2026 — bind PVE task to PegaProx user
+            self._record_api_sample('POST', url, (time.monotonic() - t0) * 1000.0, resp.status_code)
             return resp
         except requests.exceptions.Timeout as e:
             # MK: Timeout does NOT mean cluster is offline
             self.connection_error = f"Request timed out: {e}"
+            self._record_api_sample('POST', url, (time.monotonic() - t0) * 1000.0, 0)
             raise
         except requests.exceptions.ConnectionError as e:
             self._consecutive_failures += 1
             if self._consecutive_failures >= 3:
                 self.is_connected = False
                 self.connection_error = str(e)
+            self._record_api_sample('POST', url, (time.monotonic() - t0) * 1000.0, 0)
             raise
     
     def _api_put(self, url, **kwargs):
         kwargs.setdefault('timeout', self.api_timeout)
+        t0 = time.monotonic()
         try:
             session = self._create_session()
             response = session.put(url, **kwargs)
@@ -518,11 +568,13 @@ class PegaProxManager:
             self.connection_error = None
             self._consecutive_failures = 0
             self._auto_capture_upid(response)
+            self._record_api_sample('PUT', url, (time.monotonic() - t0) * 1000.0, response.status_code)
             return response
         except requests.exceptions.Timeout as e:
             # MK: Timeout does NOT mean cluster is offline - operation might have succeeded
             self.connection_error = f"Request timed out: {e}"
             self.logger.warning(f"[WARN] API PUT timeout (not marking offline): {e}")
+            self._record_api_sample('PUT', url, (time.monotonic() - t0) * 1000.0, 0)
             raise
         except requests.exceptions.ConnectionError as e:
             # Real connection error - only mark offline after multiple failures
@@ -530,11 +582,13 @@ class PegaProxManager:
             if self._consecutive_failures >= 3:
                 self.is_connected = False
                 self.connection_error = str(e)
+            self._record_api_sample('PUT', url, (time.monotonic() - t0) * 1000.0, 0)
             raise
     
     def _api_delete(self, url, **kwargs):
         # same as put but delete
         kwargs.setdefault('timeout', self.api_timeout)
+        t0 = time.monotonic()
         try:
             session = self._create_session()
             r = session.delete(url, **kwargs)
@@ -543,11 +597,13 @@ class PegaProxManager:
             self.connection_error = None
             self._consecutive_failures = 0
             self._auto_capture_upid(r)
+            self._record_api_sample('DELETE', url, (time.monotonic() - t0) * 1000.0, r.status_code)
             return r
         except requests.exceptions.Timeout as e:
             # MK: Timeout does NOT mean cluster is offline
             self.connection_error = f"Request timed out: {e}"
             self.logger.warning(f"[WARN] API DELETE timeout (not marking offline): {e}")
+            self._record_api_sample('DELETE', url, (time.monotonic() - t0) * 1000.0, 0)
             raise
         except requests.exceptions.ConnectionError as e:
             # Real connection error - only mark offline after multiple failures
@@ -555,6 +611,7 @@ class PegaProxManager:
             if self._consecutive_failures >= 3:
                 self.is_connected = False
                 self.connection_error = str(e)
+            self._record_api_sample('DELETE', url, (time.monotonic() - t0) * 1000.0, 0)
             raise
 
     def _auto_capture_upid(self, response):
@@ -593,7 +650,7 @@ class PegaProxManager:
 
     def api_request(self, method: str, endpoint: str, data: dict = None):
         """generic api request wrapper - NS Jan 2026"""
-        url = f'https://{self.host}:8006/api2/json{endpoint}'
+        url = f'https://{self.host}:{self.api_port}/api2/json{endpoint}'
         
         try:
             if method.upper() == 'GET':
@@ -669,7 +726,7 @@ class PegaProxManager:
                         self._csrf_token = None
 
                         # Test the token by making a simple API call
-                        test_url = f"https://{self._bracket_ipv6(host)}:8006/api2/json/version"
+                        test_url = f"https://{self._bracket_ipv6(host)}:{self.api_port}/api2/json/version"
                         headers = {'Authorization': f'PVEAPIToken={self._api_token}'}
                         resp = session.get(test_url, headers=headers, timeout=10)
 
@@ -717,7 +774,7 @@ class PegaProxManager:
                         }
                         # print(f"DEBUG: trying {host}")  # dont commit this
 
-                        login_url = f"https://{self._bracket_ipv6(host)}:8006/api2/json/access/ticket"
+                        login_url = f"https://{self._bracket_ipv6(host)}:{self.api_port}/api2/json/access/ticket"
                         resp = session.post(login_url, data=login_data, timeout=10)
 
                         if resp.status_code == 200:
@@ -793,7 +850,7 @@ class PegaProxManager:
         # find other nodes in cluster
         try:
             h = self.host
-            url = f"https://{h}:8006/api2/json/nodes"
+            url = f"https://{h}:{self.api_port}/api2/json/nodes"
             r = self._create_session().get(url, timeout=10)
             
             if r.status_code != 200:
@@ -829,7 +886,7 @@ class PegaProxManager:
             import random, string
             suffix = ''.join(random.choices(string.digits, k=6))
             token_id = f'pegaprox_{suffix}'
-            url = f"https://{host}:8006/api2/json/access/users/{user}/token/{token_id}"
+            url = f"https://{host}:{self.api_port}/api2/json/access/users/{user}/token/{token_id}"
             # NS: need to set ticket cookie on login session, it only has it in the response not as a cookie
             session.cookies.set('PVEAuthCookie', self._ticket)
             headers = {'CSRFPreventionToken': self._csrf_token}
@@ -873,7 +930,7 @@ class PegaProxManager:
 
     def _get_api_url(self, path: str) -> str:
         host = self.host
-        return f"https://{host}:8006/api2/json{path}"
+        return f"https://{host}:{self.api_port}/api2/json{path}"
     
     def get_node_status(self) -> Dict[str, Any]:
         # gets node status, calculates load score
@@ -904,7 +961,7 @@ class PegaProxManager:
         
         try:
             host = self.host
-            url = f"https://{host}:8006/api2/json/nodes"
+            url = f"https://{host}:{self.api_port}/api2/json/nodes"
             response = self._api_get(url)
             
             if response.status_code == 200:
@@ -914,7 +971,7 @@ class PegaProxManager:
                 # MK: /nodes/{node}/status doesn't have netin/netout, only /cluster/resources does
                 net_by_node = {}
                 try:
-                    res_url = f"https://{host}:8006/api2/json/cluster/resources?type=node"
+                    res_url = f"https://{host}:{self.api_port}/api2/json/cluster/resources?type=node"
                     res_r = self._create_session().get(res_url, timeout=10)
                     if res_r.status_code == 200:
                         for nr in res_r.json().get('data', []):
@@ -931,7 +988,7 @@ class PegaProxManager:
                 def fetch_node_details(node):
                     node_name = node['node']
                     try:
-                        status_url = f"https://{host}:8006/api2/json/nodes/{node_name}/status"
+                        status_url = f"https://{host}:{self.api_port}/api2/json/nodes/{node_name}/status"
                         status_response = self._create_session().get(status_url, timeout=10)
                         if status_response.status_code == 200:
                             return (node_name, node, status_response.json()['data'])
@@ -1140,7 +1197,7 @@ class PegaProxManager:
         if not self.is_connected or not self.session: return []
         
         try:
-            url = f"https://{self.host}:8006/api2/json/cluster/resources"
+            url = f"https://{self.host}:{self.api_port}/api2/json/cluster/resources"
             resp = self._create_session().get(url, params={'type': 'vm'}, timeout=10)
             
             if resp.status_code != 200: return []
@@ -1192,7 +1249,7 @@ class PegaProxManager:
     def get_vm_resources_v1(self) -> list:
         if not self.is_connected: return []
         try:
-            url = f"https://{self.host}:8006/api2/json/cluster/resources"
+            url = f"https://{self.host}:{self.api_port}/api2/json/cluster/resources"
             r = self._create_session().get(url, params={'type': 'vm'}, timeout=10)
             return r.json().get('data', []) if r.status_code == 200 else []
         except:
@@ -1206,7 +1263,7 @@ class PegaProxManager:
         if vmid in self._no_agent_vms:
             return []
         try:
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/qemu/{vmid}/agent/network-get-interfaces"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/agent/network-get-interfaces"
             resp = self._create_session().get(url, timeout=8)
             if resp.status_code == 500:
                 # agent socket not available — remember this VM
@@ -1241,7 +1298,7 @@ class PegaProxManager:
         """
         try:
             # method 1: /interfaces — preferred, returns all IPs
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/lxc/{vmid}/interfaces"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/interfaces"
             resp = self._create_session().get(url, timeout=8)
             if resp.status_code == 200:
                 interfaces = resp.json().get('data', [])
@@ -1263,7 +1320,7 @@ class PegaProxManager:
                     return ipv4s + ipv6s
 
             # method 2: /config — extract static IPs from net0..net9
-            cfg_url = f"https://{self.host}:8006/api2/json/nodes/{node}/lxc/{vmid}/config"
+            cfg_url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/config"
             cfg_resp = self._create_session().get(cfg_url, timeout=5)
             if cfg_resp.status_code == 200:
                 cfg = cfg_resp.json().get('data', {})
@@ -1508,7 +1565,7 @@ class PegaProxManager:
 
         # get VM config to check cpu type
         try:
-            cfg_url = f"https://{self.host}:8006/api2/json/nodes/{source_node}/qemu/{vmid}/config"
+            cfg_url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{source_node}/qemu/{vmid}/config"
             r = self._create_session().get(cfg_url, timeout=8)
             if r.status_code != 200:
                 return {'compatible': True, 'reason': 'config_unavailable'}
@@ -1589,7 +1646,7 @@ class PegaProxManager:
             vmid = vm.get('vmid')
             src = vm.get('node')
             try:
-                cfg_url = f"https://{self.host}:8006/api2/json/nodes/{src}/qemu/{vmid}/config"
+                cfg_url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{src}/qemu/{vmid}/config"
                 r = self._create_session().get(cfg_url, timeout=5)
                 raw_cpu = r.json().get('data', {}).get('cpu', 'kvm64') if r.status_code == 200 else 'unknown'
                 cpu_type = raw_cpu.split(',')[0].replace('cputype=', '')
@@ -1802,7 +1859,7 @@ class PegaProxManager:
         target_storage_names = set()
         if balance_local_disks:
             try:
-                st_url = f"https://{self.host}:8006/api2/json/nodes/{target_node}/storage"
+                st_url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{target_node}/storage"
                 st_r = self._create_session().get(st_url, timeout=10)
                 if st_r.status_code == 200:
                     target_storage_names = {s['storage'] for s in st_r.json().get('data', []) if s.get('active')}
@@ -1951,9 +2008,9 @@ class PegaProxManager:
         """Get the primary storage name of a VM/CT (e.g. 'local-lvm')."""
         try:
             if vm_type == 'lxc':
-                url = f"https://{self.host}:8006/api2/json/nodes/{node}/lxc/{vmid}/config"
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/config"
             else:
-                url = f"https://{self.host}:8006/api2/json/nodes/{node}/qemu/{vmid}/config"
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/config"
             r = self._create_session().get(url, timeout=10)
             if r.status_code == 200:
                 cfg = r.json().get('data', {})
@@ -1977,7 +2034,7 @@ class PegaProxManager:
         result = {}
         try:
             ep = 'lxc' if vm_type == 'lxc' else 'qemu'
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/{ep}/{vmid}/config"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/{ep}/{vmid}/config"
             r = self._create_session().get(url, timeout=10)
             if r.status_code != 200:
                 return result
@@ -2090,7 +2147,7 @@ class PegaProxManager:
             
             # unmount iso first or migration fails (found this out the hard way)
             if vm_type == 'qemu':
-                config_url = f"https://{self.host}:8006/api2/json/nodes/{source_node}/qemu/{vmid}/config"
+                config_url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{source_node}/qemu/{vmid}/config"
                 config_response = self._create_session().get(config_url, timeout=15)
                 if config_response.status_code == 200:
                     config = config_response.json().get('data', {})
@@ -2103,9 +2160,9 @@ class PegaProxManager:
                                 self.logger.warning(f"couldnt unmount iso: {unmount_response.text}")
             
             if vm_type == 'qemu':
-                url = f"https://{self.host}:8006/api2/json/nodes/{source_node}/qemu/{vmid}/migrate"
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{source_node}/qemu/{vmid}/migrate"
             else:
-                url = f"https://{self.host}:8006/api2/json/nodes/{source_node}/lxc/{vmid}/migrate"
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{source_node}/lxc/{vmid}/migrate"
             
             has_local_disks = vm.get('_has_local_disks', False)
 
@@ -2247,7 +2304,7 @@ class PegaProxManager:
         
         while time.time() - start_time < timeout:
             try:
-                url = f"https://{self.host}:8006/api2/json/nodes/{node}/tasks/{task_id}/status"
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/tasks/{task_id}/status"
                 response = self._api_get(url)
                 
                 if response.status_code == 200:
@@ -2450,7 +2507,7 @@ class PegaProxManager:
 
             # also check /nodes status
             host = self.host
-            resp = self._api_get(f"https://{host}:8006/api2/json/nodes")
+            resp = self._api_get(f"https://{host}:{self.api_port}/api2/json/nodes")
             if resp and resp.status_code == 200:
                 for node in resp.json().get('data', []):
                     if node.get('status') == 'maintenance':
@@ -2488,7 +2545,7 @@ class PegaProxManager:
         # We check both because single-node clusters only have manager_status
         try:
             host = self.host
-            resp = self._api_get(f"https://{host}:8006/api2/json/cluster/ha/status/current")
+            resp = self._api_get(f"https://{host}:{self.api_port}/api2/json/cluster/ha/status/current")
             if resp.status_code != 200:
                 self.logger.debug(f"[MAINT] HA status endpoint returned {resp.status_code}")
                 return set()
@@ -2692,16 +2749,44 @@ class PegaProxManager:
             return -1
 
     def exit_maintenance_mode(self, node_name):
-        native = False
+        # NS May 2026 — clear native HA flag *before* clearing the internal state.
+        # Old order: del state -> ssh call. If ssh failed (e.g. node still booting
+        # ha-services), PVE stayed in maintenance with no PegaProx-side trace.
         with self.maintenance_lock:
             if node_name not in self.nodes_in_maintenance:
                 return False
             native = self.nodes_in_maintenance[node_name].native_ha
-            del self.nodes_in_maintenance[node_name]
-            self.logger.info(f"[OK] Exited maintenance mode for {node_name}")
 
         if native:
-            self._try_disable_native_ha_maintenance(node_name)
+            ok = False
+            # Retry up to 3 times (10s, 20s, 40s) — gives HA services time to
+            # come up after a node reboot. The actual ssh helper already tries
+            # multiple cluster IPs, so each iteration is a real "try harder".
+            for delay in (0, 10, 20):
+                if delay:
+                    time.sleep(delay)
+                try:
+                    ok = self._try_disable_native_ha_maintenance(node_name)
+                    if ok:
+                        break
+                except Exception as e:
+                    self.logger.warning(f"[MAINT] exit retry for {node_name}: {e}")
+            if not ok:
+                self.logger.error(
+                    f"[MAINT] could not disable native HA maintenance on {node_name} "
+                    f"after 3 retries — PVE may still report it as in maintenance. "
+                    f"Run `ha-manager crm-command node-maintenance disable {node_name}` manually."
+                )
+                # Leave the in-memory state intact so the UI shows the stuck
+                # maintenance and the user can retry. Returning False signals
+                # the caller (rolling-update etc.) that something needs review.
+                return False
+
+        # only now drop the local state — we either disabled HA upstream or
+        # never had native_ha set in the first place
+        with self.maintenance_lock:
+            self.nodes_in_maintenance.pop(node_name, None)
+        self.logger.info(f"[OK] Exited maintenance mode for {node_name}")
 
         # unset ceph flags after maintenance (#141)
         self._unset_ceph_maintenance_flags(node_name)
@@ -2752,15 +2837,17 @@ class PegaProxManager:
 
                 if ok:
                     self.logger.info(f"[MAINT] disabled native HA maintenance for {node_name} (via {ip})")
-                    return
+                    return True
                 else:
                     self.logger.debug(f"[MAINT] SSH to {ip} failed for HA disable, trying next...")
 
             # MK: if all SSH attempts fail the user needs to do it manually
             self.logger.error(f"[MAINT] couldn't disable HA maintenance for {node_name} via any node")
             self.logger.error(f"[MAINT] manual fix: sudo ha-manager crm-command node-maintenance disable {node_name}")
+            return False
         except Exception as e:
             self.logger.error(f"[MAINT] disable HA maint error {node_name}: {e}")
+            return False
     
     def get_maintenance_status(self, node_name: str) -> Optional[Dict]:
         with self.maintenance_lock:
@@ -2785,7 +2872,7 @@ class PegaProxManager:
         
         try:
             h = self.host
-            url = f"https://{h}:8006/api2/json/nodes"
+            url = f"https://{h}:{self.api_port}/api2/json/nodes"
             r = self._create_session().get(url, timeout=10)
             
             if r.status_code != 200:
@@ -2825,7 +2912,7 @@ class PegaProxManager:
         # update fallback hosts periodically
         try:
             host = self.host
-            url = f"https://{host}:8006/api2/json/nodes"
+            url = f"https://{host}:{self.api_port}/api2/json/nodes"
             response = self._create_session().get(url, timeout=10)
             
             if response.status_code != 200:
@@ -2864,7 +2951,7 @@ class PegaProxManager:
         try:
             if self.is_connected or self.connect_to_proxmox():
                 host = self.host
-                url = f"https://{host}:8006/api2/json/nodes"
+                url = f"https://{host}:{self.api_port}/api2/json/nodes"
                 resp = self._create_session().get(url, timeout=10)
                 if resp.status_code == 200:
                     nodes = resp.json().get('data', [])
@@ -2989,7 +3076,7 @@ class PegaProxManager:
         try:
             # Use current connected host
             host = self.host
-            url = f"https://{host}:8006/api2/json/nodes"
+            url = f"https://{host}:{self.api_port}/api2/json/nodes"
             resp = self._create_session().get(url, timeout=10)
             
             if resp.status_code != 200:
@@ -3380,9 +3467,9 @@ class PegaProxManager:
             
             # Get VM config
             if vm_type == 'qemu':
-                url = f"https://{host}:8006/api2/json/nodes/{node}/qemu/{vmid}/config"
+                url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/config"
             else:
-                url = f"https://{host}:8006/api2/json/nodes/{node}/lxc/{vmid}/config"
+                url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/config"
             
             response = self._create_session().get(url, timeout=10)
             
@@ -3392,7 +3479,7 @@ class PegaProxManager:
             config = response.json().get('data', {})
             
             # Get storage configurations
-            storage_url = f"https://{host}:8006/api2/json/storage"
+            storage_url = f"https://{host}:{self.api_port}/api2/json/storage"
             storage_response = self._create_session().get(storage_url, timeout=10)
             storage_configs = {}
             if storage_response.status_code == 200:
@@ -3582,7 +3669,7 @@ class PegaProxManager:
                     return []
             
             h = self.host
-            url = f"https://{h}:8006/api2/json/cluster/resources"
+            url = f"https://{h}:{self.api_port}/api2/json/cluster/resources"
             r = self._create_session().get(url, params={'type': 'vm'}, timeout=10)
             
             if r.status_code == 200:
@@ -3601,7 +3688,7 @@ class PegaProxManager:
     def _ha_get_available_nodes(self, exclude_node: str = None) -> List[str]:
         try:
             host = self.host
-            url = f"https://{host}:8006/api2/json/nodes"
+            url = f"https://{host}:{self.api_port}/api2/json/nodes"
             response = self._create_session().get(url, timeout=10)
             
             if response.status_code == 200:
@@ -3677,7 +3764,7 @@ class PegaProxManager:
             # Check current VM status
             self.logger.info(f"[HA] Checking VM {vmid} status")
             try:
-                status_url = f"https://{host}:8006/api2/json/cluster/resources"
+                status_url = f"https://{host}:{self.api_port}/api2/json/cluster/resources"
                 status_resp = self._create_session().get(status_url, params={'type': 'vm'}, timeout=10)
                 if status_resp.status_code == 200:
                     resources = status_resp.json().get('data', [])
@@ -3708,9 +3795,9 @@ class PegaProxManager:
             self.logger.info(f"[HA] Starting VM {vmid} on {target_node}")
             
             if vm_type == 'qemu':
-                start_url = f"https://{host}:8006/api2/json/nodes/{target_node}/qemu/{vmid}/status/start"
+                start_url = f"https://{host}:{self.api_port}/api2/json/nodes/{target_node}/qemu/{vmid}/status/start"
             else:
-                start_url = f"https://{host}:8006/api2/json/nodes/{target_node}/lxc/{vmid}/status/start"
+                start_url = f"https://{host}:{self.api_port}/api2/json/nodes/{target_node}/lxc/{vmid}/status/start"
             
             start_response = self._create_session().post(start_url, timeout=15)
             
@@ -3733,14 +3820,18 @@ class PegaProxManager:
                 self.logger.error(f"[HA] Config move may have failed - check SSH access")
                 return False
             
-            # Try with skiplock if there's a lock (only works for root@pam)
-            if 'lock' in error_text and self.config.user.lower().startswith('root@'):
+            # Try with skiplock if there's a lock — only works for *password*-auth root@pam,
+            # API tokens are rejected by PVE even when owned by root.  MK May 2026 (#391):
+            # gate on the token flag too so we don't waste an HTTP call we know will fail.
+            if ('lock' in error_text
+                    and self.config.user.lower().startswith('root@')
+                    and not getattr(self, '_using_api_token', False)):
                 self.logger.info(f"[HA] VM {vmid} has lock, trying with skiplock=1")
                 start_response = self._create_session().post(start_url, data={'skiplock': 1}, timeout=15)
                 if start_response.status_code == 200:
                     self.logger.info(f"[HA] ✓ VM {vmid} started with skiplock")
                     return True
-            
+
             return False
                     
         except Exception as e:
@@ -4459,7 +4550,7 @@ echo "AGENT_INSTALLED"
         
         try:
             host = self.host
-            url = f"https://{host}:8006/api2/json/nodes"
+            url = f"https://{host}:{self.api_port}/api2/json/nodes"
             resp = self._create_session().get(url, timeout=10)
             
             if resp.status_code == 200:
@@ -4492,7 +4583,7 @@ echo "AGENT_INSTALLED"
         
         try:
             host = self.host
-            url = f"https://{host}:8006/api2/json/nodes"
+            url = f"https://{host}:{self.api_port}/api2/json/nodes"
             resp = self._create_session().get(url, timeout=10)
             
             if resp.status_code != 200:
@@ -4532,7 +4623,7 @@ echo "AGENT_INSTALLED"
         
         try:
             host = self.host
-            url = f"https://{host}:8006/api2/json/nodes"
+            url = f"https://{host}:{self.api_port}/api2/json/nodes"
             resp = self._create_session().get(url, timeout=10)
             
             if resp.status_code != 200:
@@ -4613,7 +4704,7 @@ echo "AGENT_UNINSTALLED"
         """
         try:
             host = self.host
-            url = f"https://{host}:8006/api2/json/nodes"
+            url = f"https://{host}:{self.api_port}/api2/json/nodes"
             resp = self._create_session().get(url, timeout=10)
             
             if resp.status_code != 200:
@@ -4650,7 +4741,7 @@ echo "AGENT_UNINSTALLED"
         """
         try:
             host = self.host
-            url = f"https://{host}:8006/api2/json/nodes"
+            url = f"https://{host}:{self.api_port}/api2/json/nodes"
             resp = self._create_session().get(url, timeout=10)
             
             if resp.status_code != 200:
@@ -4703,7 +4794,7 @@ echo "AGENT_UNINSTALLED"
         
         try:
             host = self.host
-            url = f"https://{host}:8006/api2/json/storage"
+            url = f"https://{host}:{self.api_port}/api2/json/storage"
             resp = self._create_session().get(url, timeout=10)
             
             if resp.status_code != 200:
@@ -5004,7 +5095,7 @@ echo "AGENT_INSTALLED_OK"
         # Get all nodes
         try:
             host = self.host
-            url = f"https://{host}:8006/api2/json/nodes"
+            url = f"https://{host}:{self.api_port}/api2/json/nodes"
             resp = self._create_session().get(url, timeout=10)
             
             if resp.status_code != 200:
@@ -5715,7 +5806,7 @@ echo "AGENT_INSTALLED_OK"
         # NOTE: These are often on a DIFFERENT VLAN (Corosync network), so put in other_ips
         try:
             host = self.host
-            url = f"https://{host}:8006/api2/json/cluster/status"
+            url = f"https://{host}:{self.api_port}/api2/json/cluster/status"
             resp = self._create_session().get(url, timeout=10)
             if resp.status_code == 200:
                 for item in resp.json().get('data', []):
@@ -5730,7 +5821,7 @@ echo "AGENT_INSTALLED_OK"
         # Try to get all network interfaces from node config
         try:
             host = self.host
-            url = f"https://{host}:8006/api2/json/nodes/{node_name.lower()}/network"
+            url = f"https://{host}:{self.api_port}/api2/json/nodes/{node_name.lower()}/network"
             resp = self._create_session().get(url, timeout=10)
             if resp.status_code == 200:
                 for iface_data in resp.json().get('data', []):
@@ -5792,7 +5883,7 @@ echo "AGENT_INSTALLED_OK"
             
             for vmid in vmids:
                 # Check if VM config has a lock
-                url = f"https://{host}:8006/api2/json/nodes/{node_name}/qemu/{vmid}/config"
+                url = f"https://{host}:{self.api_port}/api2/json/nodes/{node_name}/qemu/{vmid}/config"
                 try:
                     resp = self._create_session().get(url, timeout=5)
                     if resp.status_code == 200:
@@ -5810,7 +5901,7 @@ echo "AGENT_INSTALLED_OK"
             try:
                 # This works because pmxcfs is a cluster filesystem
                 # If we can read it, we can see all nodes' activity
-                url = f"https://{host}:8006/api2/json/cluster/status"
+                url = f"https://{host}:{self.api_port}/api2/json/cluster/status"
                 resp = self._create_session().get(url, timeout=5)
                 if resp.status_code == 200:
                     for item in resp.json().get('data', []):
@@ -5931,7 +6022,7 @@ echo "AGENT_INSTALLED_OK"
                 
                 # Get VM config to find disk paths
                 host = self.host
-                url = f"https://{host}:8006/api2/json/nodes/{node_name}/qemu/{vmid}/config"
+                url = f"https://{host}:{self.api_port}/api2/json/nodes/{node_name}/qemu/{vmid}/config"
                 
                 resp = self._create_session().get(url, timeout=5)
                 if resp.status_code == 200:
@@ -6108,9 +6199,9 @@ echo "AGENT_INSTALLED_OK"
 
         try:
             if vm_type == 'qemu':
-                config_url = f"https://{host}:8006/api2/json/nodes/{target_node}/qemu/{vmid}/config"
+                config_url = f"https://{host}:{self.api_port}/api2/json/nodes/{target_node}/qemu/{vmid}/config"
             else:
-                config_url = f"https://{host}:8006/api2/json/nodes/{target_node}/lxc/{vmid}/config"
+                config_url = f"https://{host}:{self.api_port}/api2/json/nodes/{target_node}/lxc/{vmid}/config"
 
             config_response = self._create_session().get(config_url, timeout=10)
             if config_response.status_code == 200:
@@ -6209,7 +6300,7 @@ echo "AGENT_INSTALLED_OK"
         try:
             if self.is_connected:
                 host = self.host
-                url = f"https://{host}:8006/api2/json/nodes"
+                url = f"https://{host}:{self.api_port}/api2/json/nodes"
                 session = self._create_session()
                 response = session.get(url, timeout=5)
                 if response.status_code == 200:
@@ -6307,7 +6398,7 @@ echo "AGENT_INSTALLED_OK"
             host = self.host
             
             # Get cluster-wide tasks
-            url = f"https://{host}:8006/api2/json/cluster/tasks"
+            url = f"https://{host}:{self.api_port}/api2/json/cluster/tasks"
             response = self._create_session().get(url, timeout=10)
             
             if response.status_code == 200:
@@ -6429,7 +6520,7 @@ echo "AGENT_INSTALLED_OK"
         
         try:
             host = self.host
-            url = f"https://{host}:8006/api2/json/cluster/options"
+            url = f"https://{host}:{self.api_port}/api2/json/cluster/options"
             response = self._create_session().get(url, timeout=15)
             
             if response.status_code == 200:
@@ -6461,7 +6552,7 @@ echo "AGENT_INSTALLED_OK"
             if not self.connect_to_proxmox():
                 return []
         try:
-            url = f"https://{self.host}:8006/api2/json/cluster/metrics/server"
+            url = f"https://{self.host}:{self.api_port}/api2/json/cluster/metrics/server"
             response = self._api_get(url)
             if response.status_code == 200:
                 return response.json().get('data', [])
@@ -6478,7 +6569,7 @@ echo "AGENT_INSTALLED_OK"
         
         try:
             host = self.host
-            url = f"https://{host}:8006/api2/json/nodes/{node}/tasks/{upid}"
+            url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/tasks/{upid}"
             response = self._api_delete(url)
             
             if response.status_code == 200:
@@ -6499,7 +6590,7 @@ echo "AGENT_INSTALLED_OK"
         
         try:
             host = self.host
-            url = f"https://{host}:8006/api2/json/nodes/{node}/tasks/{upid}/log"
+            url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/tasks/{upid}/log"
             params = {'limit': limit}
             response = self._create_session().get(url, params=params)
             
@@ -6529,7 +6620,7 @@ echo "AGENT_INSTALLED_OK"
         
         try:
             host = self.host
-            url = f"https://{host}:8006/api2/json/cluster/ha/resources"
+            url = f"https://{host}:{self.api_port}/api2/json/cluster/ha/resources"
             response = self._api_get(url)
             
             if response.status_code == 200:
@@ -6557,7 +6648,7 @@ echo "AGENT_INSTALLED_OK"
 
         # 1) Try the new endpoint first (PVE 9.1+).
         try:
-            response = self._api_get(f"https://{host}:8006/api2/json/cluster/ha/rules")
+            response = self._api_get(f"https://{host}:{self.api_port}/api2/json/cluster/ha/rules")
             if response.status_code == 200:
                 rules = response.json().get('data', []) or []
                 groups = []
@@ -6590,7 +6681,7 @@ echo "AGENT_INSTALLED_OK"
 
         # 2) Legacy fallback for PVE 8.x where /rules doesn't exist yet.
         try:
-            url = f"https://{host}:8006/api2/json/cluster/ha/groups"
+            url = f"https://{host}:{self.api_port}/api2/json/cluster/ha/groups"
             response = self._api_get(url)
             if response.status_code == 200:
                 return response.json().get('data', []) or []
@@ -6613,7 +6704,7 @@ echo "AGENT_INSTALLED_OK"
         
         try:
             host = self.host
-            url = f"https://{host}:8006/api2/json/cluster/ha/resources"
+            url = f"https://{host}:{self.api_port}/api2/json/cluster/ha/resources"
             
             # sid format: vm:100 or ct:100
             sid = f"{vm_type}:{vmid}"
@@ -6653,7 +6744,7 @@ echo "AGENT_INSTALLED_OK"
         try:
             host = self.host
             sid = f"{vm_type}:{vmid}"
-            url = f"https://{host}:8006/api2/json/cluster/ha/resources/{sid}"
+            url = f"https://{host}:{self.api_port}/api2/json/cluster/ha/resources/{sid}"
             
             response = self._api_delete(url)
             
@@ -6701,7 +6792,7 @@ echo "AGENT_INSTALLED_OK"
             # If target is the local/primary node, return its IP directly
             # Otherwise the logic below skips it (ip == primary_ip filter)
             try:
-                cs_url = f"https://{host}:8006/api2/json/cluster/status"
+                cs_url = f"https://{host}:{self.api_port}/api2/json/cluster/status"
                 cs_resp = self._api_get(cs_url)
                 if cs_resp.status_code == 200:
                     for item in cs_resp.json().get('data', []):
@@ -6773,7 +6864,7 @@ echo "AGENT_INSTALLED_OK"
             else:
                 try:
                     # Find current node name
-                    status_url = f"https://{host}:8006/api2/json/cluster/status"
+                    status_url = f"https://{host}:{self.api_port}/api2/json/cluster/status"
                     status_resp = self._api_get(status_url)
                     current_node_name = None
                     if status_resp.status_code == 200:
@@ -6783,7 +6874,7 @@ echo "AGENT_INSTALLED_OK"
                                 break
                     
                     if not current_node_name:
-                        nodes_url = f"https://{host}:8006/api2/json/nodes"
+                        nodes_url = f"https://{host}:{self.api_port}/api2/json/nodes"
                         nodes_resp = self._api_get(nodes_url)
                         if nodes_resp.status_code == 200:
                             for n in nodes_resp.json().get('data', []):
@@ -6792,7 +6883,7 @@ echo "AGENT_INSTALLED_OK"
                                     break
                     
                     if current_node_name:
-                        net_url = f"https://{host}:8006/api2/json/nodes/{current_node_name}/network"
+                        net_url = f"https://{host}:{self.api_port}/api2/json/nodes/{current_node_name}/network"
                         net_resp = self._api_get(net_url)
                         if net_resp.status_code == 200:
                             for net in net_resp.json().get('data', []):
@@ -6829,7 +6920,7 @@ echo "AGENT_INSTALLED_OK"
             # and probes on the SSH port.
             # ================================================================
             try:
-                cs_url = f"https://{host}:8006/api2/json/cluster/status"
+                cs_url = f"https://{host}:{self.api_port}/api2/json/cluster/status"
                 cs_resp = self._api_get(cs_url)
                 if cs_resp.status_code == 200:
                     for item in cs_resp.json().get('data', []):
@@ -6856,7 +6947,7 @@ echo "AGENT_INSTALLED_OK"
             # ================================================================
             # STEP 2: Get ALL network interfaces from the TARGET node
             # ================================================================
-            url = f"https://{host}:8006/api2/json/nodes/{node_name}/network"
+            url = f"https://{host}:{self.api_port}/api2/json/nodes/{node_name}/network"
             response = self._api_get(url)
             
             candidates = []
@@ -6960,7 +7051,7 @@ echo "AGENT_INSTALLED_OK"
             # STEP 4: Corosync -- ONLY if in management network
             # ================================================================
             try:
-                coro_url = f"https://{host}:8006/api2/json/cluster/config/nodes"
+                coro_url = f"https://{host}:{self.api_port}/api2/json/cluster/config/nodes"
                 coro_resp = self._api_get(coro_url)
                 if coro_resp.status_code == 200:
                     for node in coro_resp.json().get('data', []):
@@ -7409,7 +7500,7 @@ echo "AGENT_INSTALLED_OK"
                     # Try via Proxmox API as fallback
                     try:
                         # Proxmox has a reboot command via API
-                        url = f"https://{self.host}:8006/api2/json/nodes/{node_name}/status"
+                        url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node_name}/status"
                         response = self.session.post(url, data={'command': 'reboot'}, verify=False)
                         if response.status_code == 200:
                             task.add_output("Reboot initiated via Proxmox API")
@@ -7494,10 +7585,10 @@ echo "AGENT_INSTALLED_OK"
         try:
             host = self.host
             endpoint = 'qemu' if vm_type == 'qemu' else 'lxc'
-            url = f"https://{host}:8006/api2/json/nodes/{node}/{endpoint}/{vmid}/status/{action}"
+            url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/{endpoint}/{vmid}/status/{action}"
             
             data = {}
-            
+
             # MK: Force stop handling - different for QEMU vs LXC
             # Fixed 27.01.2026 - skiplock requires root@pam, removed for non-root users
             if force and action == 'stop':
@@ -7507,11 +7598,34 @@ echo "AGENT_INSTALLED_OK"
                     data['timeout'] = 0
                 # LW: skiplock only works for root@pam - causes error for other users
                 # "Only root may use this option" - so we skip it for non-root
+                # NS May 2026 (#391): the username-startswith check is necessary
+                # but not sufficient. PVE *also* rejects skiplock when the auth
+                # context is an API token with privilege separation, even if the
+                # token's owner is root@pam. Optimistic send + graceful retry on
+                # the specific PVE error is the only reliable path.
                 if self.config.user.lower().startswith('root@'):
                     data['skiplock'] = 1
-            
+
             self.logger.info(f"VM Action: {action} on {vm_type}/{vmid}@{node}" + (" FORCE" if force else ""))
             resp = self._api_post(url, data=data if data else None)
+
+            # NS May 2026 (#391): graceful skiplock retry. PVE returns
+            # 500 + body containing "Only root may use this option" when the
+            # auth path can't actually pass skiplock (token-based auth, role-
+            # based admins, or custom realms). Drop the param and retry once.
+            # The non-skiplock force-stop still works for unlocked VMs which
+            # is the overwhelming majority of "force stop" use cases.
+            if (resp.status_code != 200
+                    and force and action == 'stop'
+                    and isinstance(data, dict) and 'skiplock' in data
+                    and 'Only root may use this option' in (resp.text or '')):
+                self.logger.warning(
+                    f"[VM] PVE rejected skiplock for {self.config.user!r} "
+                    f"(likely API-token auth or role-restricted user) — retrying force "
+                    f"stop without skiplock. Locked VMs may still need manual unlock."
+                )
+                data.pop('skiplock', None)
+                resp = self._api_post(url, data=data if data else None)
 
             if resp.status_code == 200:
                 # #237: clear no-agent cache on start/reboot so agent gets re-checked
@@ -7539,9 +7653,9 @@ echo "AGENT_INSTALLED_OK"
         
         try:
             if vm_type == 'qemu':
-                url = f"https://{self.host}:8006/api2/json/nodes/{node}/qemu/{vmid}/clone"
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/clone"
             else:
-                url = f"https://{self.host}:8006/api2/json/nodes/{node}/lxc/{vmid}/clone"
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/clone"
             
             data = {'newid': newid}
             
@@ -7587,7 +7701,7 @@ echo "AGENT_INSTALLED_OK"
                 return {'success': False, 'error': 'Could not connect to Proxmox'}
         
         try:
-            url = f"https://{self.host}:8006/api2/json/cluster/nextid"
+            url = f"https://{self.host}:{self.api_port}/api2/json/cluster/nextid"
             response = self._api_get(url)
             
             if response.status_code == 200:
@@ -7609,7 +7723,7 @@ echo "AGENT_INSTALLED_OK"
         
         try:
             if vm_type == 'qemu':
-                url = f"https://{self.host}:8006/api2/json/nodes/{node}/qemu/{vmid}/migrate"
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/migrate"
                 data = {
                     'target': target_node,
                     'online': 1 if online else 0,
@@ -7621,7 +7735,7 @@ echo "AGENT_INSTALLED_OK"
                 if options.get('with_local_disks'):
                     data['with-local-disks'] = 1
             else:  # lxc
-                url = f"https://{self.host}:8006/api2/json/nodes/{node}/lxc/{vmid}/migrate"
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/migrate"
                 data = {
                     'target': target_node,
                     'restart': 1 if online else 0,  # LXC uses restart instead of online
@@ -7667,9 +7781,9 @@ echo "AGENT_INSTALLED_OK"
         try:
             host = self.host
             if vm_type == 'qemu':
-                url = f"https://{host}:8006/api2/json/nodes/{node}/qemu/{vmid}/remote_migrate"
+                url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/remote_migrate"
             else:  # lxc
-                url = f"https://{host}:8006/api2/json/nodes/{node}/lxc/{vmid}/remote_migrate"
+                url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/remote_migrate"
             
             # target-vmid is required - use same as source if not specified
             actual_target_vmid = target_vmid if target_vmid else vmid
@@ -7751,7 +7865,7 @@ echo "AGENT_INSTALLED_OK"
             user = self.config.user
             
             # Create token without privilege separation (privsep=0)
-            url = f"https://{host}:8006/api2/json/access/users/{user}/token/{token_name}"
+            url = f"https://{host}:{self.api_port}/api2/json/access/users/{user}/token/{token_name}"
             data = {
                 'privsep': 0,  # No privilege separation - token has same permissions as user
                 'expire': 0,   # No expiration (we'll delete it manually)
@@ -7792,7 +7906,7 @@ echo "AGENT_INSTALLED_OK"
             host = self.host
             user = self.config.user
             
-            url = f"https://{host}:8006/api2/json/access/users/{user}/token/{token_name}"
+            url = f"https://{host}:{self.api_port}/api2/json/access/users/{user}/token/{token_name}"
             response = self._api_delete(url)
             
             if response.status_code == 200:
@@ -7816,9 +7930,9 @@ echo "AGENT_INSTALLED_OK"
         try:
             # First check if VM is running and stop it
             if vm_type == 'qemu':
-                status_url = f"https://{self.host}:8006/api2/json/nodes/{node}/qemu/{vmid}/status/current"
+                status_url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/status/current"
             else:
-                status_url = f"https://{self.host}:8006/api2/json/nodes/{node}/lxc/{vmid}/status/current"
+                status_url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/status/current"
 
             status_response = self._create_session().get(status_url, timeout=15)
             if status_response.status_code == 200:
@@ -7826,9 +7940,9 @@ echo "AGENT_INSTALLED_OK"
                 if status == 'running':
                     self.logger.info(f"Stopping {vm_type}/{vmid} before deletion")
                     if vm_type == 'qemu':
-                        stop_url = f"https://{self.host}:8006/api2/json/nodes/{node}/qemu/{vmid}/status/stop"
+                        stop_url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/status/stop"
                     else:
-                        stop_url = f"https://{self.host}:8006/api2/json/nodes/{node}/lxc/{vmid}/status/stop"
+                        stop_url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/status/stop"
                     stop_resp = self._create_session().post(stop_url, timeout=15)
                     # NS: Wait for stop task to finish instead of fixed 3s sleep
                     if stop_resp.status_code == 200:
@@ -7854,9 +7968,9 @@ echo "AGENT_INSTALLED_OK"
 
             # Now delete
             if vm_type == 'qemu':
-                url = f"https://{self.host}:8006/api2/json/nodes/{node}/qemu/{vmid}"
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}"
             else:
-                url = f"https://{self.host}:8006/api2/json/nodes/{node}/lxc/{vmid}"
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}"
 
             params = {}
             if purge:
@@ -7883,7 +7997,7 @@ echo "AGENT_INSTALLED_OK"
                         # Task failed - get the error details from task log
                         error_detail = f'Proxmox deletion task failed for {vm_type}/{vmid}'
                         try:
-                            log_url = f"https://{self.host}:8006/api2/json/nodes/{node}/tasks/{task_upid}/log?limit=10"
+                            log_url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/tasks/{task_upid}/log?limit=10"
                             log_resp = self._api_get(log_url)
                             if log_resp.status_code == 200:
                                 log_lines = log_resp.json().get('data', [])
@@ -7933,7 +8047,7 @@ echo "AGENT_INSTALLED_OK"
         templates = []
         try:
             # Get VM templates
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/qemu"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu"
             response = self._api_get(url)
             if response.status_code == 200:
                 for vm in response.json()['data']:
@@ -7945,12 +8059,12 @@ echo "AGENT_INSTALLED_OK"
                         })
             
             # Get CT templates from storage
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/storage"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/storage"
             storage_response = self._api_get(url)
             if storage_response.status_code == 200:
                 for storage in storage_response.json()['data']:
                     if 'vztmpl' in storage.get('content', ''):
-                        tmpl_url = f"https://{self.host}:8006/api2/json/nodes/{node}/storage/{storage['storage']}/content"
+                        tmpl_url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/storage/{storage['storage']}/content"
                         tmpl_response = self._create_session().get(tmpl_url, params={'content': 'vztmpl'})
                         if tmpl_response.status_code == 200:
                             for tmpl in tmpl_response.json()['data']:
@@ -7971,7 +8085,7 @@ echo "AGENT_INSTALLED_OK"
                 return {'success': False, 'error': 'Could not connect to Proxmox'}
         
         try:
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/qemu"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu"
             
             # Required fields
             vmid = vm_config.get('vmid')
@@ -8212,7 +8326,7 @@ echo "AGENT_INSTALLED_OK"
                 # MK: Add to HA if enabled
                 if ha_enabled:
                     try:
-                        ha_url = f"https://{self.host}:8006/api2/json/cluster/ha/resources"
+                        ha_url = f"https://{self.host}:{self.api_port}/api2/json/cluster/ha/resources"
                         ha_data = {'sid': f"vm:{vmid}"}
                         if ha_group:
                             ha_data['group'] = ha_group
@@ -8242,7 +8356,7 @@ echo "AGENT_INSTALLED_OK"
                 return {'success': False, 'error': 'Could not connect to Proxmox'}
         
         try:
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/lxc"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc"
             
             # Required fields
             vmid = ct_config.get('vmid')
@@ -8387,7 +8501,7 @@ echo "AGENT_INSTALLED_OK"
                 # MK: Add to HA if enabled
                 if ha_enabled:
                     try:
-                        ha_url = f"https://{self.host}:8006/api2/json/cluster/ha/resources"
+                        ha_url = f"https://{self.host}:{self.api_port}/api2/json/cluster/ha/resources"
                         ha_data = {'sid': f"ct:{vmid}"}
                         if ha_group:
                             ha_data['group'] = ha_group
@@ -8420,9 +8534,9 @@ echo "AGENT_INSTALLED_OK"
         try:
             host = self.host
             if vm_type == 'qemu':
-                url = f"https://{host}:8006/api2/json/nodes/{node}/qemu/{vmid}/snapshot"
+                url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/snapshot"
             else:
-                url = f"https://{host}:8006/api2/json/nodes/{node}/lxc/{vmid}/snapshot"
+                url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/snapshot"
 
             response = self._api_get(url)
 
@@ -8432,7 +8546,7 @@ echo "AGENT_INSTALLED_OK"
 
                 # NS: try to get disk sizes for snapshot volumes
                 try:
-                    conf_url = f"https://{host}:8006/api2/json/nodes/{node}/{vm_type}/{vmid}/config"
+                    conf_url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/{vm_type}/{vmid}/config"
                     conf_resp = self._api_get(conf_url)
                     if conf_resp.status_code == 200:
                         conf = conf_resp.json().get('data', {})
@@ -8478,9 +8592,9 @@ echo "AGENT_INSTALLED_OK"
             
             # Get VM/CT config
             if vm_type == 'qemu':
-                config_url = f"https://{host}:8006/api2/json/nodes/{node}/qemu/{vmid}/config"
+                config_url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/config"
             else:
-                config_url = f"https://{host}:8006/api2/json/nodes/{node}/lxc/{vmid}/config"
+                config_url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/config"
             
             response = self._create_session().get(config_url, timeout=15)
             if response.status_code != 200:
@@ -8565,9 +8679,9 @@ echo "AGENT_INSTALLED_OK"
         try:
             host = self.host
             if vm_type == 'qemu':
-                url = f"https://{host}:8006/api2/json/nodes/{node}/qemu/{vmid}/snapshot"
+                url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/snapshot"
             else:
-                url = f"https://{host}:8006/api2/json/nodes/{node}/lxc/{vmid}/snapshot"
+                url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/snapshot"
             
             data = {'snapname': snapname}
             if description:
@@ -8613,9 +8727,9 @@ echo "AGENT_INSTALLED_OK"
         
         try:
             if vm_type == 'qemu':
-                url = f"https://{self.host}:8006/api2/json/nodes/{node}/qemu/{vmid}/snapshot/{snapname}"
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/snapshot/{snapname}"
             else:
-                url = f"https://{self.host}:8006/api2/json/nodes/{node}/lxc/{vmid}/snapshot/{snapname}"
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/snapshot/{snapname}"
             
             # self.logger.info(f"deleting snapshot {snapname}")  # spammy
             response = self._api_delete(url)
@@ -8636,9 +8750,9 @@ echo "AGENT_INSTALLED_OK"
         
         try:
             if vm_type == 'qemu':
-                url = f"https://{self.host}:8006/api2/json/nodes/{node}/qemu/{vmid}/snapshot/{snapname}/rollback"
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/snapshot/{snapname}/rollback"
             else:
-                url = f"https://{self.host}:8006/api2/json/nodes/{node}/lxc/{vmid}/snapshot/{snapname}/rollback"
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/snapshot/{snapname}/rollback"
             
             self.logger.info(f"Rolling back {vm_type}/{vmid} to snapshot '{snapname}'")
             response = self._create_session().post(url, timeout=15)
@@ -8686,9 +8800,9 @@ echo "AGENT_INSTALLED_OK"
 
             # Get VM config
             if vm_type == 'qemu':
-                config_url = f"https://{host}:8006/api2/json/nodes/{node}/qemu/{vmid}/config"
+                config_url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/config"
             else:
-                config_url = f"https://{host}:8006/api2/json/nodes/{node}/lxc/{vmid}/config"
+                config_url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/config"
 
             response = self._create_session().get(config_url, timeout=15)
             if response.status_code != 200:
@@ -8696,7 +8810,7 @@ echo "AGENT_INSTALLED_OK"
             config = response.json().get('data', {})
 
             # Get storage configs
-            storage_url = f"https://{host}:8006/api2/json/storage"
+            storage_url = f"https://{host}:{self.api_port}/api2/json/storage"
             storage_response = self._create_session().get(storage_url, timeout=10)
             storage_configs = {}
             if storage_response.status_code == 200:
@@ -8821,7 +8935,7 @@ echo "AGENT_INSTALLED_OK"
             if vm_type == 'qemu':
                 try:
                     host = self.host
-                    config_url = f"https://{host}:8006/api2/json/nodes/{node}/qemu/{vmid}/config"
+                    config_url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/config"
                     resp = self._create_session().get(config_url, timeout=10)
                     if resp.status_code == 200:
                         config = resp.json().get('data', {})
@@ -8893,7 +9007,7 @@ echo "AGENT_INSTALLED_OK"
         if vm_type == 'qemu' and cap.get('has_guest_agent'):
             try:
                 host = self.host
-                freeze_url = f"https://{host}:8006/api2/json/nodes/{node}/qemu/{vmid}/agent/fsfreeze-freeze"
+                freeze_url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/agent/fsfreeze-freeze"
                 resp = self._create_session().post(freeze_url, timeout=30)
                 if resp.status_code == 200:
                     fs_frozen = True
@@ -8942,7 +9056,7 @@ echo "AGENT_INSTALLED_OK"
             if fs_frozen:
                 try:
                     host = self.host
-                    thaw_url = f"https://{host}:8006/api2/json/nodes/{node}/qemu/{vmid}/agent/fsfreeze-thaw"
+                    thaw_url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/agent/fsfreeze-thaw"
                     self._create_session().post(thaw_url, timeout=30)
                     self.logger.info(f"FS thawed for {vm_type}/{vmid}")
                 except Exception as e:
@@ -9151,9 +9265,9 @@ echo "AGENT_INSTALLED_OK"
         try:
             host = self.host
             if vm_type == 'qemu':
-                status_url = f"https://{host}:8006/api2/json/nodes/{node}/qemu/{vmid}/status/current"
+                status_url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/status/current"
             else:
-                status_url = f"https://{host}:8006/api2/json/nodes/{node}/lxc/{vmid}/status/current"
+                status_url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/status/current"
             resp = self._create_session().get(status_url, timeout=10)
             if resp.status_code == 200:
                 vm_status = resp.json().get('data', {}).get('status', '')
@@ -9194,7 +9308,7 @@ echo "AGENT_INSTALLED_OK"
                 return []
 
         try:
-            url = f"https://{self.host}:8006/api2/json/cluster/replication"
+            url = f"https://{self.host}:{self.api_port}/api2/json/cluster/replication"
             response = self._api_get(url)
 
             if response.status_code != 200:
@@ -9215,7 +9329,7 @@ echo "AGENT_INSTALLED_OK"
                 # PVE typically only fills `source` after first run; fall back to
                 # iterating all online nodes if the field is missing.
                 if not source_nodes:
-                    nodes_url = f"https://{self.host}:8006/api2/json/nodes"
+                    nodes_url = f"https://{self.host}:{self.api_port}/api2/json/nodes"
                     nr = self._api_get(nodes_url)
                     if nr.status_code == 200:
                         source_nodes = {n['node'] for n in nr.json().get('data', [])
@@ -9223,7 +9337,7 @@ echo "AGENT_INSTALLED_OK"
                 runtime_by_id = {}
                 for nname in source_nodes:
                     try:
-                        nu = f"https://{self.host}:8006/api2/json/nodes/{nname}/replication"
+                        nu = f"https://{self.host}:{self.api_port}/api2/json/nodes/{nname}/replication"
                         rr = self._api_get(nu)
                         if rr.status_code == 200:
                             for entry in rr.json().get('data', []) or []:
@@ -9257,7 +9371,7 @@ echo "AGENT_INSTALLED_OK"
                 return []
         
         try:
-            url = f"https://{self.host}:8006/api2/json/cluster/replication"
+            url = f"https://{self.host}:{self.api_port}/api2/json/cluster/replication"
             response = self._api_get(url)
             
             if response.status_code == 200:
@@ -9286,7 +9400,7 @@ echo "AGENT_INSTALLED_OK"
             # Create job ID
             job_id = f"{vmid}-0"  # Default to first replication job
             
-            url = f"https://{self.host}:8006/api2/json/cluster/replication"
+            url = f"https://{self.host}:{self.api_port}/api2/json/cluster/replication"
             
             data = {
                 'id': job_id,
@@ -9317,7 +9431,7 @@ echo "AGENT_INSTALLED_OK"
                 return {'success': False, 'error': 'Could not connect to Proxmox'}
         
         try:
-            url = f"https://{self.host}:8006/api2/json/cluster/replication/{job_id}"
+            url = f"https://{self.host}:{self.api_port}/api2/json/cluster/replication/{job_id}"
             
             params = {}
             if keep:
@@ -9349,7 +9463,7 @@ echo "AGENT_INSTALLED_OK"
             source_node = None
             # 1. Cheapest: ask /cluster/replication, find the job, read .source
             try:
-                rj = self._api_get(f"https://{self.host}:8006/api2/json/cluster/replication")
+                rj = self._api_get(f"https://{self.host}:{self.api_port}/api2/json/cluster/replication")
                 if rj.status_code == 200:
                     for j in rj.json().get('data', []) or []:
                         if j.get('id') == job_id and j.get('source'):
@@ -9361,7 +9475,7 @@ echo "AGENT_INSTALLED_OK"
             if not source_node:
                 try:
                     vmid = job_id.split('-', 1)[0]
-                    rr = self._api_get(f"https://{self.host}:8006/api2/json/cluster/resources?type=vm")
+                    rr = self._api_get(f"https://{self.host}:{self.api_port}/api2/json/cluster/resources?type=vm")
                     if rr.status_code == 200:
                         for r in rr.json().get('data', []) or []:
                             if str(r.get('vmid')) == str(vmid):
@@ -9373,7 +9487,7 @@ echo "AGENT_INSTALLED_OK"
                 return {'success': False,
                         'error': f"Could not resolve source node for job '{job_id}' — job not found in /cluster/replication and VM not in /cluster/resources"}
 
-            url = f"https://{self.host}:8006/api2/json/nodes/{source_node}/replication/{job_id}/schedule_now"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{source_node}/replication/{job_id}/schedule_now"
             self.logger.info(f"Triggering immediate replication for job {job_id} on node {source_node}")
             response = self._create_session().post(url, timeout=15)
             if response.status_code == 200:
@@ -9395,9 +9509,9 @@ echo "AGENT_INSTALLED_OK"
             
             # Build URL based on VM type
             if vm_type == 'qemu':
-                url = f"https://{host}:8006/api2/json/nodes/{node}/qemu/{vmid}/vncproxy"
+                url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/vncproxy"
             else:  # lxc
-                url = f"https://{host}:8006/api2/json/nodes/{node}/lxc/{vmid}/vncproxy"
+                url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/vncproxy"
             
             self.logger.info(f"[VNC] Requesting ticket from {host} for {vm_type}/{vmid} on {node}")
             
@@ -9444,9 +9558,9 @@ echo "AGENT_INSTALLED_OK"
         try:
             host = self.host
             if vm_type == 'qemu':
-                url = f"https://{host}:8006/api2/json/nodes/{node}/qemu/{vmid}/termproxy"
+                url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/termproxy"
             else:
-                url = f"https://{host}:8006/api2/json/nodes/{node}/lxc/{vmid}/termproxy"
+                url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/termproxy"
 
             self.logger.info(f"[TERM] Requesting terminal ticket from {host} for {vm_type}/{vmid} on {node}")
             session = self._create_session()
@@ -9458,6 +9572,10 @@ echo "AGENT_INSTALLED_OK"
                     'success': True,
                     'ticket': data.get('ticket'),
                     'port': data.get('port'),
+                    # NS May 2026 — termproxy needs the PVE user for the WS
+                    # auth handshake (`user:ticket\n`). PVE returns it; if not,
+                    # fall back to the manager's configured user.
+                    'user': data.get('user') or self.config.user,
                     'host': host,
                     'node': node,
                     'vmid': vmid,
@@ -9477,7 +9595,7 @@ echo "AGENT_INSTALLED_OK"
                 return {'success': False, 'error': 'Could not connect to Proxmox'}
         
         try:
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/termproxy"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/termproxy"
             
             # Request websocket terminal
             response = self._create_session().post(url, timeout=15)
@@ -9516,7 +9634,7 @@ echo "AGENT_INSTALLED_OK"
                 return {'success': False, 'error': 'Could not connect to Proxmox'}
         
         try:
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/qemu/{vmid}/spiceproxy"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/spiceproxy"
             response = self._create_session().post(url, timeout=15)
             
             if response.status_code == 200:
@@ -9537,9 +9655,9 @@ echo "AGENT_INSTALLED_OK"
         
         try:
             if vm_type == 'qemu':
-                url = f"https://{self.host}:8006/api2/json/nodes/{node}/qemu/{vmid}/config"
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/config"
             else:
-                url = f"https://{self.host}:8006/api2/json/nodes/{node}/lxc/{vmid}/config"
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/config"
             
             response = self._api_get(url)
             
@@ -9548,9 +9666,9 @@ echo "AGENT_INSTALLED_OK"
                 
                 # Also get current status for some dynamic info
                 if vm_type == 'qemu':
-                    status_url = f"https://{self.host}:8006/api2/json/nodes/{node}/qemu/{vmid}/status/current"
+                    status_url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/status/current"
                 else:
-                    status_url = f"https://{self.host}:8006/api2/json/nodes/{node}/lxc/{vmid}/status/current"
+                    status_url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/status/current"
                 
                 status_response = self._create_session().get(status_url, timeout=15)
                 status = {}
@@ -9596,9 +9714,9 @@ echo "AGENT_INSTALLED_OK"
             
             # First get current config to see lock reason
             if vm_type == 'qemu':
-                config_url = f"https://{host}:8006/api2/json/nodes/{node}/qemu/{vmid}/config"
+                config_url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/config"
             else:
-                config_url = f"https://{host}:8006/api2/json/nodes/{node}/lxc/{vmid}/config"
+                config_url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/config"
             
             config_response = self._api_get(config_url)
             if config_response.status_code != 200:
@@ -9642,9 +9760,9 @@ echo "AGENT_INSTALLED_OK"
             host = self.host
             
             if vm_type == 'qemu':
-                config_url = f"https://{host}:8006/api2/json/nodes/{node}/qemu/{vmid}/config"
+                config_url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/config"
             else:
-                config_url = f"https://{host}:8006/api2/json/nodes/{node}/lxc/{vmid}/config"
+                config_url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/config"
             
             response = self._api_get(config_url)
             
@@ -9678,9 +9796,9 @@ echo "AGENT_INSTALLED_OK"
             host = self.host
             
             if vm_type == 'qemu':
-                url = f"https://{host}:8006/api2/json/nodes/{node}/qemu/{vmid}/rrddata"
+                url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/rrddata"
             else:
-                url = f"https://{host}:8006/api2/json/nodes/{node}/lxc/{vmid}/rrddata"
+                url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/rrddata"
             
             response = self._create_session().get(url, params={'timeframe': timeframe})
             
@@ -9779,6 +9897,13 @@ echo "AGENT_INSTALLED_OK"
             }
             
             # Hardware
+            # NS May 2026: scsihw default is `lsi` per PVE upstream (matches
+            # /usr/share/perl5/PVE/QemuServer.pm). Was 'virtio-scsi-pci' here
+            # which made the Configure dropdown lie about what PVE actually
+            # uses when scsihw is omitted from config — user reported in
+            # comments that picking VirtIO in PegaProx left PVE on LSI; turns
+            # out the dropdown was already showing VirtIO without anything to
+            # save against, so the user's "no-op" save kept PVE's lsi default.
             parsed['hardware'] = {
                 'cores': config.get('cores', 1),
                 'sockets': config.get('sockets', 1),
@@ -9789,7 +9914,7 @@ echo "AGENT_INSTALLED_OK"
                 'vga': config.get('vga', 'std'),
                 'machine': config.get('machine', ''),
                 'bios': config.get('bios', 'seabios'),
-                'scsihw': config.get('scsihw', 'virtio-scsi-pci'),
+                'scsihw': config.get('scsihw', 'lsi'),
             }
             
             # Options
@@ -10034,9 +10159,9 @@ echo "AGENT_INSTALLED_OK"
         
         try:
             if vm_type == 'qemu':
-                url = f"https://{self.host}:8006/api2/json/nodes/{node}/qemu/{vmid}/config"
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/config"
             else:
-                url = f"https://{self.host}:8006/api2/json/nodes/{node}/lxc/{vmid}/config"
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/config"
             
             # NS: If boot order is being updated, validate it against current config
             if 'boot' in config_updates:
@@ -10132,9 +10257,9 @@ echo "AGENT_INSTALLED_OK"
             
             # Apply update
             if vm_type == 'qemu':
-                url = f"https://{self.host}:8006/api2/json/nodes/{node}/qemu/{vmid}/config"
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/config"
             else:
-                url = f"https://{self.host}:8006/api2/json/nodes/{node}/lxc/{vmid}/config"
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/config"
             
             response = self._api_put(url, data={'boot': new_boot})
             
@@ -10162,9 +10287,9 @@ echo "AGENT_INSTALLED_OK"
         
         try:
             if vm_type == 'qemu':
-                url = f"https://{self.host}:8006/api2/json/nodes/{node}/qemu/{vmid}/resize"
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/resize"
             else:
-                url = f"https://{self.host}:8006/api2/json/nodes/{node}/lxc/{vmid}/resize"
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/resize"
             
             data = {'disk': disk, 'size': size}
             response = self._api_put(url, data=data)
@@ -10186,7 +10311,7 @@ echo "AGENT_INSTALLED_OK"
         
         try:
             host = self.host
-            url = f"https://{host}:8006/api2/json/nodes/{node}/storage"
+            url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/storage"
             response = self._api_get(url)
             
             if response.status_code == 200:
@@ -10211,7 +10336,7 @@ echo "AGENT_INSTALLED_OK"
             found_bridges = set()
             
             # 1. Get local bridges from node
-            url = f"https://{host}:8006/api2/json/nodes/{node}/network"
+            url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/network"
             response = self._api_get(url)
             
             if response.status_code == 200:
@@ -10227,7 +10352,7 @@ echo "AGENT_INSTALLED_OK"
             # 2. Get SDN VNets (cluster-wide)
             # NS: Feb 2026 - Improved SDN support for GitHub Issue #38
             try:
-                sdn_url = f"https://{host}:8006/api2/json/cluster/sdn/vnets"
+                sdn_url = f"https://{host}:{self.api_port}/api2/json/cluster/sdn/vnets"
                 sdn_response = self._api_get(sdn_url)
                 
                 if sdn_response.status_code == 200:
@@ -10257,7 +10382,7 @@ echo "AGENT_INSTALLED_OK"
             
             # 3. Get SDN Zones and update VNet info
             try:
-                zones_url = f"https://{host}:8006/api2/json/cluster/sdn/zones"
+                zones_url = f"https://{host}:{self.api_port}/api2/json/cluster/sdn/zones"
                 zones_response = self._api_get(zones_url)
                 
                 if zones_response.status_code == 200:
@@ -10273,7 +10398,7 @@ echo "AGENT_INSTALLED_OK"
             
             # 4. Discover networks from running VMs (catches SDN VNets not in API)
             try:
-                vms_url = f"https://{host}:8006/api2/json/nodes/{node}/qemu"
+                vms_url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/qemu"
                 vms_response = self._api_get(vms_url)
                 
                 if vms_response.status_code == 200:
@@ -10282,7 +10407,7 @@ echo "AGENT_INSTALLED_OK"
                     for vm in vms[:15]:  # Check first 15 VMs
                         vmid = vm.get('vmid')
                         if vmid:
-                            config_url = f"https://{host}:8006/api2/json/nodes/{node}/qemu/{vmid}/config"
+                            config_url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/config"
                             config_response = self._api_get(config_url)
                             
                             if config_response.status_code == 200:
@@ -10322,7 +10447,7 @@ echo "AGENT_INSTALLED_OK"
             host = self.host
 
             # get online nodes
-            nodes_url = f"https://{host}:8006/api2/json/nodes"
+            nodes_url = f"https://{host}:{self.api_port}/api2/json/nodes"
             nodes_resp = self._api_get(nodes_url)
             if nodes_resp.status_code != 200:
                 return {'networks': []}
@@ -10331,7 +10456,7 @@ echo "AGENT_INSTALLED_OK"
                            if n.get('status') == 'online']
 
             # get VMs from cluster resources
-            res_url = f"https://{host}:8006/api2/json/cluster/resources?type=vm"
+            res_url = f"https://{host}:{self.api_port}/api2/json/cluster/resources?type=vm"
             res_resp = self._api_get(res_url)
             all_vms = res_resp.json().get('data', []) if res_resp.status_code == 200 else []
 
@@ -10343,10 +10468,11 @@ echo "AGENT_INSTALLED_OK"
             def fetch_node(node):
                 net_data = []
                 vm_bridges = []
+                vm_storages = []  # NS May 2026 — disk → storage refs
 
                 # node network interfaces
                 try:
-                    net_url = f"https://{host}:8006/api2/json/nodes/{node}/network"
+                    net_url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/network"
                     r = self._api_get(net_url)
                     if r.status_code == 200:
                         net_data = r.json().get('data', [])
@@ -10360,44 +10486,83 @@ echo "AGENT_INSTALLED_OK"
                         continue
                     vtype = 'qemu' if vm.get('type') == 'qemu' else 'lxc'
                     try:
-                        cfg_url = f"https://{host}:8006/api2/json/nodes/{node}/{vtype}/{vmid}/config"
+                        cfg_url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/{vtype}/{vmid}/config"
                         cr = self._api_get(cfg_url)
                         if cr.status_code != 200:
                             continue
                         cfg = cr.json().get('data', {})
                         for key, val in cfg.items():
-                            if not key.startswith('net') or not isinstance(val, str):
+                            if not isinstance(val, str):
                                 continue
-                            if not key[3:].isdigit():
+                            # NS May 2026 — extract net bridge AND disk storage from
+                            # the same config response. Both are in scope for the
+                            # /networks endpoint that powers the topology view.
+                            if key.startswith('net') and key[3:].isdigit():
+                                bridge = None
+                                for part in val.split(','):
+                                    if part.startswith('bridge='):
+                                        bridge = part.split('=', 1)[1]
+                                        break
+                                if bridge:
+                                    vm_bridges.append({
+                                        'vmid': vmid,
+                                        'name': vm.get('name', ''),
+                                        'node': node,
+                                        'status': vm.get('status', 'unknown'),
+                                        'type': vm.get('type', 'qemu'),
+                                        'iface': key,
+                                        'bridge': bridge,
+                                    })
                                 continue
-                            bridge = None
-                            for part in val.split(','):
-                                if part.startswith('bridge='):
-                                    bridge = part.split('=', 1)[1]
+                            # disk slots: scsi/virtio/sata/ide/unused/efidisk/tpmstate (qemu)
+                            # plus rootfs / mp* (lxc). 'cdrom' / 'none,...' values skipped.
+                            disk_prefixes = ('scsi', 'virtio', 'sata', 'ide', 'unused',
+                                             'efidisk', 'tpmstate', 'mp', 'rootfs')
+                            matched = False
+                            for p in disk_prefixes:
+                                if key.startswith(p):
+                                    suffix = key[len(p):]
+                                    if suffix == '' or suffix.isdigit():
+                                        matched = True
                                     break
-                            if bridge:
-                                vm_bridges.append({
-                                    'vmid': vmid,
-                                    'name': vm.get('name', ''),
-                                    'node': node,
-                                    'status': vm.get('status', 'unknown'),
-                                    'type': vm.get('type', 'qemu'),
-                                    'iface': key,
-                                    'bridge': bridge,
-                                })
+                            if not matched:
+                                continue
+                            head = val.split(',', 1)[0].strip()
+                            if not head or head == 'none' or head.startswith('none,'):
+                                continue
+                            if ':' not in head:
+                                continue
+                            storage_name = head.split(':', 1)[0].strip()
+                            if not storage_name or storage_name == 'none':
+                                continue
+                            # MK May 2026 — skip cdrom-only attachments to keep the
+                            # tier focused on actual VM disks. media=cdrom is the
+                            # PVE convention; we keep ISO storages off the diagram.
+                            if 'media=cdrom' in val:
+                                continue
+                            vm_storages.append({
+                                'vmid': vmid,
+                                'name': vm.get('name', ''),
+                                'node': node,
+                                'status': vm.get('status', 'unknown'),
+                                'type': vm.get('type', 'qemu'),
+                                'slot': key,
+                                'storage': storage_name,
+                            })
                     except Exception:
                         pass
 
-                return node, net_data, vm_bridges
+                return node, net_data, vm_bridges, vm_storages
 
             tasks = [lambda n=n: fetch_node(n) for n in online_nodes]
             results = run_concurrent(tasks, timeout=15)
 
             network_map = {}
+            storage_assignments = {}  # storage_name → list of {vmid, name, node, ...}
             for res in results:
                 if not res:
                     continue
-                node, ifaces, vm_bridges = res
+                node, ifaces, vm_bridges, vm_storages = res
 
                 for iface in ifaces:
                     itype = iface.get('type', '')
@@ -10433,10 +10598,26 @@ echo "AGENT_INSTALLED_OK"
                         }
                     network_map[br]['vms'].append(vb)
 
-            return {'networks': sorted(network_map.values(), key=lambda n: n['name'])}
+                for vs in vm_storages:
+                    sname = vs['storage']
+                    if sname not in storage_assignments:
+                        storage_assignments[sname] = []
+                    storage_assignments[sname].append({
+                        'vmid': vs['vmid'], 'name': vs['name'], 'node': vs['node'],
+                        'status': vs['status'], 'type': vs['type'], 'slot': vs['slot'],
+                    })
+
+            return {
+                'networks': sorted(network_map.values(), key=lambda n: n['name']),
+                # NS May 2026 — flat list, easier for frontend to index by storage name
+                'storage_assignments': [
+                    {'storage': s, 'vms': storage_assignments[s]}
+                    for s in sorted(storage_assignments.keys())
+                ],
+            }
         except Exception as e:
             logging.error(f"get_cluster_networks failed: {e}")
-            return {'networks': []}
+            return {'networks': [], 'storage_assignments': []}
 
     def get_iso_list(self, node: str, storage: str = None) -> List[Dict]:
         
@@ -10451,7 +10632,7 @@ echo "AGENT_INSTALLED_OK"
             storages = [storage] if storage else [s['storage'] for s in self.get_storage_list(node) if 'iso' in s.get('content', '')]
             
             for stor in storages:
-                url = f"https://{host}:8006/api2/json/nodes/{node}/storage/{stor}/content"
+                url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/storage/{stor}/content"
                 response = self._create_session().get(url, params={'content': 'iso'})
                 
                 if response.status_code == 200:
@@ -10482,7 +10663,7 @@ echo "AGENT_INSTALLED_OK"
                             if content_type in s.get('content', '') and s.get('active')]
                 files = []
                 for stor in storages:
-                    url = f"https://{host}:8006/api2/json/nodes/{node}/storage/{stor['storage']}/content"
+                    url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/storage/{stor['storage']}/content"
                     r = self._create_session().get(url, params={'content': content_type}, timeout=10)
                     if r.status_code == 200:
                         for item in r.json().get('data', []):
@@ -10670,7 +10851,7 @@ echo "AGENT_INSTALLED_OK"
         
         try:
             host = self.host
-            url = f"https://{host}:8006/api2/json/pools"
+            url = f"https://{host}:{self.api_port}/api2/json/pools"
             response = self._api_get(url)
             
             if response.status_code == 200:
@@ -10688,7 +10869,7 @@ echo "AGENT_INSTALLED_OK"
         
         try:
             host = self.host
-            url = f"https://{host}:8006/api2/json/pools/{pool_id}"
+            url = f"https://{host}:{self.api_port}/api2/json/pools/{pool_id}"
             response = self._api_get(url)
             
             if response.status_code == 200:
@@ -10717,7 +10898,7 @@ echo "AGENT_INSTALLED_OK"
         try:
             payload = {'poolid': poolid}
             if comment: payload['comment'] = comment
-            resp = self._api_post(f"https://{host}:8006/api2/json/pools", data=payload)
+            resp = self._api_post(f"https://{host}:{self.api_port}/api2/json/pools", data=payload)
             if resp.status_code == 200:
                 return {'success': True}
             # proxmox gives us the error in 'errors' or just the body
@@ -10733,7 +10914,7 @@ echo "AGENT_INSTALLED_OK"
         if not self.is_connected and not self.connect_to_proxmox():
             return {'success': False, 'error': 'Not connected'}
         host = self.host
-        url = f"https://{host}:8006/api2/json/pools/{poolid}"
+        url = f"https://{host}:{self.api_port}/api2/json/pools/{poolid}"
         try:
             data = {}
             if comment is not None:
@@ -10762,7 +10943,7 @@ echo "AGENT_INSTALLED_OK"
             return {'success': False, 'error': 'Not connected'}
         try:
             host = self.host
-            resp = self._api_delete(f"https://{host}:8006/api2/json/pools/{poolid}")
+            resp = self._api_delete(f"https://{host}:{self.api_port}/api2/json/pools/{poolid}")
             return {'success': True} if resp.status_code == 200 else {'success': False, 'error': f'PVE {resp.status_code}'}
         except Exception as e:
             self.logger.error(f"delete_pool({poolid}): {e}")
@@ -10792,7 +10973,7 @@ echo "AGENT_INSTALLED_OK"
             supports_ssd = bus_type in ['scsi', 'virtio', 'sata']
             
             if vm_type == 'qemu':
-                url = f"https://{self.host}:8006/api2/json/nodes/{node}/qemu/{vmid}/config"
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/config"
 
                 # Build disk string - format is storage:size (size in GB without unit)
                 disk_str = f"{storage}:{size}"
@@ -10823,7 +11004,7 @@ echo "AGENT_INSTALLED_OK"
                 data = {disk_id: disk_str}
                 
             else:  # LXC
-                url = f"https://{self.host}:8006/api2/json/nodes/{node}/lxc/{vmid}/config"
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/config"
                 
                 # For LXC mountpoints
                 mp_str = f"{storage}:{size}"
@@ -10888,9 +11069,9 @@ echo "AGENT_INSTALLED_OK"
                             
                             # Update boot order BEFORE removing disk
                             if vm_type == 'qemu':
-                                boot_url = f"https://{self.host}:8006/api2/json/nodes/{node}/qemu/{vmid}/config"
+                                boot_url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/config"
                             else:
-                                boot_url = f"https://{self.host}:8006/api2/json/nodes/{node}/lxc/{vmid}/config"
+                                boot_url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/config"
                             
                             boot_response = self._api_put(boot_url, data={'boot': new_boot})
                             if boot_response.status_code == 200:
@@ -10909,9 +11090,9 @@ echo "AGENT_INSTALLED_OK"
                         self.logger.info(f"[DEBUG] volume_path={volume_path}")
             
             if vm_type == 'qemu':
-                url = f"https://{self.host}:8006/api2/json/nodes/{node}/qemu/{vmid}/config"
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/config"
             else:
-                url = f"https://{self.host}:8006/api2/json/nodes/{node}/lxc/{vmid}/config"
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/config"
             
             # Now detach the disk from VM config
             data = {'delete': disk_id}
@@ -10957,7 +11138,7 @@ echo "AGENT_INSTALLED_OK"
                                 if storage_name:
                                     import urllib.parse
                                     encoded_volid = urllib.parse.quote(volume_path, safe='')
-                                    delete_url = f"https://{self.host}:8006/api2/json/nodes/{node}/storage/{storage_name}/content/{encoded_volid}"
+                                    delete_url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/storage/{storage_name}/content/{encoded_volid}"
                                     delete_response = self._api_delete(delete_url)
                                     if delete_response.status_code == 200:
                                         self.logger.info(f"[OK] Deleted volume {volume_path} via storage API")
@@ -11000,9 +11181,9 @@ echo "AGENT_INSTALLED_OK"
 
         try:
             if vm_type == 'qemu':
-                url = f"https://{self.host}:8006/api2/json/nodes/{node}/qemu/{vmid}/move_disk"
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/move_disk"
             else:
-                url = f"https://{self.host}:8006/api2/json/nodes/{node}/lxc/{vmid}/move_volume"
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/move_volume"
             
             data = {
                 'disk': disk_id,
@@ -11029,7 +11210,7 @@ echo "AGENT_INSTALLED_OK"
                 return {'success': False, 'error': 'Could not connect to Proxmox'}
         
         try:
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/qemu/{vmid}/config"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/config"
             
             if iso_path:
                 # Mount ISO
@@ -11060,7 +11241,7 @@ echo "AGENT_INSTALLED_OK"
             net_id = net_config.get('net_id', 'net1')
             
             if vm_type == 'qemu':
-                url = f"https://{self.host}:8006/api2/json/nodes/{node}/qemu/{vmid}/config"
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/config"
                 
                 # Build network string: model=XX:XX:XX:XX:XX:XX,bridge=vmbr0,...
                 model = net_config.get('model', 'virtio')
@@ -11085,7 +11266,7 @@ echo "AGENT_INSTALLED_OK"
                 net_str = ','.join(parts)
                 
             else:  # LXC
-                url = f"https://{self.host}:8006/api2/json/nodes/{node}/lxc/{vmid}/config"
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/config"
                 
                 parts = []
                 if net_config.get('name'):
@@ -11140,7 +11321,7 @@ echo "AGENT_INSTALLED_OK"
         
         try:
             if vm_type == 'qemu':
-                url = f"https://{self.host}:8006/api2/json/nodes/{node}/qemu/{vmid}/config"
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/config"
                 
                 model = net_config.get('model', 'virtio')
                 parts = [model]
@@ -11167,7 +11348,7 @@ echo "AGENT_INSTALLED_OK"
                 net_str = ','.join(parts)
                 
             else:  # LXC
-                url = f"https://{self.host}:8006/api2/json/nodes/{node}/lxc/{vmid}/config"
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/config"
                 
                 parts = []
                 if net_config.get('name'):
@@ -11215,9 +11396,9 @@ echo "AGENT_INSTALLED_OK"
         
         try:
             if vm_type == 'qemu':
-                url = f"https://{self.host}:8006/api2/json/nodes/{node}/qemu/{vmid}/config"
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/config"
             else:
-                url = f"https://{self.host}:8006/api2/json/nodes/{node}/lxc/{vmid}/config"
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/config"
             
             data = {'delete': net_id}
             response = self._api_put(url, data=data)
@@ -11248,7 +11429,7 @@ echo "AGENT_INSTALLED_OK"
             host = self.host
             
             # First get current network config
-            config_url = f"https://{host}:8006/api2/json/nodes/{node}/qemu/{vmid}/config"
+            config_url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/config"
             config_response = self._api_get(config_url)
             
             if config_response.status_code != 200:
@@ -11282,7 +11463,7 @@ echo "AGENT_INSTALLED_OK"
             new_net_config = ','.join(new_parts)
             
             # Update the network config
-            update_url = f"https://{host}:8006/api2/json/nodes/{node}/qemu/{vmid}/config"
+            update_url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/config"
             response = self._api_put(update_url, data={net_id: new_net_config})
             
             if response.status_code == 200:
@@ -11439,14 +11620,14 @@ echo "AGENT_INSTALLED_OK"
         
         try:
             # Get node status
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/status"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/status"
             response = self._api_get(url)
             
             if response.status_code == 200:
                 data = response.json().get('data', {})
                 
                 # Get PVE version
-                version_url = f"https://{self.host}:8006/api2/json/nodes/{node}/version"
+                version_url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/version"
                 version_response = self._create_session().get(version_url, timeout=15)
                 version_data = {}
                 if version_response.status_code == 200:
@@ -11498,7 +11679,7 @@ echo "AGENT_INSTALLED_OK"
         
         try:
             host = self.host
-            url = f"https://{host}:8006/api2/json/nodes/{node}/rrddata"
+            url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/rrddata"
             
             response = self._create_session().get(url, params={'timeframe': timeframe})
             
@@ -11605,7 +11786,7 @@ echo "AGENT_INSTALLED_OK"
                 return []
         
         try:
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/network"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/network"
             response = self._api_get(url)
             
             if response.status_code == 200:
@@ -11622,7 +11803,7 @@ echo "AGENT_INSTALLED_OK"
                 return {'success': False, 'error': 'Could not connect'}
         
         try:
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/network/{iface}"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/network/{iface}"
             response = self._api_put(url, data=config)
             
             if response.status_code == 200:
@@ -11638,7 +11819,7 @@ echo "AGENT_INSTALLED_OK"
                 return {'success': False, 'error': 'Could not connect'}
         
         try:
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/network"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/network"
             data = {
                 'iface': iface,
                 'type': iface_type,
@@ -11662,7 +11843,7 @@ echo "AGENT_INSTALLED_OK"
                 return {'success': False, 'error': 'Could not connect'}
         
         try:
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/network/{iface}"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/network/{iface}"
             response = self._api_delete(url)
             
             if response.status_code == 200:
@@ -11678,7 +11859,7 @@ echo "AGENT_INSTALLED_OK"
                 return {'success': False, 'error': 'Could not connect'}
         
         try:
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/network"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/network"
             response = self._create_session().put(url, timeout=15)
             
             if response.status_code == 200:
@@ -11694,7 +11875,7 @@ echo "AGENT_INSTALLED_OK"
                 return {'success': False, 'error': 'Could not connect'}
         
         try:
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/network"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/network"
             response = self._api_delete(url)
             
             if response.status_code == 200:
@@ -11710,7 +11891,7 @@ echo "AGENT_INSTALLED_OK"
                 return {}
         
         try:
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/dns"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/dns"
             response = self._api_get(url)
             
             if response.status_code == 200:
@@ -11727,7 +11908,7 @@ echo "AGENT_INSTALLED_OK"
                 return {'success': False, 'error': 'Could not connect'}
         
         try:
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/dns"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/dns"
             response = self._api_put(url, data=dns_config)
             
             if response.status_code == 200:
@@ -11743,7 +11924,7 @@ echo "AGENT_INSTALLED_OK"
                 return ''
         
         try:
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/hosts"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/hosts"
             response = self._api_get(url)
             
             if response.status_code == 200:
@@ -11760,7 +11941,7 @@ echo "AGENT_INSTALLED_OK"
                 return {'success': False, 'error': 'Could not connect'}
         
         try:
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/hosts"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/hosts"
             response = self._api_post(url, data={'data': hosts_content})
             
             if response.status_code == 200:
@@ -11776,7 +11957,7 @@ echo "AGENT_INSTALLED_OK"
                 return {}
         
         try:
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/time"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/time"
             response = self._api_get(url)
             
             if response.status_code == 200:
@@ -11793,7 +11974,7 @@ echo "AGENT_INSTALLED_OK"
                 return {'success': False, 'error': 'Could not connect'}
         
         try:
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/time"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/time"
             response = self._api_put(url, data={'timezone': timezone})
             
             if response.status_code == 200:
@@ -11809,7 +11990,7 @@ echo "AGENT_INSTALLED_OK"
                 return []
         
         try:
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/syslog"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/syslog"
             params = {'limit': limit}
             if since:
                 params['since'] = since
@@ -11832,7 +12013,7 @@ echo "AGENT_INSTALLED_OK"
                 return []
         
         try:
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/certificates/info"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/certificates/info"
             response = self._api_get(url)
             
             if response.status_code == 200:
@@ -11849,7 +12030,7 @@ echo "AGENT_INSTALLED_OK"
                 return {'success': False, 'error': 'Could not connect'}
         
         try:
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/certificates/acme/certificate"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/certificates/acme/certificate"
             data = {'force': 1} if force else {}
             response = self._api_post(url, data=data)
             
@@ -11866,7 +12047,7 @@ echo "AGENT_INSTALLED_OK"
                 return {'success': False, 'error': 'Could not connect'}
         
         try:
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/certificates/custom"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/certificates/custom"
             data = {
                 'certificates': certificates,
                 'key': key,
@@ -11888,7 +12069,7 @@ echo "AGENT_INSTALLED_OK"
                 return {'success': False, 'error': 'Could not connect'}
         
         try:
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/certificates/custom"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/certificates/custom"
             params = {'restart': 1 if restart else 0}
             response = self._create_session().delete(url, params=params)
             
@@ -11905,7 +12086,7 @@ echo "AGENT_INSTALLED_OK"
                 return []
         
         try:
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/disks/list"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/disks/list"
             response = self._api_get(url)
             
             if response.status_code == 200:
@@ -11922,7 +12103,7 @@ echo "AGENT_INSTALLED_OK"
                 return {}
         
         try:
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/disks/smart"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/disks/smart"
             response = self._create_session().get(url, params={'disk': disk})
             
             if response.status_code == 200:
@@ -11939,7 +12120,7 @@ echo "AGENT_INSTALLED_OK"
                 return []
         
         try:
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/disks/lvm"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/disks/lvm"
             response = self._api_get(url)
             
             if response.status_code == 200:
@@ -11956,7 +12137,7 @@ echo "AGENT_INSTALLED_OK"
                 return {'success': False, 'error': 'Could not connect'}
         
         try:
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/disks/lvm"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/disks/lvm"
             data = {
                 'device': device,
                 'name': name,
@@ -11977,7 +12158,7 @@ echo "AGENT_INSTALLED_OK"
                 return []
         
         try:
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/disks/lvmthin"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/disks/lvmthin"
             response = self._api_get(url)
             
             if response.status_code == 200:
@@ -11994,7 +12175,7 @@ echo "AGENT_INSTALLED_OK"
                 return {'success': False, 'error': 'Could not connect'}
         
         try:
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/disks/lvmthin"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/disks/lvmthin"
             data = {
                 'device': device,
                 'name': name,
@@ -12015,7 +12196,7 @@ echo "AGENT_INSTALLED_OK"
                 return []
         
         try:
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/disks/zfs"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/disks/zfs"
             response = self._api_get(url)
             
             if response.status_code == 200:
@@ -12033,7 +12214,7 @@ echo "AGENT_INSTALLED_OK"
                 return {'success': False, 'error': 'Could not connect'}
         
         try:
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/disks/zfs"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/disks/zfs"
             
             # devices must be comma-separated string for Proxmox API
             if isinstance(devices, list):
@@ -12064,7 +12245,7 @@ echo "AGENT_INSTALLED_OK"
                 return []
         
         try:
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/disks/directory"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/disks/directory"
             response = self._api_get(url)
             
             if response.status_code == 200:
@@ -12081,7 +12262,7 @@ echo "AGENT_INSTALLED_OK"
                 return {'success': False, 'error': 'Could not connect'}
         
         try:
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/disks/directory"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/disks/directory"
             data = {
                 'device': device,
                 'name': name,
@@ -12103,7 +12284,7 @@ echo "AGENT_INSTALLED_OK"
                 return {'success': False, 'error': 'Could not connect'}
         
         try:
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/disks/initgpt"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/disks/initgpt"
             data = {'disk': disk}
             if uuid:
                 data['uuid'] = uuid
@@ -12122,7 +12303,7 @@ echo "AGENT_INSTALLED_OK"
                 return {'success': False, 'error': 'Could not connect'}
         
         try:
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/disks/wipedisk"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/disks/wipedisk"
             response = self._api_post(url, data={'disk': disk})
             
             if response.status_code == 200:
@@ -12138,7 +12319,7 @@ echo "AGENT_INSTALLED_OK"
                 return []
         
         try:
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/replication"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/replication"
             response = self._api_get(url)
             
             if response.status_code == 200:
@@ -12155,7 +12336,7 @@ echo "AGENT_INSTALLED_OK"
                 return []
         
         try:
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/tasks"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/tasks"
             params = {'start': start, 'limit': limit}
             if errors:
                 params['errors'] = 1
@@ -12175,7 +12356,7 @@ echo "AGENT_INSTALLED_OK"
                 return []
         
         try:
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/tasks/{upid}/log"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/tasks/{upid}/log"
             response = self._create_session().get(url, params={'start': start, 'limit': limit})
             
             if response.status_code == 200:
@@ -12193,7 +12374,7 @@ echo "AGENT_INSTALLED_OK"
                 return {}
         
         try:
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/subscription"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/subscription"
             response = self._api_get(url)
             
             if response.status_code == 200:
@@ -12210,7 +12391,7 @@ echo "AGENT_INSTALLED_OK"
                 return {'success': False, 'error': 'Could not connect'}
         
         try:
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/subscription"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/subscription"
             response = self._api_put(url, data={'key': key})
             
             if response.status_code == 200:
@@ -12227,7 +12408,7 @@ echo "AGENT_INSTALLED_OK"
         
         try:
             # Node options are part of datacenter config for that node
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/config"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/config"
             response = self._api_get(url)
             
             if response.status_code == 200:
@@ -12244,7 +12425,7 @@ echo "AGENT_INSTALLED_OK"
                 return {'success': False, 'error': 'Could not connect'}
         
         try:
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/config"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/config"
             response = self._api_put(url, data=options)
             
             if response.status_code == 200:
@@ -12265,7 +12446,7 @@ echo "AGENT_INSTALLED_OK"
         
         try:
             host = self.host
-            url = f"https://{host}:8006/api2/json/nodes/{node}/apt/update"
+            url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/apt/update"
             response = self._create_session().get(url, timeout=15)
             
             if response.status_code == 200:
@@ -12286,7 +12467,7 @@ echo "AGENT_INSTALLED_OK"
         
         try:
             host = self.host
-            url = f"https://{host}:8006/api2/json/nodes/{node}/apt/update"
+            url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/apt/update"
             response = self._create_session().post(url, timeout=15)
             
             if response.status_code == 200:
@@ -12505,7 +12686,7 @@ echo "AGENT_INSTALLED_OK"
         
         try:
             host = self.host
-            url = f"https://{host}:8006/api2/json/version"
+            url = f"https://{host}:{self.api_port}/api2/json/version"
             response = self._create_session().get(url, timeout=5)
             return response.status_code == 200
         except:
@@ -13825,7 +14006,7 @@ echo DONE""",
         if vmid in self._no_agent_vms:
             return []
         try:
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/qemu/{vmid}/agent/network-get-interfaces"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/agent/network-get-interfaces"
             resp = self._create_session().get(url, timeout=8)
             if resp.status_code == 500:
                 self._no_agent_vms.add(vmid)
@@ -13859,7 +14040,7 @@ echo DONE""",
         if vmid in self._no_agent_vms:
             return {}
         try:
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/qemu/{vmid}/agent/get-fsinfo"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/agent/get-fsinfo"
             resp = self._create_session().get(url, timeout=8)
             if resp.status_code == 500:
                 self._no_agent_vms.add(vmid)
@@ -13886,7 +14067,7 @@ echo DONE""",
         """Fetch IP addresses for a running LXC container.
         Proxmox returns either inet/inet6 strings or ip-addresses array depending on version."""
         try:
-            url = f"https://{self.host}:8006/api2/json/nodes/{node}/lxc/{vmid}/interfaces"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/interfaces"
             resp = self._create_session().get(url, timeout=8)
             if resp.status_code != 200:
                 return []

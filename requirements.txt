@@ -2,16 +2,23 @@
 # Install with: pip install -r requirements.txt
 
 # === Core (Required) ===
-flask>=2.3.0
-flask-cors>=4.0.0
+# NS May 2026 — Flask 3.x floor: pulls werkzeug 3.x which patches the RCE
+# in 2.2.3 (debugger pin bypass). Verified no removed-in-3 APIs in our code
+# (no before_first_request, no JSONEncoder direct use, no _app_ctx_stack).
+flask>=3.0.3  # NS: werkzeug 3.0.3 RCE fix transit; CVE-2023-30861 long since fixed
+# MK May 2026 — flask-cors 6.0.0 fixes 3 CVEs incl. CVE-2024-6221 (improper case
+# handling in Origin allowlist) + CVE-2024-6839/-6844 (source verification +
+# origin validation). Pre-6 versions are scanner-flagged High.
+flask-cors>=6.0.0
 flask-sock>=0.6.0
 flask-compress>=1.14
-# MK May 2026 — bumped requests + urllib3 floors to dodge CVE-2026-25645
-# and friends. Older versions still work in a pinch but pip-audit flags them.
-# NS May 2026 — urllib3 floor pushed to 2.0.7 (CVE-2023-43804: Cookie header
-# leaks via cross-origin redirect when allow_redirects not explicitly disabled).
+# Werkzeug explicit pin — defends against transitive resolution that could
+# downgrade to 2.x even with flask>=3 (rare but pip-audit reproducible).
+werkzeug>=3.0.3  # NS: CVE-2024-34069 RCE in debugger pin bypass
+# urllib3 2.5.0+ closes Open Redirect (CVE-2025-50181) on top of the cookie
+# header fix that landed in 2.0.7. 2.6+ adds the deprecation cleanup.
 requests>=2.33.0
-urllib3>=2.0.7
+urllib3>=2.5.0
 
 # === Encryption & Security ===
 # NS May 2026 — cryptography 46.0.6/.0.7 patches CVE-2026-34073 + -39892,
@@ -19,16 +26,33 @@ urllib3>=2.0.7
 cryptography>=46.0.7
 pyopenssl>=26.0.0
 argon2-cffi>=23.0.0
+# pyasn1 0.6.3 fixes the recursion + resource-allocation vulns; transitive
+# via pyopenssl. Explicit pin so scanners stop seeing the old 0.5.x floor.
+pyasn1>=0.6.3
+
+# MK May 2026 — SQLCipher full-DB encryption (AES-256-CBC + HMAC-SHA512).
+# Currently only ships pre-built wheels for Linux x86_64; ARM / macOS /
+# Windows installs will not have it available and PegaProx falls back to
+# plain SQLite with Fernet field-encryption.  See docs/SECURITY.md for
+# the platform matrix and the `--migrate-db` migration tool.
+sqlcipher3-binary>=0.6.0; sys_platform == "linux" and platform_machine == "x86_64"
 
 # === SSH & Console ===
-# NS May 2026 — bump to 3.4.0+ for CVE-2023-48795 (Terrapin attack on the
-# SSH binary packet protocol). 3.4.0 disables the affected mode by default.
-paramiko>=3.4.0
+# NS May 2026 — paramiko 4.0 drops DSSKey (legacy DSA, broken-crypto class).
+# All our DSSKey lookups already use getattr(paramiko, 'DSSKey', None) so
+# we degrade cleanly when the symbol is gone. 3.x stays scanner-flagged Low.
+paramiko>=4.0.0
 websockets>=11.0
 websocket-client>=1.6.0
+# h11 0.16.0 closes the request-smuggling CVE (transitive via wsproto/
+# websocket stack). Pin explicit so scanners stop nagging on 0.14.x.
+h11>=0.16.0
 
 # === Performance (Recommended) ===
-gevent>=23.0.0
+# MK May 2026 — gevent 25.4.1+ fixes 3 CVEs: trusting HTTP permission methods
+# (CVSS 9.3), race condition (CVSS 8.3), and HTTP request smuggling (CVSS 6.9).
+# WSGI handler + monkey.patch_all() unchanged from 23.x — no migration work.
+gevent>=25.4.1
 gevent-websocket>=0.10.0
 
 # === Two-Factor Auth ===
@@ -58,3 +82,10 @@ XenAPI>=23.14.0
 # off the wire (XCP-ng RRD responses, iSCSI probe TGTs). Stops XXE / billion-laughs
 # / external-entity expansion. Pure-Python wrapper — no compile, tiny.
 defusedxml>=0.7.1
+
+# === Transitive pins (scanner hygiene) ===
+# MK May 2026 — these aren't direct deps but old transitive resolutions get
+# flagged by pip-audit / Snyk. Listing them here forces a fresh venv to a
+# floor that doesn't carry known CVEs. Newer versions are pulled automatically.
+setuptools>=78.1.1  # CVE-2024-6345 RCE in package_index, CVE-2025-47273 ReDoS
+zipp>=3.19.1        # CVE-2024-5569 infinite loop in Path._next

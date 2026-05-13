@@ -168,9 +168,9 @@ def collect_metrics_snapshot():
             # Storage totals for capacity forecasting (MK May 2026)
             cluster_data['storage'] = {}
             try:
-                host = mgr.host
+                host, port = mgr.host, mgr.api_port
                 ss = mgr._create_session()
-                sresp = ss.get(f"https://{host}:8006/api2/json/cluster/resources?type=storage", timeout=8)
+                sresp = ss.get(f"https://{host}:{port}/api2/json/cluster/resources?type=storage", timeout=8)
                 if sresp.status_code == 200:
                     seen = set()
                     for s in sresp.json().get('data') or []:

@@ -207,8 +207,18 @@ def _verify_tls_for(target):
 
 def _http_post(url, body_bytes, headers, timeout=10, verify_tls=True):
     """Plain urllib HTTPS POST. MK May 2026 — TLS verification on by default;
-    admins opt out per target if they're shipping to a self-signed SIEM."""
+    admins opt out per target if they're shipping to a self-signed SIEM.
+
+    NS May 2026 — SSRF guard: reject URLs aimed at internal/metadata IPs
+    even when admin sets a malicious endpoint via UI. SIEM targets are
+    almost always public, so this is an honest fit.
+    """
     import ssl
+    from pegaprox.utils.url_security import sanitize_outbound_url, SsrfError
+    try:
+        sanitize_outbound_url(url, allowed_schemes=('https', 'http'))
+    except SsrfError as exc:
+        raise RuntimeError(f"SIEM endpoint rejected: {exc}")
     req = urllib.request.Request(url, data=body_bytes, method='POST', headers=headers)
     if verify_tls:
         ctx = ssl.create_default_context()

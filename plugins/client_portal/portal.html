@@ -275,7 +275,11 @@ async function login(u,p,totpCode){
     }catch(e){S.err='Connection error';}
     S.loading=false;render();
 }
-function logout(){S.sid=null;S.user=null;S.vms=[];S.screen='login';S.err=null;S.modal=null;S.pending2fa=null;S.searchQuery='';S.filterStatus='all';sessionStorage.removeItem('portal-sid');render();}
+function logout(){
+    // MK May 2026 (#396): disconnect any active VNC ws before tearing down state
+    try{if(window._portalRfb){window._portalRfb.disconnect();window._portalRfb=null;}}catch(e){}
+    S.sid=null;S.user=null;S.vms=[];S.screen='login';S.err=null;S.modal=null;S.pending2fa=null;S.searchQuery='';S.filterStatus='all';sessionStorage.removeItem('portal-sid');render();
+}
 
 // NS: Apr 2026 - check if OIDC/LDAP available for portal login
 async function checkAuthProviders(){
@@ -882,7 +886,14 @@ window.pUnmountIso=async function(c,v){
 window.pCreateSnap=function(c,v){const vm=S.vms.find(x=>x.cluster_id===c&&x.vmid===v);const n=document.getElementById('snap-name')?.value||'';if(vm)createSnapshot(vm,n,'');};
 window.pRollback=function(c,v,snapname){const vm=S.vms.find(x=>x.cluster_id===c&&x.vmid===v);if(vm)rollbackSnapshot(vm,snapname);};
 window.pDeleteSnap=function(c,v,snapname){const vm=S.vms.find(x=>x.cluster_id===c&&x.vmid===v);if(vm)deleteSnapshot(vm,snapname);};
-window.closeModal=function(){S.modal=null;render();};
+window.closeModal=function(){
+    // MK May 2026 (#396): if a noVNC console is open, disconnect cleanly so
+    // Proxmox releases the vncproxy task. Without this the server-side ws
+    // stays attached and the next openConsole gets refused until Proxmox
+    // times the prior task out (~30s seen in pvedaemon logs).
+    try{if(window._portalRfb){window._portalRfb.disconnect();window._portalRfb=null;}}catch(e){}
+    S.modal=null;render();
+};
 window.pVncFullscreen=function(){
     const el=document.getElementById('vnc-wrap');
     if(el){

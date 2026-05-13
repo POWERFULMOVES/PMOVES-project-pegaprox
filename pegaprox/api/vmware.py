@@ -755,7 +755,7 @@ def get_vmware_migration_plan(vmware_id, vm_id):
             node_storages = {}
             for n in nodes:
                 try:
-                    sr = cmgr._api_get(f"https://{cmgr.host}:8006/api2/json/nodes/{n}/storage")
+                    sr = cmgr._api_get(f"https://{cmgr.host}:{cmgr.api_port}/api2/json/nodes/{n}/storage")
                     if sr.status_code == 200:
                         node_storages[n] = [s['storage'] for s in sr.json().get('data', [])
                                             if s.get('active') and 'images' in s.get('content', '')]

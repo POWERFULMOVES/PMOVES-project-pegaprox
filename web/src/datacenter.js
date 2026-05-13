@@ -2923,9 +2923,27 @@
                                                             <input value={newStorage.datastore || ''} onChange={e => setNewStorage({...newStorage, datastore: e.target.value})} placeholder="store1" className="w-full bg-proxmox-dark border border-proxmox-border rounded p-2 text-sm" />
                                                         </div>
                                                         <div>
-                                                            <label className="block text-sm text-gray-400 mb-1">Fingerprint</label>
+                                                            <label className="block text-sm text-gray-400 mb-1 flex items-center justify-between">
+                                                                <span>Fingerprint</span>
+                                                                {/* NS May 2026 — auto-fetch + preflight */}
+                                                                {window.PegaProxFingerprintFetcher && React.createElement(window.PegaProxFingerprintFetcher, {
+                                                                    host: newStorage.server,
+                                                                    port: newStorage.port || 8007,
+                                                                    authFetch,
+                                                                    apiUrl: API_URL,
+                                                                    onFetched: (fp) => setNewStorage({...newStorage, fingerprint: fp}),
+                                                                })}
+                                                            </label>
                                                             <input value={newStorage.fingerprint || ''} onChange={e => setNewStorage({...newStorage, fingerprint: e.target.value})} placeholder="optional" className="w-full bg-proxmox-dark border border-proxmox-border rounded p-2 text-sm font-mono text-xs" />
                                                         </div>
+                                                    </div>
+                                                )}
+                                                {/* NS May 2026 — preflight check button for PBS storage */}
+                                                {newStorage.type === 'pbs' && clusterId && window.PegaProxStoragePreflightCheck && (
+                                                    <div className="mt-3">
+                                                        {React.createElement(window.PegaProxStoragePreflightCheck, {
+                                                            clusterId, config: newStorage, authFetch, apiUrl: API_URL,
+                                                        })}
                                                     </div>
                                                 )}
 
@@ -4414,6 +4432,32 @@
                                                     <td className="p-3 text-sm">{job.vmid || t('all')}</td>
                                                     <td className="p-3">
                                                         <div className="flex gap-1">
+                                                            {/* NS May 2026 — Run-Now: triggers vzdump immediately */}
+                                                            <button
+                                                                onClick={async () => {
+                                                                    try {
+                                                                        const r = await authFetch(`${API_URL}/clusters/${clusterId}/datacenter/backup/${job.id}/run`, {
+                                                                            method: 'POST',
+                                                                            headers: { 'Content-Type': 'application/json' },
+                                                                        });
+                                                                        const j = await r.json();
+                                                                        if (r.ok && j.upid && j.upid !== 'OK') {
+                                                                            addToast?.(t('backupRunning') || 'Backup started', 'success');
+                                                                            window.dispatchEvent(new CustomEvent('pegaprox-show-backup-progress', {
+                                                                                detail: { upid: j.upid, node: j.node },
+                                                                            }));
+                                                                        } else if (r.ok) {
+                                                                            addToast?.(t('backupRunning') || 'Backup started', 'success');
+                                                                        } else {
+                                                                            addToast?.(j.error || `HTTP ${r.status}`, 'error');
+                                                                        }
+                                                                    } catch (e) {
+                                                                        addToast?.(String(e), 'error');
+                                                                    }
+                                                                }}
+                                                                className="p-1 hover:bg-green-500/20 rounded text-green-400" title={t('runNow') || 'Run now'}>
+                                                                {Icons.Play ? <Icons.Play className="w-4 h-4" /> : <span>▶</span>}
+                                                            </button>
                                                             <button onClick={() => setEditBackupJob({...job})} className="p-1 hover:bg-blue-500/20 rounded text-blue-400" title="Edit"><Icons.Edit className="w-4 h-4" /></button>
                                                             <button onClick={() => deleteBackupJob(job.id)} className="p-1 hover:bg-red-500/20 rounded text-red-400" title="Delete"><Icons.Trash /></button>
                                                         </div>

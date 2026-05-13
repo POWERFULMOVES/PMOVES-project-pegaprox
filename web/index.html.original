@@ -1106,53 +1106,65 @@
             --corp-shadow-xl: 0 8px 24px rgba(0,0,0,0.4), 0 2px 8px rgba(0,0,0,0.2);
         }
 
-        /* LW: Mar 2026 - vCenter 8 style light mode */
+        /* LW: Mar 2026 — corporate light mode tokens. NS 2026-05-10 retuned:
+           bumped text contrast (was #555/#888 → too washed), darker accent for
+           AA on white, slightly cooler surface base, sharper border on the
+           "subtle" tier so dense tables don't read as a flat block. */
         body[data-corp-theme="light"] {
             /* override base Tailwind color system */
-            --color-dark: #f0f2f5;
-            --color-darker: #e4e8ec;
-            --color-dark-rgb: 240, 242, 245;
-            --color-darker-rgb: 228, 232, 236;
+            --color-dark: #eef1f4;
+            --color-darker: #e2e7ec;
+            --color-dark-rgb: 238, 241, 244;
+            --color-darker-rgb: 226, 231, 236;
             --color-card: #ffffff;
-            --color-border: #cfd8dc;
-            --color-text: #333333;
-            --color-hover: #e8f0f4;
-            --color-orange: #d46b08;
+            --color-border: #c0ccd4;
+            --color-text: #1c2733;
+            --color-hover: #e6eef4;
+            --color-orange: #c2610a;
             /* corporate variables */
             --corp-accent: #0072a3;
-            --corp-selection: #e3f2fd;
-            --corp-text-secondary: #555;
-            --corp-text-muted: #888;
-            --corp-divider: #e0e0e0;
+            --corp-accent-hover: #005a85;
+            --corp-selection: #d6ebf6;
+            --corp-text:           #1c2733;
+            --corp-text-secondary: #44525e;
+            --corp-text-muted:     #6a7782;
+            --corp-divider:        #d8dee3;
             --corp-surface-0: #ffffff;
-            --corp-surface-1: #f5f7f9;
-            --corp-surface-2: #eef1f4;
-            --corp-surface-3: #e4e8ec;
-            --corp-surface-raised: #fff;
-            --corp-border-subtle: #e0e4e8;
-            --corp-border-medium: #cfd8dc;
-            --corp-border-strong: #b0bec5;
-            --corp-header-bg: #f5f7f9;
-            --corp-bar-track: #e8ecef;
-            --corp-shadow-sm: 0 1px 2px rgba(0,0,0,0.06);
-            --corp-shadow-md: 0 2px 6px rgba(0,0,0,0.08);
-            --corp-shadow-lg: 0 4px 12px rgba(0,0,0,0.1);
-            --corp-shadow-xl: 0 8px 24px rgba(0,0,0,0.12);
-            background-color: #f0f2f5 !important;
-            color: #333 !important;
+            --corp-surface-1: #f6f8fa;
+            --corp-surface-2: #ecf1f4;
+            --corp-surface-3: #e0e6ea;
+            --corp-surface-raised: #ffffff;
+            --corp-border-subtle: #dde3e8;
+            --corp-border-medium: #c0ccd4;
+            --corp-border-strong: #97a5b0;
+            --corp-header-bg: #f6f8fa;
+            --corp-bar-track: #e6ebef;
+            --corp-shadow-sm: 0 1px 1px rgba(15,30,50,0.04), 0 1px 2px rgba(15,30,50,0.06);
+            --corp-shadow-md: 0 1px 3px rgba(15,30,50,0.06), 0 2px 6px rgba(15,30,50,0.08);
+            --corp-shadow-lg: 0 2px 6px rgba(15,30,50,0.08), 0 6px 14px rgba(15,30,50,0.10);
+            --corp-shadow-xl: 0 4px 12px rgba(15,30,50,0.10), 0 12px 32px rgba(15,30,50,0.12);
+            background-color: #eef1f4 !important;
+            color: #1c2733 !important;
         }
         /* component-level overrides */
         body[data-corp-theme="light"] .corp-tab-strip button { color: #555; }
         body[data-corp-theme="light"] .corp-tab-strip button.active { color: #0072a3; border-color: #0072a3; }
         body[data-corp-theme="light"] .corp-sidebar-search { background: #fff; border-color: #cfd8dc; color: #333; }
         body[data-corp-theme="light"] .corp-sidebar-search::placeholder { color: #999; }
-        body[data-corp-theme="light"] .corp-datagrid th { background: #f0f2f5 !important; color: #555 !important; }
-        body[data-corp-theme="light"] .corp-datagrid td { border-color: #e8ecef !important; color: #333 !important; }
+        body[data-corp-theme="light"] .corp-datagrid th { background: #f6f8fa !important; color: #44525e !important; border-bottom-color: #c0ccd4 !important; }
+        body[data-corp-theme="light"] .corp-datagrid td { border-color: #ecf1f4 !important; color: #1c2733 !important; }
+        body[data-corp-theme="light"] .corp-datagrid tr:hover td { background: rgba(0,114,163,0.04) !important; }
+        body[data-corp-theme="light"] .corp-datagrid tr.corp-row-selected td { background: rgba(0,114,163,0.10) !important; }
+        body[data-corp-theme="light"] .corp-datagrid tr.corp-row-selected td:first-child { border-left-color: #0072a3 !important; }
         /* MK May 2026 (#296): the dark-mode `.corp-datagrid td` rule sits later
            in the cascade with equal specificity, so without !important the
            inventory overview rows ended up #e9ecef on white = invisible. */
-        body[data-corp-theme="light"] .corp-context-menu { background: #fff; border-color: #ddd; }
-        body[data-corp-theme="light"] .corp-ctx-item:hover { background: #e3f2fd; }
+        body[data-corp-theme="light"] .corp-context-menu { background: #ffffff; border-color: #c0ccd4; box-shadow: 0 6px 20px rgba(15,30,50,0.12); }
+        body[data-corp-theme="light"] .corp-ctx-item { color: #1c2733; }
+        body[data-corp-theme="light"] .corp-ctx-item:hover { background: #ecf1f4; color: #1c2733; }
+        body[data-corp-theme="light"] .corp-dropdown { background: #ffffff !important; border-color: #c0ccd4 !important; box-shadow: 0 6px 20px rgba(15,30,50,0.12) !important; }
+        body[data-corp-theme="light"] .corp-dropdown button { color: #1c2733 !important; }
+        body[data-corp-theme="light"] .corp-dropdown button:hover { background: #ecf1f4 !important; }
         body[data-corp-theme="light"] .corp-node-row:hover { background: #e8f0f4 !important; }
         body[data-corp-theme="light"] .corp-subnav-item:hover { background: #e8f0f4 !important; }
         body[data-corp-theme="light"] .corp-toolbar button:hover { background: rgba(0,0,0,0.06) !important; }
@@ -1167,20 +1179,30 @@
         body[data-corp-theme="light"] .border-proxmox-border { border-color: #cfd8dc !important; }
         body[data-corp-theme="light"] .border-gray-700\/50,
         body[data-corp-theme="light"] .border-gray-700 { border-color: #ddd !important; }
-        body[data-corp-theme="light"] .text-white { color: #333 !important; }
-        body[data-corp-theme="light"] .text-gray-200 { color: #444 !important; }
-        body[data-corp-theme="light"] .text-gray-300 { color: #555 !important; }
-        body[data-corp-theme="light"] .text-gray-400 { color: #777 !important; }
-        body[data-corp-theme="light"] .text-gray-500 { color: #888 !important; }
+        /* NS 2026-05-10 — text contrast bumped (AA on white). Old values were
+           too washed (#555 secondary, #888 muted) — checked AA: failed. */
+        body[data-corp-theme="light"] .text-white { color: #1c2733 !important; }
+        body[data-corp-theme="light"] .text-gray-200 { color: #2a3744 !important; }
+        body[data-corp-theme="light"] .text-gray-300 { color: #3a4754 !important; }
+        body[data-corp-theme="light"] .text-gray-400 { color: #5a6772 !important; }
+        body[data-corp-theme="light"] .text-gray-500 { color: #6a7782 !important; }
+        body[data-corp-theme="light"] .text-gray-600 { color: #818b94 !important; }
         /* override inline style colors — React renders as rgb() not hex */
         body[data-corp-theme="light"] [style*="color: rgb(233, 236, 239)"],
-        body[data-corp-theme="light"] [style*="color: #e9ecef"] { color: #333 !important; }
+        body[data-corp-theme="light"] [style*="color: #e9ecef"] { color: #1c2733 !important; }
         body[data-corp-theme="light"] [style*="color: rgb(114, 139, 154)"],
-        body[data-corp-theme="light"] [style*="color: #728b9a"] { color: #777 !important; }
+        body[data-corp-theme="light"] [style*="color: #728b9a"] { color: #5a6772 !important; }
         body[data-corp-theme="light"] [style*="color: rgb(90, 122, 138)"],
-        body[data-corp-theme="light"] [style*="color: #5a7a8a"] { color: #888 !important; }
+        body[data-corp-theme="light"] [style*="color: #5a7a8a"] { color: #6a7782 !important; }
         body[data-corp-theme="light"] [style*="color: rgb(173, 187, 196)"],
-        body[data-corp-theme="light"] [style*="color: #adbbc4"] { color: #555 !important; }
+        body[data-corp-theme="light"] [style*="color: #adbbc4"] { color: #3a4754 !important; }
+        /* NS 2026-05-10 — also handle white text inline (some component-internal
+           styles use color: #fff or rgb(255,255,255) for emphasis on dark — flip
+           to dark text on light bg). Skip explicit white-on-coloured-bg which
+           is intentional on accent buttons (handled by .corp-vm-btn-primary). */
+        body[data-corp-theme="light"] .corp-vm-modal-body [style*="color: #fff"],
+        body[data-corp-theme="light"] .corp-vm-modal-body [style*="color: rgb(255, 255, 255)"],
+        body[data-corp-theme="light"] .corp-vm-modal-body [style*="color: #ffffff"] { color: #1c2733 !important; }
         /* override inline backgrounds — both hex AND rgb() forms */
         body[data-corp-theme="light"] [style*="background-color: rgb(14, 22, 27)"],
         body[data-corp-theme="light"] [style*="background-color: rgb(17, 26, 33)"],
@@ -1211,15 +1233,31 @@
         body[data-corp-theme="light"] [style*="background: rgb(50, 79, 97)"],
         body[data-corp-theme="light"] [style*="background: #2c4050"],
         body[data-corp-theme="light"] [style*="background: #324f61"] { background: #e3f2fd !important; background-color: #e3f2fd !important; }
-        /* inline borders */
+        /* inline borders — NS 2026-05-10 added #485764 / #3a5060 / #3a5565 +
+           variants. Most legacy code in node_modals.js uses these as 1-px frame
+           borders; without overrides they show as dark grey on light bg = ugly. */
         body[data-corp-theme="light"] [style*="border-color: rgb(40, 56, 68)"],
         body[data-corp-theme="light"] [style*="border-color: rgb(52, 73, 85)"],
         body[data-corp-theme="light"] [style*="border-color: rgb(55, 71, 79)"],
+        body[data-corp-theme="light"] [style*="border-color: rgb(72, 87, 100)"],
+        body[data-corp-theme="light"] [style*="border-color: rgb(58, 80, 96)"],
+        body[data-corp-theme="light"] [style*="border-color: rgb(58, 85, 101)"],
         body[data-corp-theme="light"] [style*="border-color: #283844"],
         body[data-corp-theme="light"] [style*="border-color: #344955"],
         body[data-corp-theme="light"] [style*="border-color: #37474f"],
+        body[data-corp-theme="light"] [style*="border-color: #485764"],
+        body[data-corp-theme="light"] [style*="border-color: #3a5060"],
+        body[data-corp-theme="light"] [style*="border-color: #3a5565"],
         body[data-corp-theme="light"] [style*="border: 1px solid rgb(40, 56, 68)"],
-        body[data-corp-theme="light"] [style*="border: 1px solid rgb(52, 73, 85)"] { border-color: #cfd8dc !important; }
+        body[data-corp-theme="light"] [style*="border: 1px solid rgb(52, 73, 85)"],
+        body[data-corp-theme="light"] [style*="border: 1px solid rgb(72, 87, 100)"],
+        body[data-corp-theme="light"] [style*="border: 1px solid #485764"],
+        body[data-corp-theme="light"] [style*="border: 1px solid #283844"],
+        body[data-corp-theme="light"] [style*="border: 1px solid #344955"],
+        body[data-corp-theme="light"] [style*="border: 1px solid #3a5060"],
+        body[data-corp-theme="light"] [style*="border: 1px solid #3a5565"],
+        body[data-corp-theme="light"] [style*="borderBottom: 1px solid #485764"],
+        body[data-corp-theme="light"] [style*="border-bottom: 1px solid #485764"] { border-color: var(--corp-border-medium, #c0ccd4) !important; }
         /* Tailwind arbitrary bg classes — MK May 2026 (#296) substring matchers
            on class= attribute hold the LITERAL class string, so brackets/hash
            don't get escaped. Earlier version had \\[ \\# \\] in the string which
@@ -1235,7 +1273,9 @@
         body[data-corp-theme="light"] [class*="bg-[#0e161b]"],
         body[data-corp-theme="light"] [class*="bg-[#243542]"],
         body[data-corp-theme="light"] [class*="bg-[#22343c]"],
-        body[data-corp-theme="light"] [class*="bg-[#12181f]"] { background-color: #f5f7f9 !important; }
+        body[data-corp-theme="light"] [class*="bg-[#12181f]"],
+        body[data-corp-theme="light"] [class*="bg-[#0f161a]"],
+        body[data-corp-theme="light"] [class*="bg-[#1c2733]"] { background-color: #f6f8fa !important; }
         body[data-corp-theme="light"] [class*="bg-[#324f61]"],
         body[data-corp-theme="light"] [class*="bg-[#29414e]"],
         body[data-corp-theme="light"] [class*="bg-[#2c4050]"] { background-color: #e8f0f4 !important; }
@@ -1257,12 +1297,16 @@
         body[data-corp-theme="light"] select,
         body[data-corp-theme="light"] textarea { background: #fff !important; color: #333 !important; border-color: #cfd8dc !important; }
         /* sidebar tree */
-        body[data-corp-theme="light"] .corp-inline-tree { background: #f5f7f9 !important; }
-        body[data-corp-theme="light"] .corp-tree-item:hover { background: #e8f0f4 !important; }
+        body[data-corp-theme="light"] .corp-inline-tree { background: #f6f8fa !important; }
+        body[data-corp-theme="light"] .corp-tree-item { color: #1c2733; }
+        body[data-corp-theme="light"] .corp-tree-item:hover { background: #ecf1f4 !important; }
         body[data-corp-theme="light"] .corp-tree-item.selected,
-        body[data-corp-theme="light"] .corp-tree-item[style*="background: var(--corp-selection)"] { background: #e3f2fd !important; }
+        body[data-corp-theme="light"] .corp-tree-item[style*="background: var(--corp-selection)"] {
+            background: #d6ebf6 !important;
+            box-shadow: inset 2px 0 0 #0072a3;
+        }
         /* header */
-        body[data-corp-theme="light"] header { background: #fff !important; border-bottom: 1px solid #ddd !important; }
+        body[data-corp-theme="light"] header { background: #ffffff !important; border-bottom: 1px solid #c0ccd4 !important; box-shadow: 0 1px 0 rgba(15,30,50,0.04); }
         /* scrollbar */
         body[data-corp-theme="light"] ::-webkit-scrollbar-track { background: #f0f2f5; }
         body[data-corp-theme="light"] ::-webkit-scrollbar-thumb { background: #bbb; }
@@ -1270,8 +1314,8 @@
 
         /* NS: Mar 2026 - comprehensive light mode overrides for all corp-* classes */
         /* modals */
-        body[data-corp-theme="light"] .corp-modal-header { background: #f0f2f5 !important; }
-        body[data-corp-theme="light"] .corp-modal-title { color: #333 !important; }
+        body[data-corp-theme="light"] .corp-modal-header { background: linear-gradient(180deg, #ffffff 0%, #f6f8fa 100%) !important; border-color: #c0ccd4 !important; }
+        body[data-corp-theme="light"] .corp-modal-title { color: #1c2733 !important; }
         body[data-corp-theme="light"] .corp-modal-close { color: #888 !important; }
         body[data-corp-theme="light"] .corp-modal-close:hover { color: #333 !important; }
         body[data-corp-theme="light"] .corp-modal-footer { background: #f5f7f9 !important; border-color: #ddd !important; }
@@ -1288,17 +1332,18 @@
         body[data-corp-theme="light"] .corp-subnav-item:hover { background: #e8f0f4 !important; color: #333 !important; }
         body[data-corp-theme="light"] .corp-subnav-header { color: #888 !important; }
         /* content header & title */
-        body[data-corp-theme="light"] .corp-content-header { background: #f0f2f5 !important; border-color: #cfd8dc !important; }
-        body[data-corp-theme="light"] .corp-content-header .corp-header-title { color: #333 !important; }
+        body[data-corp-theme="light"] .corp-content-header { background: #ffffff !important; border-color: #c0ccd4 !important; box-shadow: 0 1px 0 rgba(15,30,50,0.04); }
+        body[data-corp-theme="light"] .corp-content-header .corp-header-title { color: #1c2733 !important; font-weight: 500; }
         /* status bar */
-        body[data-corp-theme="light"] .corp-status-bar { background: #f0f2f5 !important; color: #888 !important; border-color: #ddd !important; }
-        body[data-corp-theme="light"] .corp-status-bar-item { border-color: #ddd !important; }
-        body[data-corp-theme="light"] .corp-status-bar-item strong { color: #333 !important; }
+        body[data-corp-theme="light"] .corp-status-bar { background: #f6f8fa !important; color: #6a7782 !important; border-color: #c0ccd4 !important; }
+        body[data-corp-theme="light"] .corp-status-bar-item { border-color: #c0ccd4 !important; }
+        body[data-corp-theme="light"] .corp-status-bar-item strong { color: #1c2733 !important; }
         /* overview cards */
-        body[data-corp-theme="light"] .corp-overview-card { background: #fff !important; border-color: #cfd8dc !important; }
-        body[data-corp-theme="light"] .corp-overview-label { color: #888 !important; }
-        body[data-corp-theme="light"] .corp-overview-value { color: #333 !important; }
-        body[data-corp-theme="light"] .corp-overview-sub { color: #888 !important; }
+        body[data-corp-theme="light"] .corp-overview-card { background: #ffffff !important; border-color: #c0ccd4 !important; box-shadow: 0 1px 0 rgba(15,30,50,0.04); }
+        body[data-corp-theme="light"] .corp-overview-card:hover { border-color: #97a5b0 !important; box-shadow: 0 1px 4px rgba(15,30,50,0.08); }
+        body[data-corp-theme="light"] .corp-overview-label { color: #6a7782 !important; font-weight: 500; }
+        body[data-corp-theme="light"] .corp-overview-value { color: #1c2733 !important; }
+        body[data-corp-theme="light"] .corp-overview-sub { color: #6a7782 !important; }
         /* LW: Apr 2026 — improved light mode polish */
         body[data-corp-theme="light"] .corp-capacity-bar { background: #e8ecef !important; }
         body[data-corp-theme="light"] .corp-donut-track { stroke: #e0e4e8 !important; }
@@ -1307,13 +1352,14 @@
         body[data-corp-theme="light"] .corp-tasks-date { color: #888 !important; }
         body[data-corp-theme="light"] .corp-consumer-name { color: #333 !important; }
         body[data-corp-theme="light"] .corp-consumer-node { color: #888 !important; }
-        body[data-corp-theme="light"] .corp-toolbar { background: #f5f7f9 !important; border-color: #ddd !important; }
-        body[data-corp-theme="light"] .corp-toolbar button { color: #555 !important; }
-        body[data-corp-theme="light"] .corp-toolbar button:hover { color: #333 !important; }
-        body[data-corp-theme="light"] .corp-toolbar-group { background: #e8ecef !important; }
-        body[data-corp-theme="light"] .corp-view-switcher { background: #f0f2f5 !important; border-color: #cfd8dc !important; }
-        body[data-corp-theme="light"] .corp-view-switcher button { color: #777 !important; }
-        body[data-corp-theme="light"] .corp-view-switcher button.active { background: #0072a3 !important; color: #fff !important; }
+        body[data-corp-theme="light"] .corp-toolbar { background: #ffffff !important; border-color: #c0ccd4 !important; }
+        body[data-corp-theme="light"] .corp-toolbar button { color: #44525e !important; }
+        body[data-corp-theme="light"] .corp-toolbar button:hover { color: #1c2733 !important; background: #f6f8fa !important; }
+        body[data-corp-theme="light"] .corp-toolbar-group { background: #ecf1f4 !important; }
+        body[data-corp-theme="light"] .corp-view-switcher { background: #f6f8fa !important; border-color: #c0ccd4 !important; }
+        body[data-corp-theme="light"] .corp-view-switcher button { color: #5a6772 !important; }
+        body[data-corp-theme="light"] .corp-view-switcher button:hover { color: #1c2733 !important; }
+        body[data-corp-theme="light"] .corp-view-switcher button.active { background: #0072a3 !important; color: #ffffff !important; }
         body[data-corp-theme="light"] .corp-event-log { background: #f5f7f9 !important; border-color: #ddd !important; }
         body[data-corp-theme="light"] .bg-green-500\/10 { background: rgba(34,197,94,0.08) !important; }
         body[data-corp-theme="light"] .bg-red-500\/10 { background: rgba(239,68,68,0.06) !important; }
@@ -1380,8 +1426,8 @@
         body[data-corp-theme="light"] .corp-dc-section-header { background: #f0f2f5 !important; color: #555 !important; border-color: #ddd !important; }
         body[data-corp-theme="light"] .corp-dc-section-icon { color: #0072a3 !important; }
         /* storage cards */
-        body[data-corp-theme="light"] .corp-storage-card { background: #fff !important; border-color: #cfd8dc !important; }
-        body[data-corp-theme="light"] .corp-storage-card:hover { border-color: #90caf9 !important; }
+        body[data-corp-theme="light"] .corp-storage-card { background: #ffffff !important; border-color: #c0ccd4 !important; }
+        body[data-corp-theme="light"] .corp-storage-card:hover { border-color: #0072a3 !important; box-shadow: 0 0 0 1px rgba(0,114,163,0.15); }
         /* node detail grid */
         body[data-corp-theme="light"] .corp-node-detail-grid { background: #f5f7f9 !important; }
         /* skeleton loaders */
@@ -1697,12 +1743,20 @@
         .corp-node-row.node-maintenance { border-left-color: #efc006; }
         .corp-node-row.node-offline { border-left-color: #f54f47; }
 
-        /* Corporate tab strip (Clarity tabs) - transparent bg, underline active */
+        /* Corporate tab strip (flat tabs) - transparent bg, underline active.
+           NS 2026-05-10: tighter padding (8/14), focus-visible ring, light-mode
+           hover that doesn't tint the bg cyan. */
         .corp-tab-strip { border-bottom: 1px solid var(--corp-border-medium, #344955); display: flex; gap: 0; padding: 0 8px; background: transparent; }
-        .corp-tab-strip button { padding: 9px 16px; font-size: 13px; color: var(--corp-text-secondary, #adbbc4); border: none; background: none;
-            cursor: pointer; margin-bottom: -1px; border-bottom: 2px solid transparent; white-space: nowrap; display: flex; align-items: center; gap: 6px; }
-        .corp-tab-strip button:hover { color: var(--color-text, #e9ecef); background: rgba(73,175,217,0.06); }
-        .corp-tab-strip button.active { color: var(--color-text, #e9ecef); font-weight: 600; background: rgba(73,175,217,0.08); border-bottom-color: var(--corp-accent); }
+        .corp-tab-strip button { padding: 8px 14px; font-size: 12.5px; color: var(--corp-text-secondary, #adbbc4); border: none; background: none;
+            cursor: pointer; margin-bottom: -1px; border-bottom: 2px solid transparent; white-space: nowrap; display: flex; align-items: center; gap: 6px;
+            font-family: inherit; transition: color .12s, border-color .12s, background .12s; }
+        .corp-tab-strip button:hover { color: var(--color-text, #e9ecef); background: rgba(73,175,217,0.05); }
+        .corp-tab-strip button.active { color: var(--color-text, #e9ecef); font-weight: 500; background: rgba(73,175,217,0.08); border-bottom-color: var(--corp-accent); }
+        .corp-tab-strip button:focus-visible { outline: 2px solid var(--corp-accent, #49afd9); outline-offset: -2px; }
+        [data-corp-theme="light"] .corp-tab-strip { border-bottom-color: #c0ccd4; }
+        [data-corp-theme="light"] .corp-tab-strip button { color: #44525e; }
+        [data-corp-theme="light"] .corp-tab-strip button:hover { color: #1c2733; background: rgba(0,114,163,0.05); }
+        [data-corp-theme="light"] .corp-tab-strip button.active { color: #1c2733; background: rgba(0,114,163,0.07); border-bottom-color: #0072a3; }
 
         /* Corporate section headers */
         .corp-section-header { font-size: 11px; font-weight: 600; color: var(--corp-text-muted, #728b9a); text-transform: uppercase;
@@ -1738,6 +1792,643 @@
         .corp-subnav-item:hover { color: var(--color-text, #e9ecef); background: rgba(73, 175, 217, 0.06); }
         .corp-subnav-item.active { background: var(--corp-selection, #324f61); border-left-color: var(--corp-accent, #49afd9); color: var(--color-text, #e9ecef); }
         .corp-subnav-header { padding: 8px 12px 4px; font-size: 11px; font-weight: 600; color: var(--corp-text-muted, #728b9a); text-transform: uppercase; letter-spacing: 0.05em; }
+
+        /* ============================================================
+           NS May 2026 — VM Configure modal (Corporate layout, corporate flat style)
+           ============================================================
+           Drives the redesigned Configure modal. Goals: flat surfaces,
+           thin dividers, light-weight title typography, narrow sidebar
+           tab tree (where applicable), property-list rows. Avoids the
+           Modern dark-pill tab look that felt foreign in Corporate. */
+        .corp-vm-modal-overlay {
+            position: fixed; inset: 0; z-index: 50;
+            display: flex; align-items: stretch; justify-content: center;
+            background: rgba(0, 0, 0, 0.55);
+            backdrop-filter: saturate(120%) blur(2px);
+            -webkit-backdrop-filter: saturate(120%) blur(2px);
+            padding: 16px;
+        }
+        .corp-vm-modal {
+            width: 100%;
+            max-width: 1400px;
+            max-height: 100%;
+            display: flex; flex-direction: column;
+            background: var(--corp-surface-1, #111a21);
+            border: 1px solid var(--corp-border-medium, #344955);
+            border-radius: 4px;
+            box-shadow: var(--corp-shadow-xl, 0 8px 24px rgba(0,0,0,0.4));
+            overflow: hidden;
+        }
+        [data-corp-theme="light"] .corp-vm-modal {
+            background: #ffffff;
+            border-color: #c0ccd4;
+        }
+
+        /* Top header bar — VM identity + actions. NS 2026-05-10: subtle
+           inset shadow on light mode adds depth without breaking flat style. */
+        .corp-vm-modal-header {
+            display: flex; align-items: center; justify-content: space-between;
+            gap: 16px;
+            padding: 14px 20px 12px;
+            border-bottom: 1px solid var(--corp-border-subtle, #283844);
+            background: var(--corp-header-bg, #1a2730);
+            min-height: 60px;
+        }
+        [data-corp-theme="light"] .corp-vm-modal-header {
+            background: linear-gradient(180deg, #ffffff 0%, #f6f8fa 100%);
+            border-bottom-color: #c0ccd4;
+        }
+        .corp-vm-modal-header-left {
+            display: flex; align-items: center; gap: 12px; min-width: 0; flex: 1;
+        }
+        .corp-vm-type-pill {
+            display: inline-flex; align-items: center; justify-content: center;
+            min-width: 36px; height: 22px; padding: 0 8px;
+            font-size: 11px; font-weight: 700; letter-spacing: 0.06em;
+            font-family: 'JetBrains Mono', 'SF Mono', ui-monospace, monospace;
+            color: #fff;
+            background: var(--corp-accent, #49afd9);
+            border-radius: 3px;
+            flex-shrink: 0;
+        }
+        .corp-vm-type-pill.lxc { background: #8b5cf6; }
+        .corp-vm-modal-title-block { min-width: 0; flex: 1; }
+        .corp-vm-modal-title {
+            font-size: 17px;
+            font-weight: 400;
+            letter-spacing: -0.01em;
+            color: var(--color-text, #e9ecef);
+            line-height: 1.25;
+            margin: 0;
+            white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        }
+        [data-corp-theme="light"] .corp-vm-modal-title { color: #1c2733; font-weight: 500; }
+        .corp-vm-modal-meta {
+            display: flex; align-items: center; gap: 8px;
+            font-size: 11.5px;
+            color: var(--corp-text-muted, #728b9a);
+            margin-top: 3px;
+        }
+        [data-corp-theme="light"] .corp-vm-modal-meta { color: #6a7782; }
+        .corp-vm-modal-meta .corp-meta-sep { opacity: 0.5; }
+        .corp-vm-modal-actions {
+            display: flex; align-items: center; gap: 8px;
+            flex-shrink: 0;
+        }
+        .corp-unsaved-pill {
+            display: inline-flex; align-items: center; gap: 6px;
+            padding: 3px 10px; font-size: 11px; font-weight: 500;
+            background: rgba(239, 192, 6, 0.12);
+            color: #efc006;
+            border: 1px solid rgba(239, 192, 6, 0.32);
+            border-radius: 3px;
+        }
+        .corp-unsaved-pill::before {
+            content: ''; width: 6px; height: 6px; border-radius: 50%;
+            background: #efc006;
+            animation: corp-pulse 1.6s ease-in-out infinite;
+        }
+        @keyframes corp-pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+
+        /* Action buttons inside the modal header. NS 2026-05-10: tighter
+           padding (5/12), explicit focus-visible ring, light-mode hover that
+           uses surface tint instead of accent-tint (reads cleaner on white). */
+        .corp-vm-btn {
+            display: inline-flex; align-items: center; gap: 6px;
+            padding: 5px 12px;
+            font-size: 12.5px; font-weight: 500;
+            border-radius: 3px;
+            border: 1px solid transparent;
+            cursor: pointer;
+            transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease, box-shadow 0.12s ease;
+            font-family: inherit;
+            line-height: 1.2;
+        }
+        .corp-vm-btn:focus-visible {
+            outline: none;
+            box-shadow: 0 0 0 2px var(--corp-accent, #49afd9);
+        }
+        .corp-vm-btn-primary {
+            background: var(--corp-accent, #49afd9);
+            color: #fff;
+            border-color: var(--corp-accent, #49afd9);
+        }
+        .corp-vm-btn-primary:hover { filter: brightness(1.08); }
+        [data-corp-theme="light"] .corp-vm-btn-primary {
+            background: #0072a3;
+            border-color: #0072a3;
+            color: #fff;
+        }
+        [data-corp-theme="light"] .corp-vm-btn-primary:hover {
+            background: #005a85;
+            border-color: #005a85;
+            filter: none;
+        }
+        .corp-vm-btn-primary:disabled {
+            opacity: 0.45; cursor: not-allowed;
+            filter: none;
+        }
+        .corp-vm-btn-ghost {
+            background: transparent;
+            color: var(--corp-text-secondary, #adbbc4);
+            border-color: var(--corp-border-medium, #344955);
+        }
+        .corp-vm-btn-ghost:hover {
+            background: rgba(73, 175, 217, 0.06);
+            color: var(--color-text, #e9ecef);
+            border-color: var(--corp-accent, #49afd9);
+        }
+        [data-corp-theme="light"] .corp-vm-btn-ghost {
+            color: #44525e;
+            border-color: #c0ccd4;
+            background: #ffffff;
+        }
+        [data-corp-theme="light"] .corp-vm-btn-ghost:hover {
+            background: #f6f8fa;
+            color: #1c2733;
+            border-color: #97a5b0;
+        }
+        .corp-vm-btn-danger-ghost {
+            background: transparent;
+            color: var(--corp-text-secondary, #adbbc4);
+            border-color: var(--corp-border-medium, #344955);
+        }
+        .corp-vm-btn-danger-ghost:hover {
+            background: rgba(245, 79, 71, 0.08);
+            color: #f54f47;
+            border-color: rgba(245, 79, 71, 0.4);
+        }
+        [data-corp-theme="light"] .corp-vm-btn-danger-ghost {
+            color: #44525e;
+            border-color: #c0ccd4;
+            background: #ffffff;
+        }
+        [data-corp-theme="light"] .corp-vm-btn-danger-ghost:hover {
+            background: rgba(220, 38, 38, 0.06);
+            color: #c8262a;
+            border-color: rgba(220, 38, 38, 0.40);
+        }
+
+        /* Tab strip — sits below the header. NS 2026-05-10: tighter rhythm
+           (10/14 padding), 12.5px font for denser feel, shadow-inset bottom
+           border on light mode for cleaner separation, and a focus-visible
+           ring for keyboard nav. */
+        .corp-vm-modal-tabs {
+            display: flex; align-items: center;
+            gap: 0;
+            padding: 0 10px;
+            background: var(--corp-surface-2, #1a2730);
+            border-bottom: 1px solid var(--corp-border-medium, #344955);
+            overflow-x: auto;
+            scrollbar-width: none;
+        }
+        [data-corp-theme="light"] .corp-vm-modal-tabs {
+            background: #f6f8fa;
+            border-bottom-color: #c0ccd4;
+            box-shadow: inset 0 -1px 0 rgba(15,30,50,0.04);
+        }
+        .corp-vm-modal-tabs::-webkit-scrollbar { display: none; }
+        .corp-vm-modal-tab {
+            display: inline-flex; align-items: center; gap: 7px;
+            padding: 10px 14px;
+            font-size: 12.5px; font-weight: 400;
+            color: var(--corp-text-secondary, #adbbc4);
+            background: none; border: none;
+            border-bottom: 2px solid transparent;
+            cursor: pointer; white-space: nowrap;
+            margin-bottom: -1px;
+            font-family: inherit;
+            letter-spacing: -0.005em;
+            transition: color 0.12s, border-color 0.12s, background 0.12s;
+        }
+        .corp-vm-modal-tab:hover {
+            color: var(--color-text, #e9ecef);
+            background: rgba(73, 175, 217, 0.04);
+        }
+        [data-corp-theme="light"] .corp-vm-modal-tab:hover {
+            color: #1c2733;
+            background: rgba(0, 114, 163, 0.05);
+        }
+        .corp-vm-modal-tab:focus-visible {
+            outline: 2px solid var(--corp-accent, #49afd9);
+            outline-offset: -2px;
+        }
+        .corp-vm-modal-tab.active {
+            color: var(--corp-accent, #49afd9);
+            border-bottom-color: var(--corp-accent, #49afd9);
+            font-weight: 500;
+        }
+        [data-corp-theme="light"] .corp-vm-modal-tab.active {
+            color: var(--corp-accent, #0072a3);
+            border-bottom-color: var(--corp-accent, #0072a3);
+        }
+
+        /* Body — the form area. NS 2026-05-10: explicit text colour so labels
+           inherit cleanly in light mode without relying on the global override
+           cascade. */
+        .corp-vm-modal-body {
+            flex: 1;
+            overflow-y: auto;
+            background: var(--corp-surface-1, #111a21);
+            color: var(--color-text, #e9ecef);
+            padding: 20px 24px;
+        }
+        [data-corp-theme="light"] .corp-vm-modal-body {
+            background: #ffffff;
+            color: #1c2733;
+        }
+        /* Inputs inside the modal body — explicit light-mode polish so they
+           match the surrounding chrome (the global form override misses some
+           because Tailwind utilities outrank it on specificity). */
+        [data-corp-theme="light"] .corp-vm-modal-body input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
+        [data-corp-theme="light"] .corp-vm-modal-body select,
+        [data-corp-theme="light"] .corp-vm-modal-body textarea {
+            background: #ffffff !important;
+            color: #1c2733 !important;
+            border: 1px solid #c0ccd4 !important;
+            border-radius: 3px !important;
+            padding: 6px 8px !important;
+        }
+        [data-corp-theme="light"] .corp-vm-modal-body input:focus,
+        [data-corp-theme="light"] .corp-vm-modal-body select:focus,
+        [data-corp-theme="light"] .corp-vm-modal-body textarea:focus {
+            border-color: #0072a3 !important;
+            outline: none !important;
+            box-shadow: 0 0 0 3px rgba(0,114,163,0.15) !important;
+        }
+        [data-corp-theme="light"] .corp-vm-modal-body label {
+            color: #1c2733;
+        }
+
+        /* Property list — corporate flat style key/value */
+        .corp-prop-list {
+            display: grid;
+            grid-template-columns: minmax(160px, 220px) 1fr;
+            row-gap: 0;
+            column-gap: 24px;
+        }
+        .corp-prop-list .corp-prop-row {
+            display: contents;
+        }
+        .corp-prop-list .corp-prop-label,
+        .corp-prop-list .corp-prop-value {
+            padding: 9px 0;
+            border-bottom: 1px solid var(--corp-border-subtle, #283844);
+            font-size: 13px;
+            min-height: 38px;
+            display: flex; align-items: center;
+        }
+        [data-corp-theme="light"] .corp-prop-list .corp-prop-label,
+        [data-corp-theme="light"] .corp-prop-list .corp-prop-value {
+            border-bottom-color: #e9ecef;
+        }
+        .corp-prop-list .corp-prop-label {
+            color: var(--corp-text-muted, #728b9a);
+            font-weight: 400;
+        }
+        .corp-prop-list .corp-prop-value {
+            color: var(--color-text, #e9ecef);
+        }
+        .corp-prop-list .corp-prop-row:last-child .corp-prop-label,
+        .corp-prop-list .corp-prop-row:last-child .corp-prop-value {
+            border-bottom: none;
+        }
+
+        /* Section header inside the modal body */
+        .corp-vm-section-title {
+            font-size: 12px; font-weight: 600;
+            color: var(--corp-text-muted, #728b9a);
+            text-transform: uppercase; letter-spacing: 0.08em;
+            padding: 16px 0 10px;
+            border-bottom: 1px solid var(--corp-border-subtle, #283844);
+            margin-bottom: 12px;
+        }
+        [data-corp-theme="light"] .corp-vm-section-title {
+            border-bottom-color: #c0ccd4;
+            color: #6a7782;
+        }
+        .corp-vm-section-title:first-child {
+            padding-top: 0;
+        }
+
+        /* Loading / error states inside the modal body */
+        .corp-vm-modal-state {
+            display: flex; flex-direction: column;
+            align-items: center; justify-content: center;
+            min-height: 320px;
+            text-align: center;
+        }
+        .corp-vm-spinner {
+            width: 32px; height: 32px;
+            border: 2px solid var(--corp-border-medium, #344955);
+            border-top-color: var(--corp-accent, #49afd9);
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        /* ============================================================
+           NS May 2026 — VM/CT Create wizard chrome (Corporate)
+           ============================================================
+           Reuses corp-vm-modal-overlay/corp-vm-modal/corp-vm-modal-header
+           but adds a numbered stepper, footer bar, and a small warning row. */
+
+        /* Warning strip between header and stepper (e.g. no nodes available) */
+        .corp-vm-modal-warning {
+            display: flex; align-items: center; gap: 8px;
+            padding: 8px 20px;
+            font-size: 12px;
+            color: #efc006;
+            background: rgba(239, 192, 6, 0.10);
+            border-bottom: 1px solid rgba(239, 192, 6, 0.30);
+        }
+
+        /* Numbered stepper (numbered "1 — Edit settings — 2 — …" wizard pattern) */
+        .corp-vm-stepper {
+            display: flex; align-items: stretch;
+            padding: 14px 20px 14px;
+            background: var(--corp-surface-2, #1a2730);
+            border-bottom: 1px solid var(--corp-border-medium, #344955);
+            overflow-x: auto;
+            scrollbar-width: none;
+        }
+        [data-corp-theme="light"] .corp-vm-stepper {
+            background: #fafbfc;
+            border-bottom-color: #e0e4e8;
+        }
+        .corp-vm-stepper::-webkit-scrollbar { display: none; }
+
+        .corp-vm-step {
+            display: inline-flex; align-items: center; gap: 8px;
+            padding: 4px 8px 4px 4px;
+            background: none; border: none;
+            color: var(--corp-text-muted, #728b9a);
+            font-size: 12.5px; font-weight: 400;
+            cursor: pointer;
+            position: relative;
+            white-space: nowrap;
+            font-family: inherit;
+            transition: color 0.15s;
+        }
+        .corp-vm-step:disabled { cursor: not-allowed; }
+        .corp-vm-step-num {
+            display: inline-flex; align-items: center; justify-content: center;
+            width: 22px; height: 22px;
+            border-radius: 50%;
+            background: var(--corp-surface-3, #243542);
+            border: 1px solid var(--corp-border-medium, #344955);
+            color: var(--corp-text-secondary, #adbbc4);
+            font-size: 11px; font-weight: 600;
+            flex-shrink: 0;
+        }
+        [data-corp-theme="light"] .corp-vm-step-num {
+            background: #f0f2f5;
+            border-color: #cfd8dc;
+            color: #555;
+        }
+        .corp-vm-step-label {
+            color: var(--corp-text-secondary, #adbbc4);
+            font-size: 12.5px;
+        }
+        .corp-vm-step-line {
+            width: 28px; height: 1px;
+            background: var(--corp-border-medium, #344955);
+            margin: 0 4px;
+            flex-shrink: 0;
+        }
+        [data-corp-theme="light"] .corp-vm-step-line {
+            background: #cfd8dc;
+        }
+
+        .corp-vm-step.active .corp-vm-step-num {
+            background: var(--corp-accent, #49afd9);
+            border-color: var(--corp-accent, #49afd9);
+            color: #fff;
+            box-shadow: 0 0 0 3px rgba(73, 175, 217, 0.16);
+        }
+        .corp-vm-step.active .corp-vm-step-label {
+            color: var(--corp-accent, #49afd9);
+            font-weight: 500;
+        }
+        [data-corp-theme="light"] .corp-vm-step.active .corp-vm-step-num {
+            background: var(--corp-accent, #0072a3);
+            border-color: var(--corp-accent, #0072a3);
+            box-shadow: 0 0 0 3px rgba(0, 114, 163, 0.16);
+        }
+        [data-corp-theme="light"] .corp-vm-step.active .corp-vm-step-label {
+            color: var(--corp-accent, #0072a3);
+        }
+
+        .corp-vm-step.done .corp-vm-step-num {
+            background: var(--corp-accent, #49afd9);
+            border-color: var(--corp-accent, #49afd9);
+            color: #fff;
+        }
+        .corp-vm-step.done .corp-vm-step-label {
+            color: var(--color-text, #e9ecef);
+        }
+        [data-corp-theme="light"] .corp-vm-step.done .corp-vm-step-label {
+            color: #1a1a1a;
+        }
+        .corp-vm-step.done + .corp-vm-step .corp-vm-step-line,
+        .corp-vm-step.done .corp-vm-step-line {
+            background: var(--corp-accent, #49afd9);
+        }
+
+        .corp-vm-step:hover:not(:disabled) .corp-vm-step-label {
+            color: var(--color-text, #e9ecef);
+        }
+        [data-corp-theme="light"] .corp-vm-step:hover:not(:disabled) .corp-vm-step-label {
+            color: #1a1a1a;
+        }
+
+        /* Footer bar with Back / Cancel / Next / Create buttons */
+        .corp-vm-modal-footer {
+            display: flex; align-items: center; justify-content: space-between;
+            gap: 12px;
+            padding: 12px 20px;
+            border-top: 1px solid var(--corp-border-subtle, #283844);
+            background: var(--corp-header-bg, #1a2730);
+        }
+        [data-corp-theme="light"] .corp-vm-modal-footer {
+            background: #f6f8fa;
+            border-top-color: #c0ccd4;
+            box-shadow: inset 0 1px 0 rgba(15,30,50,0.04);
+        }
+
+        /* Create-button uses the success/green palette to set it apart from Next */
+        .corp-vm-btn-create {
+            display: inline-flex; align-items: center; gap: 6px;
+            padding: 6px 16px;
+            font-size: 12.5px; font-weight: 500;
+            background: #60b515;
+            color: #fff;
+            border: 1px solid #60b515;
+            border-radius: 3px;
+            cursor: pointer;
+            font-family: inherit;
+            transition: filter 0.15s;
+        }
+        .corp-vm-btn-create:hover:not(:disabled) { filter: brightness(1.08); }
+        .corp-vm-btn-create:disabled {
+            opacity: 0.45; cursor: not-allowed;
+        }
+
+        /* LW: Snapshot Overview tab — flat corporate table */
+        .corp-snap-overview {
+            background: var(--corp-surface-1, #111a21);
+            border: 1px solid var(--corp-border-medium, #344955);
+            display: flex; flex-direction: column;
+        }
+        [data-corp-theme="light"] .corp-snap-overview {
+            background: #ffffff; border-color: #d4dae0;
+        }
+        .corp-snap-overview-header {
+            display: flex; align-items: center; justify-content: space-between;
+            gap: 12px;
+            padding: 14px 20px 12px;
+            border-bottom: 1px solid var(--corp-border-subtle, #283844);
+            background: var(--corp-header-bg, #1a2730);
+        }
+        [data-corp-theme="light"] .corp-snap-overview-header {
+            background: #f7f9fa; border-bottom-color: #e0e4e8;
+        }
+        .corp-snap-empty {
+            padding: 48px 20px; text-align: center;
+            background: var(--corp-surface-1);
+        }
+        [data-corp-theme="light"] .corp-snap-empty { background: #ffffff; }
+        .corp-snap-table-wrap {
+            overflow-x: auto;
+            background: var(--corp-surface-1);
+        }
+        [data-corp-theme="light"] .corp-snap-table-wrap { background: #ffffff; }
+        .corp-snap-table {
+            width: 100%; border-collapse: collapse;
+        }
+        .corp-snap-table thead th {
+            background: var(--corp-surface-0, #0e161b);
+            color: var(--corp-text-secondary, #adbbc4);
+            font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em;
+            font-weight: 600;
+            padding: 8px 14px;
+            border-bottom: 2px solid var(--corp-border-medium, #344955);
+            text-align: left; cursor: pointer; white-space: nowrap;
+        }
+        [data-corp-theme="light"] .corp-snap-table thead th {
+            background: #f0f3f5; color: #455560; border-bottom-color: #cfd8dc;
+        }
+        .corp-snap-table thead th:hover { color: var(--color-text, #e9ecef); }
+        .corp-snap-table tbody td {
+            padding: 8px 14px; font-size: 13px;
+            border-bottom: 1px solid var(--corp-border-subtle, #283844);
+            color: var(--color-text, #e9ecef);
+        }
+        [data-corp-theme="light"] .corp-snap-table tbody td {
+            color: #1c2733; border-bottom-color: #ebeef1;
+        }
+        .corp-snap-table tbody tr:hover td { background: rgba(73,175,217,0.04); }
+        [data-corp-theme="light"] .corp-snap-table tbody tr:hover td { background: rgba(0,114,163,0.04); }
+        .corp-snap-mono {
+            font-family: 'JetBrains Mono', 'SF Mono', ui-monospace, monospace;
+            font-size: 12px;
+        }
+        .corp-snap-age { color: #efc006; }
+        [data-corp-theme="light"] .corp-snap-age { color: #b78b00; }
+        .corp-snap-action { text-align: right; width: 60px; }
+        .corp-snap-type-pill {
+            display: inline-flex; align-items: center; justify-content: center;
+            min-width: 32px; padding: 1px 8px;
+            font-size: 10.5px; font-weight: 600; letter-spacing: 0.05em;
+            border: 1px solid; border-radius: 3px;
+        }
+        .corp-snap-delete {
+            background: none; border: none; cursor: pointer;
+            color: #f54f47; padding: 4px;
+            opacity: 0; transition: opacity 0.15s, color 0.15s;
+        }
+        .corp-snap-table tr:hover .corp-snap-delete { opacity: 1; }
+        .corp-snap-delete:hover { color: #ff7a73; }
+        [data-corp-theme="light"] .corp-snap-delete { color: #c8262a; }
+        [data-corp-theme="light"] .corp-snap-delete:hover { color: #ff5a52; }
+
+        /* LW: Topology view chrome (corporate) */
+        .corp-topo-frame {
+            background: var(--corp-surface-1, #111a21);
+            border: 1px solid var(--corp-border-medium, #344955);
+            display: flex; flex-direction: column;
+        }
+        [data-corp-theme="light"] .corp-topo-frame {
+            background: #ffffff; border-color: #d4dae0;
+        }
+        .corp-topo-header {
+            display: flex; align-items: center; justify-content: space-between;
+            gap: 12px;
+            padding: 12px 16px 10px;
+            border-bottom: 1px solid var(--corp-border-subtle, #283844);
+            background: var(--corp-header-bg, #1a2730);
+        }
+        [data-corp-theme="light"] .corp-topo-header {
+            background: #f7f9fa; border-bottom-color: #e0e4e8;
+        }
+        /* underline-tab toggle, similar to corp-vm-modal-tab */
+        .corp-topo-toggle { display: inline-flex; align-items: center; }
+        .corp-topo-toggle > button {
+            display: inline-flex; align-items: center;
+            padding: 6px 12px;
+            font-size: 12px; font-weight: 400;
+            color: var(--corp-text-secondary, #adbbc4);
+            background: none; border: none;
+            border-bottom: 2px solid transparent;
+            cursor: pointer;
+            transition: color 0.12s, border-color 0.12s, background 0.12s;
+        }
+        .corp-topo-toggle > button:hover {
+            color: var(--color-text, #e9ecef);
+            background: rgba(73,175,217,0.04);
+        }
+        .corp-topo-toggle > button.active {
+            color: var(--corp-accent, #49afd9);
+            border-bottom-color: var(--corp-accent, #49afd9);
+            font-weight: 500;
+        }
+        [data-corp-theme="light"] .corp-topo-toggle > button.active {
+            color: var(--corp-accent, #0072a3);
+            border-bottom-color: var(--corp-accent, #0072a3);
+        }
+        .corp-topo-frame > div:not(.corp-topo-header) {
+            padding: 14px 16px;
+        }
+
+        /* LW: per-VM snapshot rows (tree view) */
+        .corp-snap-row {
+            padding: 8px 12px;
+            background: var(--corp-surface-2, #1a2733);
+            border: 1px solid var(--corp-border-subtle, #283844);
+            margin-bottom: 4px;
+            transition: border-color 0.15s, background 0.15s;
+        }
+        [data-corp-theme="light"] .corp-snap-row {
+            background: #fafbfc; border-color: #e0e4e8;
+        }
+        .corp-snap-row:hover {
+            border-color: rgba(73,175,217,0.35);
+            background: rgba(73,175,217,0.04);
+        }
+        [data-corp-theme="light"] .corp-snap-row:hover {
+            border-color: rgba(0,114,163,0.35);
+            background: rgba(0,114,163,0.03);
+        }
+        .corp-snap-pill {
+            display: inline-flex; align-items: center;
+            padding: 1px 7px; font-size: 10px; font-weight: 600;
+            letter-spacing: 0.04em;
+            border: 1px solid; border-radius: 2px;
+        }
+
         .corp-capacity-bar { height: 7px; background: var(--corp-bar-track); overflow: hidden; border-radius: 2px; }
         .corp-capacity-bar > div { height: 100%; transition: width 0.3s ease; border-radius: 2px; }
         .corp-badge-online { background: rgba(96, 181, 21, 0.15); color: #60b515; border: 1px solid rgba(96, 181, 21, 0.3); }

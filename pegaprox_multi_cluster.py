@@ -62,6 +62,31 @@ import warnings
 warnings.filterwarnings('ignore', message='coroutine.*was never awaited')
 warnings.filterwarnings('ignore', category=RuntimeWarning, module='asyncio')
 
+# NS May 2026 — disable PerMessageDeflate in simple-websocket. The library
+# hard-codes the extension on AcceptConnection which causes it to send
+# RSV1=1 frames even when negotiation didn't take place, making strict
+# RFC-6455 clients (Node ws, browsers in some setups) reject every frame
+# with "RSV1 must be clear". We patch the AcceptConnection call to pass
+# an empty extensions list so framing stays vanilla.
+def _disable_simple_websocket_deflate():
+    try:
+        import simple_websocket.ws as _swws
+        from wsproto.events import AcceptConnection as _Accept
+        _orig = _swws.Server._handle_events
+        # Replace the hard-coded extension with no extensions on the
+        # AcceptConnection emission. We monkey-patch by overriding the
+        # AcceptConnection class so any kw passed gets stripped.
+        class _NoExtAccept(_Accept):
+            def __init__(self, *a, **kw):
+                kw.pop('extensions', None)
+                super().__init__(*a, **kw)
+        _swws.AcceptConnection = _NoExtAccept
+        print('[ws-patch] simple-websocket PerMessageDeflate disabled')
+    except Exception as _e:
+        print(f'[ws-patch] could not disable deflate: {_e}')
+
+_disable_simple_websocket_deflate()
+
 
 def print_system_requirements():
     """Print recommended system requirements"""
@@ -119,6 +144,32 @@ if __name__ == '__main__':
         print_system_requirements()
     elif '--download-static' in sys.argv:
         download_static_files()
+    # MK May 2026 — DB-migration + key-management CLI subcommands.
+    # These short-circuit the normal server startup so an admin can run
+    # them on a stopped instance without --debug spinning up gevent etc.
+    elif '--migrate-db' in sys.argv:
+        from pegaprox.cli.migrate_db import main as _migrate_main
+        sub_args = [a for a in sys.argv[1:] if a != '--migrate-db']
+        sys.exit(_migrate_main(sub_args))
+    elif '--print-key' in sys.argv:
+        # Print the resolved master key (base64) — for use by `systemd-creds
+        # encrypt`, secret-manager handoff, or `.env` setup.  Output goes to
+        # stdout only; stderr gets a one-line provenance note.
+        from pegaprox.core.keystore import load_master_key
+        mk = load_master_key()
+        sys.stderr.write(f"[KEYSTORE] master key source: {mk.source}"
+                          f"{' (' + mk.source_path + ')' if mk.source_path else ''}\n")
+        sys.stdout.buffer.write(mk.key_b64)
+        sys.stdout.flush()
+        sys.exit(0)
+    elif '--keystore-status' in sys.argv:
+        # Human-readable status of the current key + DB-backend.
+        import json as _json
+        from pegaprox.core.keystore import health_status as _ks_health
+        from pegaprox.core.dbcrypto import backend_status as _db_status
+        print(_json.dumps({'keystore': _ks_health(), 'db': _db_status()},
+                           indent=2))
+        sys.exit(0)
     elif '--help' in sys.argv or '-h' in sys.argv:
         print("""
 PegaProx Server
@@ -130,10 +181,16 @@ Options:
   --debug           verbose logging
   --requirements    show requirements
   --download-static download js libs for offline mode
+  --migrate-db      migrate plain SQLite DB to SQLCipher (see --migrate-db --help)
+  --print-key       print the resolved master key (base64) to stdout
+  --keystore-status JSON dump of key-source + DB-backend status
   --help, -h        this message
 
 Env vars:
-  PEGAPROX_ALLOWED_ORIGINS  cors origins
+  PEGAPROX_DB_KEY            master key (urlsafe-base64 or hex)
+  PEGAPROX_KEY_FILE          path to key file (overrides default lookup chain)
+  CREDENTIALS_DIRECTORY      systemd LoadCredentialEncrypted directory
+  PEGAPROX_ALLOWED_ORIGINS   cors origins
   PEGAPROX_MAX_REQUEST_SIZE  max API request size (default 10MB)
   PEGAPROX_MAX_UPLOAD_SIZE   max file upload size (default 4GB)
   PEGAPROX_HTTP_PORT         http port for redirect (default 80)

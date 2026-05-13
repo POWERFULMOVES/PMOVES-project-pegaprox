@@ -87,7 +87,7 @@
                 );
             }
 
-            // corporate layout - split pane like vCenter
+            // corporate layout - split pane
             if (isCorporate) {
                 return (
                     <div className="flex h-full" style={{minHeight: '500px'}}>

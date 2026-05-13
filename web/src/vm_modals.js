@@ -721,7 +721,7 @@
 
         // VM Detail Panel Component (inline, not modal)
         // LW: this shows when you click a VM in detail view mode
-        function VmDetailPanel({ vm, clusterId, onAction, onOpenConsole, onOpenConfig, onMigrate, onClone, onForceStop, onDelete, onCrossClusterMigrate, showCrossCluster, actionLoading, onShowMetrics, addToast }) {
+        function VmDetailPanel({ vm, clusterId, onAction, onOpenConsole, onOpenLxcShell, onOpenConfig, onMigrate, onClone, onForceStop, onDelete, onCrossClusterMigrate, showCrossCluster, actionLoading, onShowMetrics, addToast }) {
             const { t } = useTranslation();
             const { getAuthHeaders } = useAuth();
             
@@ -1263,6 +1263,7 @@
                                 <Icons.Monitor />
                                 {t('console')}
                             </button>
+                            {/* NS May 2026 — VNC↔Term toggle moved inside Console modal. */}
                             <button
                                 onClick={() => onOpenConfig(vm)}
                                 className="flex items-center justify-center gap-2 p-3 bg-proxmox-dark hover:bg-proxmox-border border border-proxmox-border rounded-lg text-gray-300 transition-all"
@@ -1422,6 +1423,8 @@
             const [snapName, setSnapName] = useState('');
             const [snapDesc, setSnapDesc] = useState('');
             const [snapRam, setSnapRam] = useState(false);
+            // LW May 2026 — snapshot compare modal state
+            const [compareSnap, setCompareSnap] = useState(null);  // { a, b } or null
 
             const isQemu = vm.type === 'qemu';
             const displayName = vm.name || `${isQemu ? 'VM' : 'CT'} ${vm.vmid}`;
@@ -1946,7 +1949,7 @@
                             {/* hardware + related */}
                             <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
                                 {/* Left: VM Hardware */}
-                                <div style={{border: '1px solid #485764'}}>
+                                <div style={{border: '1px solid var(--corp-border-medium)'}}>
                                     <div className="px-3 py-2 flex items-center justify-between" style={{background: 'var(--corp-header-bg)', borderBottom: '1px solid var(--corp-border-medium)'}}>
                                         <span className="text-[13px] font-medium" style={{color: '#e9ecef'}}>{t('vmHardware') || 'VM Hardware'}</span>
                                     </div>
@@ -2025,7 +2028,7 @@
                                 {/* Right: Related Objects + HA */}
                                 <div className="space-y-4">
                                     {/* related objects */}
-                                    <div style={{border: '1px solid #485764'}}>
+                                    <div style={{border: '1px solid var(--corp-border-medium)'}}>
                                         <div className="px-3 py-2" style={{background: 'var(--corp-header-bg)', borderBottom: '1px solid var(--corp-border-medium)'}}>
                                             <span className="text-[13px] font-medium" style={{color: '#e9ecef'}}>{t('relatedObjects') || 'Related Objects'}</span>
                                         </div>
@@ -2042,7 +2045,7 @@
 
                                     {/* Guest Agent Info (if available) */}
                                     {isQemu && isRunning && guestInfo && (
-                                        <div style={{border: '1px solid #485764'}}>
+                                        <div style={{border: '1px solid var(--corp-border-medium)'}}>
                                             <div className="px-3 py-2" style={{background: 'var(--corp-header-bg)', borderBottom: '1px solid var(--corp-border-medium)'}}>
                                                 <span className="text-[13px] font-medium" style={{color: '#e9ecef'}}>{t('guestAgentInfo')}</span>
                                             </div>
@@ -2060,7 +2063,7 @@
                                     )}
 
                                     {/* HA config */}
-                                    <div style={{border: '1px solid #485764'}}>
+                                    <div style={{border: '1px solid var(--corp-border-medium)'}}>
                                         <div className="px-3 py-2 flex items-center justify-between" style={{background: 'var(--corp-header-bg)', borderBottom: '1px solid var(--corp-border-medium)'}}>
                                             <span className="text-[13px] font-medium" style={{color: '#e9ecef'}}>{t('proxmoxHa') || 'Proxmox HA'}</span>
                                             <button
@@ -2088,7 +2091,7 @@
 
                             {/* LW: Mar 2026 - inline perf charts, no more modal for corporate view */}
                             {isRunning && (
-                                <div style={{border: '1px solid #485764'}}>
+                                <div style={{border: '1px solid var(--corp-border-medium)'}}>
                                     <div className="px-3 py-2 flex items-center justify-between" style={{background: 'var(--corp-header-bg)', borderBottom: '1px solid var(--corp-border-medium)'}}>
                                         <span className="text-[13px] font-medium" style={{color: '#e9ecef'}}>
                                             {t('performanceMetrics') || 'Performance Metrics'}
@@ -2158,38 +2161,48 @@
                     {activeDetailTab === 'snapshots' && (
                         <div className="p-4 space-y-3">
                             <div className="flex items-center justify-between mb-2">
-                                <h3 className="text-sm font-medium" style={{color: '#e9ecef'}}>
-                                    <Icons.Clock className="w-4 h-4 inline mr-1" />{t('snapshotsTab') || 'Snapshots'}
+                                <h3 className="text-[13px] font-medium flex items-center gap-1.5" style={{color: '#e9ecef'}}>
+                                    <Icons.Clock className="w-4 h-4" />{t('snapshotsTab') || 'Snapshots'}
+                                    {snapshots.length + efficientSnapshots.length > 0 && (
+                                        <span className="text-[11px] font-normal" style={{color:'var(--corp-text-muted, #728b9a)'}}>
+                                            ({snapshots.filter(s => s.name !== 'current').length + efficientSnapshots.length})
+                                        </span>
+                                    )}
                                 </h3>
                                 <button onClick={() => setShowCreateSnap(!showCreateSnap)}
-                                    className="px-3 py-1.5 text-xs rounded bg-proxmox-orange/20 text-proxmox-orange hover:bg-proxmox-orange/30">
-                                    + {t('createSnapshot') || 'Create Snapshot'}
+                                    className="corp-vm-btn corp-vm-btn-primary flex items-center gap-1.5">
+                                    <Icons.Plus className="w-3 h-3" />
+                                    {t('createSnapshot') || 'Take Snapshot'}
                                 </button>
                             </div>
 
                             {showCreateSnap && (
-                                <div className="p-3 rounded-lg" style={{background: 'var(--corp-surface-1, #1a2733)', border: '1px solid var(--corp-border-subtle, #283844)'}}>
+                                <div style={{background: 'var(--corp-surface-2, #1a2733)', border: '1px solid var(--corp-border-medium, #344955)', padding: '12px 14px'}}>
                                     <div className="space-y-2">
-                                        <input type="text" value={snapName} onChange={e => setSnapName(e.target.value)}
-                                            placeholder={t('snapshotName') || 'Snapshot name'}
-                                            className="w-full px-3 py-1.5 text-sm rounded bg-proxmox-dark border border-proxmox-border text-white" />
-                                        <input type="text" value={snapDesc} onChange={e => setSnapDesc(e.target.value)}
-                                            placeholder={t('description') || 'Description (optional)'}
-                                            className="w-full px-3 py-1.5 text-sm rounded bg-proxmox-dark border border-proxmox-border text-white" />
-                                        <div className="flex items-center justify-between">
-                                            {isQemu && isRunning && (
-                                                <label className="flex items-center gap-2 text-xs text-gray-400 cursor-pointer">
+                                        <div>
+                                            <div className="corp-vm-section-title">{t('snapshotName') || 'Name'}</div>
+                                            <input type="text" value={snapName} onChange={e => setSnapName(e.target.value)}
+                                                placeholder="snap_2026..." />
+                                        </div>
+                                        <div>
+                                            <div className="corp-vm-section-title">{t('description') || 'Description'} <span style={{color:'var(--corp-text-muted)', fontWeight:400}}>({t('optional')})</span></div>
+                                            <input type="text" value={snapDesc} onChange={e => setSnapDesc(e.target.value)}
+                                                placeholder={t('snapshotDescription') || 'Optional description'} />
+                                        </div>
+                                        <div className="flex items-center justify-between pt-1">
+                                            {isQemu && isRunning ? (
+                                                <label className="flex items-center gap-2 text-[12px] cursor-pointer" style={{color:'var(--corp-text-secondary, #adbbc4)'}}>
                                                     <input type="checkbox" checked={snapRam} onChange={e => setSnapRam(e.target.checked)} />
-                                                    {t('includeRam') || 'Include RAM'}
+                                                    {t('includeRam') || 'Include RAM state'}
                                                 </label>
-                                            )}
+                                            ) : <span></span>}
                                             <div className="flex gap-2 ml-auto">
                                                 <button onClick={() => setShowCreateSnap(false)}
-                                                    className="px-3 py-1 text-xs rounded text-gray-400 hover:text-white">
+                                                    className="corp-vm-btn corp-vm-btn-ghost">
                                                     {t('cancel')}
                                                 </button>
                                                 <button onClick={handleCreateSnap}
-                                                    className="px-3 py-1 text-xs rounded bg-proxmox-orange text-white hover:bg-proxmox-orange/80">
+                                                    className="corp-vm-btn corp-vm-btn-create">
                                                     {t('create') || 'Create'}
                                                 </button>
                                             </div>
@@ -2213,35 +2226,41 @@
 
                                 const renderSnapNode = (node, depth) => (
                                     <React.Fragment key={node.name}>
-                                        <div className="p-2.5 rounded-lg flex items-center justify-between"
-                                            style={{marginLeft: depth * 20, background: 'var(--corp-surface-1, #1a2733)', border: '1px solid var(--corp-border-subtle, #283844)', marginBottom: 4}}>
+                                        <div className="corp-snap-row flex items-center justify-between"
+                                            style={{marginLeft: depth * 20}}>
                                             <div className="flex items-center gap-2 min-w-0">
-                                                {depth > 0 && <span className="text-xs" style={{color: '#49afd9', fontFamily: 'monospace'}}>└─</span>}
+                                                {depth > 0 && <span className="text-xs" style={{color: 'var(--corp-accent, #49afd9)', fontFamily: 'monospace'}}>└─</span>}
                                                 <div className="min-w-0">
                                                     <div className="flex items-center gap-2">
-                                                        <span className="text-sm font-medium truncate" style={{color: '#e9ecef'}}>{node.name}</span>
-                                                        {!!node.vmstate && <span className="px-1 py-0.5 text-[10px] rounded bg-blue-500/20 text-blue-400">RAM</span>}
+                                                        <span className="text-[13px] font-medium truncate" style={{color: '#e9ecef'}}>{node.name}</span>
+                                                        {!!node.vmstate && <span className="corp-snap-pill" style={{background:'rgba(73,175,217,0.12)', color:'var(--corp-accent, #49afd9)', borderColor:'rgba(73,175,217,0.30)'}}>RAM</span>}
                                                         {node.disk_size > 0 && (
-                                                            <span className="text-[10px] px-1.5 py-0.5 rounded" style={{background: 'rgba(255,255,255,0.05)', color: '#728b9a'}}>
+                                                            <span className="text-[10.5px] px-1.5 py-0" style={{background: 'rgba(255,255,255,0.04)', color: 'var(--corp-text-muted, #728b9a)', border: '1px solid var(--corp-border-subtle)'}}>
                                                                 {(node.disk_size / (1024*1024*1024)).toFixed(1)} GB
                                                                 {!!node.vmstate && node.ram_size > 0 && ` + ${(node.ram_size / (1024*1024*1024)).toFixed(1)} GB RAM`}
                                                             </span>
                                                         )}
                                                     </div>
-                                                    <div className="text-[11px]" style={{color: '#728b9a'}}>
+                                                    <div className="text-[11px] mt-0.5" style={{color: 'var(--corp-text-muted, #728b9a)'}}>
                                                         {node.snaptime ? new Date(node.snaptime * 1000).toLocaleString() : ''}
                                                         {node.description && <span className="ml-2" style={{color: '#5a7a8a'}}>— {node.description}</span>}
                                                     </div>
                                                 </div>
                                             </div>
                                             <div className="flex gap-1 flex-shrink-0">
+                                                <button onClick={() => setCompareSnap({ a: 'current', b: node.name })}
+                                                    className="corp-vm-btn corp-vm-btn-ghost flex items-center gap-1" title={t('compareSnapshot') || 'Compare with current'}>
+                                                    <Icons.ChevronRight className="w-3 h-3" style={{transform:'rotate(90deg)'}} />
+                                                    <span className="text-[11px]">{t('compare') || 'Compare'}</span>
+                                                </button>
                                                 <button onClick={() => handleRollbackSnap(node.name)}
-                                                    className="p-1.5 rounded hover:bg-blue-500/20 text-blue-400" title={t('rollback')}>
-                                                    <Icons.RotateCcw className="w-3.5 h-3.5" />
+                                                    className="corp-vm-btn corp-vm-btn-ghost flex items-center gap-1" title={t('rollback')}>
+                                                    <Icons.RotateCcw className="w-3 h-3" />
+                                                    <span className="text-[11px]">{t('rollback')}</span>
                                                 </button>
                                                 <button onClick={() => handleDeleteSnap(node.name)}
-                                                    className="p-1.5 rounded hover:bg-red-500/20 text-red-400" title={t('delete')}>
-                                                    <Icons.Trash2 className="w-3.5 h-3.5" />
+                                                    className="corp-vm-btn corp-vm-btn-danger-ghost" title={t('delete')}>
+                                                    <Icons.Trash2 className="w-3 h-3" />
                                                 </button>
                                             </div>
                                         </div>
@@ -2261,35 +2280,36 @@
                                     {tree.map(root => renderSnapNode(root, 0))}
 
                                     {efficientSnapshots.length > 0 && (<>
-                                        <div className="text-xs font-medium mt-4 mb-1" style={{color: '#49afd9'}}>
+                                        <div className="corp-vm-section-title mt-3" style={{color: 'var(--corp-accent, #49afd9)'}}>
                                             Efficient Snapshots (LVM COW)
                                         </div>
                                         {efficientSnapshots.map(snap => (
-                                            <div key={snap.id} className="p-2.5 rounded-lg flex items-center justify-between"
-                                                style={{background: 'var(--corp-surface-1, #1a2733)', border: '1px solid rgba(73,175,217,0.2)', marginBottom: 4}}>
+                                            <div key={snap.id} className="corp-snap-row flex items-center justify-between"
+                                                style={{borderColor:'rgba(73,175,217,0.30)'}}>
                                                 <div>
                                                     <div className="flex items-center gap-2">
-                                                        <span className="text-sm font-medium" style={{color: '#e9ecef'}}>{snap.name}</span>
-                                                        <span className="px-1.5 py-0.5 text-[10px] rounded bg-green-500/20 text-green-400">COW</span>
-                                                        {snap.fs_frozen && <span className="px-1.5 py-0.5 text-[10px] rounded bg-blue-500/20 text-blue-400">frozen</span>}
+                                                        <span className="text-[13px] font-medium" style={{color: '#e9ecef'}}>{snap.name}</span>
+                                                        <span className="corp-snap-pill" style={{background:'rgba(96,181,21,0.15)', color:'#60b515', borderColor:'rgba(96,181,21,0.30)'}}>COW</span>
+                                                        {snap.fs_frozen && <span className="corp-snap-pill" style={{background:'rgba(73,175,217,0.12)', color:'var(--corp-accent, #49afd9)', borderColor:'rgba(73,175,217,0.30)'}}>frozen</span>}
                                                         {snap.total_snap_alloc_gb != null && (
-                                                            <span className="text-[10px] px-1.5 py-0.5 rounded" style={{background: 'rgba(255,255,255,0.05)', color: '#728b9a'}}>
+                                                            <span className="text-[10.5px] px-1.5 py-0" style={{background:'rgba(255,255,255,0.04)', color:'var(--corp-text-muted, #728b9a)', border:'1px solid var(--corp-border-subtle)'}}>
                                                                 {snap.total_snap_alloc_gb.toFixed(1)} GB
                                                             </span>
                                                         )}
                                                     </div>
-                                                    <div className="text-[11px]" style={{color: '#728b9a'}}>
+                                                    <div className="text-[11px] mt-0.5" style={{color: 'var(--corp-text-muted, #728b9a)'}}>
                                                         {snap.created ? new Date(snap.created).toLocaleString() : ''}
                                                     </div>
                                                 </div>
                                                 <div className="flex gap-1">
                                                     <button onClick={() => handleRollbackEfficientSnap(snap.id, snap.name)}
-                                                        className="p-1.5 rounded hover:bg-blue-500/20 text-blue-400" title={t('rollback')}>
-                                                        <Icons.RotateCcw className="w-3.5 h-3.5" />
+                                                        className="corp-vm-btn corp-vm-btn-ghost flex items-center gap-1" title={t('rollback')}>
+                                                        <Icons.RotateCcw className="w-3 h-3" />
+                                                        <span className="text-[11px]">{t('rollback')}</span>
                                                     </button>
                                                     <button onClick={() => handleDeleteEfficientSnap(snap.id, snap.name)}
-                                                        className="p-1.5 rounded hover:bg-red-500/20 text-red-400" title={t('delete')}>
-                                                        <Icons.Trash2 className="w-3.5 h-3.5" />
+                                                        className="corp-vm-btn corp-vm-btn-danger-ghost" title={t('delete')}>
+                                                        <Icons.Trash2 className="w-3 h-3" />
                                                     </button>
                                                 </div>
                                             </div>
@@ -2298,6 +2318,20 @@
                                 </>);
                             })()}
                         </div>
+                    )}
+
+                    {/* LW May 2026 — snapshot compare modal */}
+                    {compareSnap && (
+                        <SnapshotCompareModal
+                            vm={vm}
+                            clusterId={clusterId}
+                            snapshots={snapshots}
+                            initialA={compareSnap.a}
+                            initialB={compareSnap.b}
+                            onClose={() => setCompareSnap(null)}
+                            authFetch={authFetch}
+                            apiUrl={API_URL}
+                        />
                     )}
                 </div>
             );
@@ -3044,7 +3078,13 @@
                     const networkRes = await authFetch(`${API_URL}/clusters/${targetCluster}/nodes/${targetNode}/networks`);
                     if(networkRes && networkRes.ok) {
                         const networks = await networkRes.json();
-                        const bridges = networks.filter(n => n.type === 'bridge' || n.type === 'OVSBridge' || n.source === 'sdn');
+                        // NS May 2026 (#385): exclude OVS access ports — their ovs_bridge
+                        // field points to the parent OVSBridge; they're not bridges.
+                        const bridges = networks.filter(n => {
+                            if (n.type === 'OVSIntPort' || n.type === 'OVSPort' || n.type === 'OVSBond') return false;
+                            if (n.ovs_bridge) return false;
+                            return n.type === 'bridge' || n.type === 'OVSBridge' || n.source === 'sdn';
+                        });
                         setTargetBridges(bridges);
                         // update bridge map defaults: keep source bridge if it exists on target, else first available
                         const availNames = bridges.map(b => b.iface);
@@ -3902,7 +3942,7 @@
                         {/* Top Resources */}
                         {groupTopGuests.length > 0 && (
                             <div>
-                                <div className="flex items-center gap-2 py-1.5" style={{borderBottom: '1px solid #485764'}}>
+                                <div className="flex items-center gap-2 py-1.5" style={{borderBottom: '1px solid var(--corp-border-subtle)'}}>
                                     <Icons.Activity className="w-3.5 h-3.5" style={{color: '#49afd9'}} />
                                     <span className="text-[13px] font-semibold" style={{color: '#adbbc4'}}>{t('topResources') || 'Top Resources'}</span>
                                 </div>
@@ -3939,7 +3979,7 @@
                         {/* LB History */}
                         {lbEnabled && lbHistory.length > 0 && (
                             <div>
-                                <div className="flex items-center gap-2 py-1.5" style={{borderBottom: '1px solid #485764'}}>
+                                <div className="flex items-center gap-2 py-1.5" style={{borderBottom: '1px solid var(--corp-border-subtle)'}}>
                                     <Icons.Activity className="w-3.5 h-3.5" style={{color: '#a178d9'}} />
                                     <span className="text-[13px] font-semibold" style={{color: '#adbbc4'}}>{t('lbHistory') || 'LB History'}</span>
                                 </div>
@@ -4680,7 +4720,7 @@
                         {/* top resources */}
                         {!topologyOnly && topGuests.length > 0 && (
                             <div>
-                                <div className="flex items-center gap-2 py-1.5" style={{borderBottom: '1px solid #485764'}}>
+                                <div className="flex items-center gap-2 py-1.5" style={{borderBottom: '1px solid var(--corp-border-subtle)'}}>
                                     <Icons.Activity className="w-3.5 h-3.5" style={{color: '#49afd9'}} />
                                     <span className="text-[13px] font-semibold" style={{color: '#adbbc4'}}>{t('topResources') || 'Top Resources'}</span>
                                     <span className="text-[11px]" style={{color: '#728b9a'}}>Top 10</span>
@@ -5286,7 +5326,12 @@
                             if (networkRes && networkRes.ok) {
                                 const networks = await networkRes.json();
                                 const names = new Set();
-                                networks.filter(n => n.type === 'bridge' || n.type === 'OVSBridge' || n.source === 'sdn').forEach(b => {
+                                networks.filter(n => {
+                                    // NS May 2026 (#385): same OVS port guard as the corporate bridge picker.
+                                    if (n.type === 'OVSIntPort' || n.type === 'OVSPort' || n.type === 'OVSBond') return false;
+                                    if (n.ovs_bridge) return false;
+                                    return n.type === 'bridge' || n.type === 'OVSBridge' || n.source === 'sdn';
+                                }).forEach(b => {
                                     names.add(b.iface);
                                     allBridgeInfo[b.iface] = { iface: b.iface, type: b.type, source: b.source || 'local', comments: b.comments || '', zone: b.zone || '', alias: b.alias || '' };
                                 });
@@ -5473,7 +5518,12 @@
                         if (netRes && netRes.ok) {
                             const netData = await netRes.json();
                             setXReplTargetBridges((Array.isArray(netData) ? netData : netData.networks || [])
-                                .filter(n => n.type === 'bridge' || n.type === 'OVSBridge' || n.source === 'sdn'));
+                                .filter(n => {
+                                    // NS May 2026 (#385): same OVS port guard.
+                                    if (n.type === 'OVSIntPort' || n.type === 'OVSPort' || n.type === 'OVSBond') return false;
+                                    if (n.ovs_bridge) return false;
+                                    return n.type === 'bridge' || n.type === 'OVSBridge' || n.source === 'sdn';
+                                }));
                         }
                     } catch (err) { console.error('xrepl target resources:', err); }
                     if (!cancelled) setXReplLoadingResources(false);
@@ -6411,6 +6461,7 @@
         // Create Snapshot Modal - NS: Feb 2026 enhanced with efficient mode
         function CreateSnapshotModal({ isQemu, onSubmit, onClose, loading, efficientInfo }) {
             const { t } = useTranslation();
+            const { isCorporate } = useLayout(); // LW: corporate corporate chrome
             const [snapname, setSnapname] = useState(`snap_${Date.now()}`);
             const [description, setDescription] = useState('');
             const [vmstate, setVmstate] = useState(false);
@@ -6424,6 +6475,156 @@
                 if (!snapname.trim()) return;
                 onSubmit(snapname.trim(), description, vmstate, isEfficient ? { mode: 'efficient', snap_size_gb: snapSizeGb } : { mode: 'standard' });
             };
+
+            // LW: corporate path — corporate modal chrome (matches ConfigModal/CreateVmModal)
+            if (isCorporate) {
+                return (
+                    <div className="corp-vm-modal-overlay" onClick={onClose}>
+                        <div
+                            className="corp-vm-modal"
+                            style={{maxWidth: canEfficient ? '640px' : '520px', width: '100%'}}
+                            onClick={e => e.stopPropagation()}
+                        >
+                            <div className="corp-vm-modal-header">
+                                <div className="flex items-center gap-3 min-w-0 flex-1">
+                                    <Icons.Camera className="w-5 h-5" style={{color:'var(--corp-accent, #49afd9)'}} />
+                                    <div className="min-w-0">
+                                        <div className="corp-vm-modal-title truncate">{t('createSnapshot')}</div>
+                                        <div className="corp-vm-modal-meta">{isQemu ? 'QEMU' : 'LXC'}{canEfficient ? ' · efficient capable' : ''}</div>
+                                    </div>
+                                </div>
+                                <div className="corp-vm-modal-actions">
+                                    <button onClick={onClose} className="corp-vm-btn corp-vm-btn-ghost" title={t('close') || 'Close'}>
+                                        <Icons.X />
+                                    </button>
+                                </div>
+                            </div>
+                            <div className="corp-vm-modal-body">
+                                <div className="space-y-4">
+                                    {canEfficient && (
+                                        <div>
+                                            <div className="corp-vm-section-title">{t('snapshotMode')}</div>
+                                            <div className="flex gap-2 mt-1">
+                                                <button
+                                                    onClick={() => setMode('standard')}
+                                                    className={`flex-1 px-3 py-2 text-[13px] border transition-colors ${
+                                                        !isEfficient
+                                                            ? 'text-white'
+                                                            : 'text-gray-400 hover:text-white'
+                                                    }`}
+                                                    style={!isEfficient
+                                                        ? {borderColor: 'var(--corp-accent, #49afd9)', background: 'rgba(73,175,217,0.10)', color: 'var(--corp-accent, #49afd9)'}
+                                                        : {borderColor: 'var(--corp-border-medium)', background: 'transparent'}}
+                                                >
+                                                    {t('normalMode')}
+                                                </button>
+                                                <button
+                                                    onClick={() => setMode('efficient')}
+                                                    className="flex-1 px-3 py-2 text-[13px] border transition-colors flex items-center justify-center gap-1"
+                                                    style={isEfficient
+                                                        ? {borderColor: '#60b515', background: 'rgba(96,181,21,0.10)', color: '#60b515'}
+                                                        : {borderColor: 'var(--corp-border-medium)', background: 'transparent', color: 'var(--corp-text-secondary)'}}
+                                                >
+                                                    <Icons.Zap className="w-3.5 h-3.5" />
+                                                    {t('efficientMode')}
+                                                </button>
+                                            </div>
+                                        </div>
+                                    )}
+
+                                    {isEfficient && efficientInfo && (
+                                        <div className="p-3 space-y-3" style={{background:'var(--corp-surface-2)', border:'1px solid rgba(96,181,21,0.30)'}}>
+                                            <div className="text-[13px] font-medium flex items-center gap-1" style={{color:'#60b515'}}>
+                                                <Icons.Zap className="w-3.5 h-3.5" />
+                                                {t('spaceSavings')}: {efficientInfo.savings_percent}%
+                                            </div>
+                                            <div>
+                                                <div className="flex justify-between text-[11px] mb-1" style={{color:'var(--corp-text-secondary)'}}>
+                                                    <span>{t('normalSnapshotSize')}</span>
+                                                    <span>{efficientInfo.total_disk_size_gb?.toFixed(1)} GB</span>
+                                                </div>
+                                                <div className="w-full h-2 overflow-hidden" style={{background:'var(--corp-surface-3, #1f2c34)'}}>
+                                                    <div className="h-full" style={{width:'100%', background:'#f54f47'}}></div>
+                                                </div>
+                                            </div>
+                                            <div>
+                                                <div className="flex justify-between text-[11px] mb-1" style={{color:'var(--corp-text-secondary)'}}>
+                                                    <span>{t('efficientSnapshotSize')}</span>
+                                                    <span>~{snapSizeGb?.toFixed(1)} GB</span>
+                                                </div>
+                                                <div className="w-full h-2 overflow-hidden" style={{background:'var(--corp-surface-3, #1f2c34)'}}>
+                                                    <div className="h-full" style={{width:`${Math.max(3,(snapSizeGb / efficientInfo.total_disk_size_gb) * 100)}%`, background:'#60b515'}}></div>
+                                                </div>
+                                            </div>
+                                            <div>
+                                                <label className="block text-[11px] mb-1" style={{color:'var(--corp-text-secondary)'}}>
+                                                    {t('snapshotSizeGb')} ({t('recommended')}: {efficientInfo.recommended_snap_size_gb?.toFixed(1)} GB)
+                                                </label>
+                                                <input
+                                                    type="number"
+                                                    value={snapSizeGb}
+                                                    onChange={(e) => setSnapSizeGb(parseFloat(e.target.value) || 1)}
+                                                    min="1"
+                                                    max={efficientInfo.vg_free_gb - 2}
+                                                    step="1"
+                                                />
+                                            </div>
+                                            <div className="text-[11px] flex items-center gap-1" style={{color: efficientInfo.has_guest_agent ? '#60b515' : '#efc006'}}>
+                                                {efficientInfo.has_guest_agent ? <Icons.CheckCircle className="w-3 h-3" /> : <Icons.AlertTriangle className="w-3 h-3" />}
+                                                {efficientInfo.has_guest_agent ? t('guestAgentDetected') : t('noGuestAgent')}
+                                            </div>
+                                            <div className="text-[11px] italic" style={{color:'var(--corp-text-muted, #728b9a)'}}>
+                                                {t('managedByPegaprox')}
+                                            </div>
+                                        </div>
+                                    )}
+
+                                    <div>
+                                        <div className="corp-vm-section-title">{t('name')}</div>
+                                        <input
+                                            type="text"
+                                            value={snapname}
+                                            onChange={(e) => setSnapname(e.target.value)}
+                                            placeholder="snapshot-name"
+                                        />
+                                    </div>
+                                    <div>
+                                        <div className="corp-vm-section-title">{t('description')} <span style={{color:'var(--corp-text-muted)', fontWeight:400}}>({t('optional')})</span></div>
+                                        <input
+                                            type="text"
+                                            value={description}
+                                            onChange={(e) => setDescription(e.target.value)}
+                                            placeholder={t('snapshotDescription')}
+                                        />
+                                    </div>
+                                    {isQemu && !isEfficient && (
+                                        <label className="flex items-center gap-2 text-[13px]" style={{color:'var(--corp-text-secondary)'}}>
+                                            <input
+                                                type="checkbox"
+                                                checked={vmstate}
+                                                onChange={(e) => setVmstate(e.target.checked)}
+                                            />
+                                            {t('saveRamState')}
+                                        </label>
+                                    )}
+                                </div>
+                            </div>
+                            <div className="corp-vm-modal-footer">
+                                <button onClick={onClose} className="corp-vm-btn corp-vm-btn-ghost">{t('cancel')}</button>
+                                <button
+                                    onClick={handleSubmit}
+                                    disabled={loading || !snapname.trim()}
+                                    className="corp-vm-btn corp-vm-btn-create flex items-center gap-2"
+                                >
+                                    {loading && <Icons.RotateCw className="w-3.5 h-3.5 animate-spin" />}
+                                    {isEfficient && <Icons.Zap className="w-3.5 h-3.5" />}
+                                    {t('create')}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                );
+            }
 
             return (
                 <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/60">

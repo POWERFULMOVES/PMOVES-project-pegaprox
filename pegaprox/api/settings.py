@@ -3279,8 +3279,8 @@ def check_cluster_updates(cluster_id):
         if getattr(mgr, 'cluster_type', 'proxmox') == 'xcpng':
             nodes_data = mgr.get_nodes()
         else:
-            host = mgr.host
-            url = f"https://{host}:8006/api2/json/nodes"
+            host, port = mgr.host, mgr.api_port
+            url = f"https://{host}:{port}/api2/json/nodes"
             r = mgr._create_session().get(url, timeout=10)
             if r.status_code != 200:
                 return jsonify({'error': 'Failed: nodes from cluster'}), 500
@@ -3861,7 +3861,13 @@ def start_rolling_update(cluster_id):
                     # Step 5: Disable maintenance mode
                     mgr._rolling_update['current_step'] = 'finishing'
                     _log(f"Disabling maintenance mode on {node_name}")
-                    mgr.exit_maintenance_mode(node_name)
+                    # NS May 2026 — give HA services 30s to come back after reboot
+                    # before we try to disable maintenance. Otherwise ha-manager
+                    # rejects the call and the node stays stuck.
+                    if include_reboot:
+                        time.sleep(30)
+                    if not mgr.exit_maintenance_mode(node_name):
+                        _log(f"⚠ {node_name} maintenance exit failed (will retry at end of run)")
                     _log(f"  → Ceph (if present): noout + norebalance cleared for {node_name}")
 
                     # MK #181 — wait for Ceph to finish rebalancing/peering before we pull the
@@ -3932,11 +3938,29 @@ def start_rolling_update(cluster_id):
                         mgr._rolling_update['paused_reason'] = None
                         mgr._rolling_update['paused_details'] = None
             
+            # NS May 2026 — final sweep: any node still flagged as in maintenance
+            # gets one more attempt with extra settle time. Catches the slow-reboot
+            # case where ha-manager wasn't ready when we tried to disable.
+            try:
+                with mgr.maintenance_lock:
+                    stuck = list(mgr.nodes_in_maintenance.keys())
+            except Exception:
+                stuck = []
+            if stuck:
+                mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Cleanup: {len(stuck)} node(s) still in maintenance, retrying after 15s settle...")
+                time.sleep(15)
+                for nn in stuck:
+                    if mgr.exit_maintenance_mode(nn):
+                        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ✓ {nn} maintenance cleared on retry")
+                    else:
+                        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ✗ {nn} STILL stuck — run `ha-manager crm-command node-maintenance disable {nn}` manually")
+                        mgr._rolling_update['failed_nodes'].append({'node': nn, 'error': 'Stuck in maintenance after rolling update'})
+
             # Final summary
             completed = len(mgr._rolling_update['completed_nodes'])
             skipped = len(mgr._rolling_update['skipped_nodes'])
             failed = len(mgr._rolling_update['failed_nodes'])
-            
+
             mgr._rolling_update['status'] = 'completed'
             mgr._rolling_update['completed_at'] = time.strftime('%Y-%m-%d %H:%M:%S')
             mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] === Rolling update completed ===")
@@ -4118,10 +4142,10 @@ def get_node_repos(cluster_id, node):
         return jsonify({'error': 'Repository management not available for XCP-ng clusters'}), 400
 
     try:
-        host = mgr.host
+        host, port = mgr.host, mgr.api_port
 
         # Get all repos via Proxmox API
-        file_url = f"https://{host}:8006/api2/json/nodes/{node}/apt/repositories"
+        file_url = f"https://{host}:{port}/api2/json/nodes/{node}/apt/repositories"
         r = mgr._create_session().get(file_url, timeout=10)
         
         if r.status_code != 200:
@@ -4293,10 +4317,10 @@ def update_node_repo(cluster_id, node, repo_id):
         repo_name = repo_info['name']
     
     try:
-        host = mgr.host
+        host, port = mgr.host, mgr.api_port
         
         # Use Proxmox API to modify repository
-        url = f"https://{host}:8006/api2/json/nodes/{node}/apt/repositories"
+        url = f"https://{host}:{port}/api2/json/nodes/{node}/apt/repositories"
         
         # For known repos, we need to find them first
         if not repo_id.startswith('other-'):
@@ -4348,7 +4372,7 @@ def update_node_repo(cluster_id, node, repo_id):
             found_file_path = file_path
         
         # Toggle the repo
-        toggle_url = f"https://{host}:8006/api2/json/nodes/{node}/apt/repositories"
+        toggle_url = f"https://{host}:{port}/api2/json/nodes/{node}/apt/repositories"
         payload = {
             'path': found_file_path,
             'index': repo_index,
@@ -4403,8 +4427,8 @@ def refresh_node_repos(cluster_id, node):
             return jsonify({'error': 'Failed to refresh package list'}), 500
 
     try:
-        host = mgr.host
-        url = f"https://{host}:8006/api2/json/nodes/{node}/apt/update"
+        host, port = mgr.host, mgr.api_port
+        url = f"https://{host}:{port}/api2/json/nodes/{node}/apt/update"
 
         r = mgr._create_session().post(url, timeout=30)
         

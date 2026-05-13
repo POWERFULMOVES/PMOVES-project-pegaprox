@@ -55,7 +55,7 @@ def get_node_ip_api(cluster_id, node):
         return jsonify({'error': 'Cluster not found'}), 404
     
     mgr = cluster_managers[cluster_id]
-    cluster_host = mgr.host
+    cluster_host, cluster_port = mgr.host, mgr.api_port
     node_ip = None
     source = None
 
@@ -1257,8 +1257,8 @@ def deploy_smbios_autoconfig_all(cluster_id):
     # each node gets resolved via _get_node_ip inside the loop.
     nodes = []
     try:
-        cluster_host = mgr.host
-        status_url = f"https://{cluster_host}:8006/api2/json/cluster/status"
+        cluster_host, cluster_port = mgr.host, mgr.api_port
+        status_url = f"https://{cluster_host}:{cluster_port}/api2/json/cluster/status"
         r = mgr._create_session().get(status_url, timeout=10)
         if r.status_code == 200:
             for item in r.json().get('data', []):
@@ -1672,8 +1672,8 @@ def run_custom_script(cluster_id, script_id):
     nodes_to_run = []
 
     try:
-        cluster_host = mgr.host
-        status_url = f"https://{cluster_host}:8006/api2/json/cluster/status"
+        cluster_host, cluster_port = mgr.host, mgr.api_port
+        status_url = f"https://{cluster_host}:{cluster_port}/api2/json/cluster/status"
         r = mgr._create_session().get(status_url, timeout=10)
         if r.status_code == 200:
             for item in r.json().get('data', []):

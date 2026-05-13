@@ -418,7 +418,7 @@ def _run_v2p_migration(task):
         
         # Get next VMID
         try:
-            resp = pve_mgr._api_get(f"https://{pve_mgr.host}:8006/api2/json/cluster/nextid")
+            resp = pve_mgr._api_get(f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json/cluster/nextid")
             task.proxmox_vmid = int(resp.json().get('data', 100)) if resp.status_code == 200 else None
             if not task.proxmox_vmid:
                 task.set_phase('failed', 'Cannot allocate Proxmox VMID'); return
@@ -590,7 +590,7 @@ def _run_v2p_migration(task):
             # creation on shared LVM / cluster-aware storage routinely needs
             # 30-60s for the lock + config-replicate roundtrip. Bump explicitly.
             cr = pve_mgr._api_post(
-                f"https://{pve_mgr.host}:8006/api2/json/nodes/{task.target_node}/qemu",
+                f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json/nodes/{task.target_node}/qemu",
                 data=pve_config, timeout=120)
             if cr.status_code not in (200, 201):
                 task.set_phase('failed', f'VM creation failed: {cr.text[:300]}'); return
@@ -602,7 +602,7 @@ def _run_v2p_migration(task):
             time.sleep(2)
             try:
                 sr = pve_mgr._api_get(
-                    f"https://{pve_mgr.host}:8006/api2/json/nodes/{task.target_node}/tasks/{pve_task_id}/status")
+                    f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json/nodes/{task.target_node}/tasks/{pve_task_id}/status")
                 if sr.status_code == 200 and sr.json().get('data', {}).get('status') == 'stopped':
                     es = sr.json()['data'].get('exitstatus', '')
                     if es == 'OK': task.log("VM shell created"); break
@@ -875,7 +875,7 @@ def _run_v2p_migration(task):
                 # Start Proxmox VM
                 if task.start_after:
                     pve_mgr._api_post(
-                        f"https://{pve_mgr.host}:8006/api2/json/nodes/{task.target_node}"
+                        f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json/nodes/{task.target_node}"
                         f"/qemu/{task.proxmox_vmid}/status/start")
                 cut_t1 = time.time()
                 actual_downtime = cut_t1 - cut_t0
@@ -1041,7 +1041,7 @@ def _run_v2p_migration(task):
                 task.log("Starting Proxmox VM...")
                 try:
                     pve_mgr._api_post(
-                        f"https://{pve_mgr.host}:8006/api2/json/nodes/{task.target_node}"
+                        f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json/nodes/{task.target_node}"
                         f"/qemu/{task.proxmox_vmid}/status/start")
                     task.log(f"VM {task.proxmox_vmid} started")
                 except Exception as e:
@@ -1224,7 +1224,7 @@ def _run_v2p_migration(task):
                 # Start Proxmox VM
                 if task.start_after:
                     pve_mgr._api_post(
-                        f"https://{pve_mgr.host}:8006/api2/json/nodes/{task.target_node}"
+                        f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json/nodes/{task.target_node}"
                         f"/qemu/{task.proxmox_vmid}/status/start")
                 cut_t1 = time.time()
                 actual_downtime = cut_t1 - cut_t0
@@ -1384,7 +1384,7 @@ def _run_v2p_migration(task):
             task.log("Starting VM on Proxmox...")
             try:
                 pve_mgr._api_post(
-                    f"https://{pve_mgr.host}:8006/api2/json/nodes/{task.target_node}"
+                    f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json/nodes/{task.target_node}"
                     f"/qemu/{task.proxmox_vmid}/status/start")
                 task.log(f"VM {task.proxmox_vmid} started - DOWNTIME ENDS")
             except Exception as e:
@@ -1397,7 +1397,7 @@ def _run_v2p_migration(task):
         time.sleep(8)
         try:
             vs = pve_mgr._api_get(
-                f"https://{pve_mgr.host}:8006/api2/json/nodes/{task.target_node}"
+                f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json/nodes/{task.target_node}"
                 f"/qemu/{task.proxmox_vmid}/status/current")
             if vs.status_code == 200:
                 task.log(f"VM status: {vs.json().get('data', {}).get('status', '?')}")
@@ -1595,7 +1595,7 @@ def _inject_virtio_drivers(pve_mgr, task):
     # into a live NTFS underneath the running guest = corruption. Skip cleanly.
     try:
         st = pve_mgr._api_get(
-            f"https://{pve_mgr.host}:8006/api2/json/nodes/{node}/qemu/{task.proxmox_vmid}/status/current")
+            f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json/nodes/{node}/qemu/{task.proxmox_vmid}/status/current")
         running = (st.status_code == 200 and st.json().get('data', {}).get('status') == 'running')
         if running:
             task.log("[VirtIO] Skipped — VM is already running (sshfs_boot live-pivot path). "
@@ -2364,13 +2364,22 @@ def _drive_mirror_to_local(pve_mgr, task, node, vmid, drive_id, target_path, dis
     Use _poll_drive_mirrors() to wait for all mirrors to finish.
     Returns True if mirror started successfully."""
     
-    # Verify drive exists in QEMU block graph
+    # Separate "monitor failed" from "drive missing" — old code parsed the
+    # error msg as a drive list (#…).
     ok, block_info = _qm_monitor_cmd(pve_mgr, node, vmid, "info block")
-    if not ok or drive_id not in block_info:
-        task.log(f"  drive-mirror: drive '{drive_id}' not found in VM")
-        # Show available drives for debugging
-        drives = [l.strip().split(':')[0] for l in block_info.split('\n') if ':' in l and 'Removable' not in l]
-        task.log(f"  Available drives: {', '.join(drives[:10])}")
+    if not ok:
+        task.log(f"  drive-mirror: qm monitor failed: {str(block_info)[:200]}")
+        return False
+    if drive_id not in block_info:
+        drives = []
+        for line in block_info.splitlines():
+            l = line.strip()
+            if ':' not in l or 'Removable' in l:
+                continue
+            name = l.split(':', 1)[0].strip()
+            if name and ' ' not in name and len(name) <= 64:
+                drives.append(name)
+        task.log(f"  drive-mirror: '{drive_id}' not in VM (have: {', '.join(drives[:10]) or 'none'})")
         return False
     
     # Start drive-mirror: -n = reuse existing target, -f = skip size check
@@ -2757,7 +2766,7 @@ def _pvesm_alloc_disk(pve_mgr, node, storage, vmid, disk_index, size_bytes):
             'format': 'raw'
         }
         resp = pve_mgr._api_post(
-            f"https://{pve_mgr.host}:8006/api2/json/nodes/{node}/storage/{storage}/content",
+            f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json/nodes/{node}/storage/{storage}/content",
             data=api_data)
         if resp.status_code in (200, 201):
             result = resp.json().get('data', '')
@@ -3940,14 +3949,14 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
         task.log(f"Starting Proxmox VM ({boot_method} backend + cache=writeback)...")
         try:
             pve_mgr._api_post(
-                f"https://{pve_mgr.host}:8006/api2/json/nodes/{task.target_node}"
+                f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json/nodes/{task.target_node}"
                 f"/qemu/{task.proxmox_vmid}/status/start")
             
             # Wait and verify VM is actually running (not just start-queued)
             time.sleep(8)
             try:
                 st = pve_mgr._api_get(
-                    f"https://{pve_mgr.host}:8006/api2/json/nodes/{task.target_node}"
+                    f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json/nodes/{task.target_node}"
                     f"/qemu/{task.proxmox_vmid}/status/current")
                 vm_st = st.json().get('data', {}).get('status', 'unknown')
                 
@@ -4020,11 +4029,11 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
                                 task.log("NBD bridge ready - retrying VM start...")
                                 try:
                                     pve_mgr._api_post(
-                                        f"https://{pve_mgr.host}:8006/api2/json/nodes/{task.target_node}"
+                                        f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json/nodes/{task.target_node}"
                                         f"/qemu/{task.proxmox_vmid}/status/start")
                                     time.sleep(8)
                                     st3 = pve_mgr._api_get(
-                                        f"https://{pve_mgr.host}:8006/api2/json/nodes/{task.target_node}"
+                                        f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json/nodes/{task.target_node}"
                                         f"/qemu/{task.proxmox_vmid}/status/current")
                                     if st3.json().get('data', {}).get('status') == 'running':
                                         vm_running_on_ssh = True
@@ -4042,11 +4051,11 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
                                 timeout=5)
                             try:
                                 pve_mgr._api_post(
-                                    f"https://{pve_mgr.host}:8006/api2/json/nodes/{task.target_node}"
+                                    f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json/nodes/{task.target_node}"
                                     f"/qemu/{task.proxmox_vmid}/status/start")
                                 time.sleep(8)
                                 st2 = pve_mgr._api_get(
-                                    f"https://{pve_mgr.host}:8006/api2/json/nodes/{task.target_node}"
+                                    f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json/nodes/{task.target_node}"
                                     f"/qemu/{task.proxmox_vmid}/status/current")
                                 if st2.json().get('data', {}).get('status') == 'running':
                                     vm_running_on_ssh = True
@@ -4247,21 +4256,37 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
             # Source: flat file on SSHFS mount (raw format)
             flat_file = desc_file.replace('.vmdk', '-flat.vmdk')
             sshfs_src = f"{mnt_path}/{vm_dir}/{flat_file}"
-            
-            # Verify source is accessible
-            rc_chk, out_chk, _ = _pve_node_exec(pve_mgr, task.target_node,
-                f"test -f '{sshfs_src}' && stat --format='%s' '{sshfs_src}' 2>&1", timeout=10)
+
+            qsshfs_src = shlex.quote(sshfs_src)
+            rc_chk, out_chk, err_chk = _pve_node_exec(pve_mgr, task.target_node,
+                f"test -f {qsshfs_src} && stat --format='%s' {qsshfs_src} 2>&1", timeout=10)
             if rc_chk != 0:
                 # Try descriptor VMDK as source (qemu-img can read VMDK descriptors)
                 desc_path = f"{mnt_path}/{vm_dir}/{desc_file}"
+                qdesc = shlex.quote(desc_path)
                 rc_d, out_d, _ = _pve_node_exec(pve_mgr, task.target_node,
-                    f"test -f '{desc_path}' && head -5 '{desc_path}' 2>/dev/null", timeout=10)
+                    f"test -f {qdesc} && head -5 {qdesc} 2>/dev/null", timeout=10)
                 d_head = str(out_d or '').strip().lower()
                 if rc_d == 0 and any(kw in d_head for kw in ['descriptor', 'vmdk', 'extent', 'version=']):
                     sshfs_src = desc_path
                     task.log(f"  Disk {di}: using descriptor VMDK ({desc_file})")
                 else:
-                    task.log(f"  Disk {di}: source not found on SSHFS!")
+                    quoted_mnt = shlex.quote(mnt_path)
+                    rc_root, out_root, _ = _pve_node_exec(pve_mgr, task.target_node,
+                        f"ls -1 {quoted_mnt}/ 2>&1 | head -40", timeout=10)
+                    rc_mnt, out_mnt, _ = _pve_node_exec(pve_mgr, task.target_node,
+                        f"mount | grep {quoted_mnt} 2>&1", timeout=5)
+                    task.log(f"  Disk {di}: source not found: {sshfs_src}")
+                    if rc_mnt != 0 or not str(out_mnt or '').strip():
+                        task.log(f"    SSHFS mount at {mnt_path} is gone")
+                    elif rc_root == 0 and str(out_root or '').strip():
+                        entries = [e.strip() for e in str(out_root).splitlines() if e.strip() and not e.startswith('total')]
+                        vm_lc = vm_dir.lower()
+                        tokens = [t for t in vm_lc.replace('-', ' ').replace('_', ' ').split() if len(t) >= 3]
+                        for e in entries:
+                            if any(t in e.lower() for t in tokens):
+                                task.log(f"    hint: try esxi_vm_dir={e!r}")
+                                break
                     import_ok = False
                     continue
             
@@ -4451,11 +4476,11 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
             # This prevents filesystem corruption (initramfs on next boot!)
             try:
                 pve_mgr._api_post(
-                    f"https://{pve_mgr.host}:8006/api2/json/nodes/{task.target_node}"
+                    f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json/nodes/{task.target_node}"
                     f"/qemu/{task.proxmox_vmid}/agent/fsfreeze-freeze", timeout=10)
                 time.sleep(1)
                 pve_mgr._api_post(
-                    f"https://{pve_mgr.host}:8006/api2/json/nodes/{task.target_node}"
+                    f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json/nodes/{task.target_node}"
                     f"/qemu/{task.proxmox_vmid}/agent/fsfreeze-thaw", timeout=10)
                 task.log("  Guest filesystem synced (fsfreeze)")
             except:
@@ -4465,7 +4490,7 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
             task.log("  Sending ACPI shutdown...")
             try:
                 pve_mgr._api_post(
-                    f"https://{pve_mgr.host}:8006/api2/json/nodes/{task.target_node}"
+                    f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json/nodes/{task.target_node}"
                     f"/qemu/{task.proxmox_vmid}/status/shutdown",
                     data={'timeout': 30})
             except:
@@ -4477,7 +4502,7 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
                 time.sleep(2)
                 try:
                     st = pve_mgr._api_get(
-                        f"https://{pve_mgr.host}:8006/api2/json/nodes/{task.target_node}"
+                        f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json/nodes/{task.target_node}"
                         f"/qemu/{task.proxmox_vmid}/status/current")
                     if st.json().get('data', {}).get('status') == 'stopped':
                         stopped = True
@@ -4491,14 +4516,14 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
                 task.log("  Graceful shutdown timed out - force stopping...")
                 try:
                     pve_mgr._api_post(
-                        f"https://{pve_mgr.host}:8006/api2/json/nodes/{task.target_node}"
+                        f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json/nodes/{task.target_node}"
                         f"/qemu/{task.proxmox_vmid}/status/stop")
                 except: pass
                 for _w in range(10):
                     time.sleep(2)
                     try:
                         st = pve_mgr._api_get(
-                            f"https://{pve_mgr.host}:8006/api2/json/nodes/{task.target_node}"
+                            f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json/nodes/{task.target_node}"
                             f"/qemu/{task.proxmox_vmid}/status/current")
                         if st.json().get('data', {}).get('status') == 'stopped':
                             break
@@ -4529,7 +4554,7 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
             # Start on local storage
             try:
                 pve_mgr._api_post(
-                    f"https://{pve_mgr.host}:8006/api2/json/nodes/{task.target_node}"
+                    f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json/nodes/{task.target_node}"
                     f"/qemu/{task.proxmox_vmid}/status/start")
                 task.log(f"VM {task.proxmox_vmid} RESTARTED on local storage (full speed)")
             except Exception as e:
@@ -4562,8 +4587,9 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
                 import_path = None
                 
                 if desc_path:
+                    qdesc = shlex.quote(desc_path)
                     rc_d, out_d, _ = _pve_node_exec(pve_mgr, task.target_node,
-                        f"test -f '{desc_path}' && head -5 '{desc_path}' 2>/dev/null", timeout=10)
+                        f"test -f {qdesc} && head -5 {qdesc} 2>/dev/null", timeout=10)
                     d_head = str(out_d or '').strip().lower()
                     if rc_d == 0 and any(kw in d_head for kw in ['descriptor', 'vmdk', 'extent', 'version=']):
                         import_path = desc_path
@@ -4571,36 +4597,40 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
                 if not import_path:
                     raw_link = sshfs_path.replace('.vmdk', '.raw')
                     _pve_node_exec(pve_mgr, task.target_node,
-                        f"ln -sf '{sshfs_path}' '{raw_link}'", timeout=5)
+                        f"ln -sf {shlex.quote(sshfs_path)} {shlex.quote(raw_link)}", timeout=5)
                     import_path = raw_link
-                
+
                 old_vol = local_volumes[di][0] if di < len(local_volumes) else ''
                 if old_vol:
                     _pve_node_exec(pve_mgr, task.target_node,
-                        f"pvesm free {old_vol} 2>&1", timeout=15)
+                        f"pvesm free {shlex.quote(old_vol)} 2>&1", timeout=15)
                     local_volumes[di] = ('', '')
-                
+
                 task.log(f"  Importing disk {di} ({disk_gb:.1f} GB) → {task.target_storage}")
                 start_t = time.time()
-                rc_imp, out_imp, _ = _pve_node_exec(pve_mgr, task.target_node,
-                    f"TMPDIR='{v2p_tmpdir}' qm importdisk {task.proxmox_vmid} '{import_path}' {task.target_storage} --format raw 2>&1",
+                rc_imp, out_imp, err_imp = _pve_node_exec(pve_mgr, task.target_node,
+                    f"TMPDIR={shlex.quote(v2p_tmpdir)} qm importdisk {task.proxmox_vmid} {shlex.quote(import_path)} {shlex.quote(task.target_storage)} --format raw 2>&1",
                     timeout=86400)
                 elapsed = time.time() - start_t
                 out_str = str(out_imp or '').strip()
-                
+                err_str = str(err_imp or '').strip()
+
                 imported_vol = ''
                 for imp_line in out_str.split('\n'):
                     m = _re.search(r"([\w-]+:vm-\d+-disk-\d+(?:\.\w+)?)", imp_line)
                     if m:
                         imported_vol = m.group(1).strip("'\"")
-                
+
                 if imported_vol and rc_imp == 0:
                     local_volumes[di] = (imported_vol, '')
                     speed = (disk_total / (1024*1024)) / max(elapsed, 1)
                     task.log(f"  ✓ {elapsed:.0f}s, {speed:.0f} MB/s → {imported_vol}")
                     task.update_progress(dk, disk_total, disk_total)
                 else:
-                    task.log(f"  FAILED (rc={rc_imp}): {out_str[-300:]}")
+                    detail = (out_str or err_str or '(no output)').strip()
+                    task.log(f"  FAILED (rc={rc_imp}): {detail[-400:]}")
+                    if rc_imp == 255 and not out_str:
+                        task.log(f"    SSH to {task.target_node} died — retry / check sshd")
                     copy_ok = False
     
     # ================================================================
@@ -4803,11 +4833,11 @@ exit $((S + R))
         # Graceful shutdown to prevent filesystem corruption
         try:
             pve_mgr._api_post(
-                f"https://{pve_mgr.host}:8006/api2/json/nodes/{task.target_node}"
+                f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json/nodes/{task.target_node}"
                 f"/qemu/{task.proxmox_vmid}/agent/fsfreeze-freeze", timeout=10)
             time.sleep(1)
             pve_mgr._api_post(
-                f"https://{pve_mgr.host}:8006/api2/json/nodes/{task.target_node}"
+                f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json/nodes/{task.target_node}"
                 f"/qemu/{task.proxmox_vmid}/agent/fsfreeze-thaw", timeout=10)
             task.log("  Guest filesystem synced (fsfreeze)")
         except:
@@ -4816,7 +4846,7 @@ exit $((S + R))
         # Try ACPI shutdown first
         try:
             pve_mgr._api_post(
-                f"https://{pve_mgr.host}:8006/api2/json/nodes/{task.target_node}"
+                f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json/nodes/{task.target_node}"
                 f"/qemu/{task.proxmox_vmid}/status/shutdown",
                 data={'timeout': 30})
         except: pass
@@ -4826,7 +4856,7 @@ exit $((S + R))
             time.sleep(2)
             try:
                 st = pve_mgr._api_get(
-                    f"https://{pve_mgr.host}:8006/api2/json/nodes/{task.target_node}"
+                    f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json/nodes/{task.target_node}"
                     f"/qemu/{task.proxmox_vmid}/status/current")
                 if st.json().get('data', {}).get('status') != 'running':
                     task.log(f"  VM stopped gracefully ({(attempt+1)*2}s)")
@@ -4838,14 +4868,14 @@ exit $((S + R))
             task.log("  Graceful shutdown timed out - force stopping...")
             try:
                 pve_mgr._api_post(
-                    f"https://{pve_mgr.host}:8006/api2/json/nodes/{task.target_node}"
+                    f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json/nodes/{task.target_node}"
                     f"/qemu/{task.proxmox_vmid}/status/stop")
             except: pass
             for _w in range(10):
                 time.sleep(2)
                 try:
                     st = pve_mgr._api_get(
-                        f"https://{pve_mgr.host}:8006/api2/json/nodes/{task.target_node}"
+                        f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json/nodes/{task.target_node}"
                         f"/qemu/{task.proxmox_vmid}/status/current")
                     if st.json().get('data', {}).get('status') != 'running':
                         break
@@ -4972,7 +5002,7 @@ exit $((S + R))
         if task.start_after or vm_running_on_ssh:
             try:
                 pve_mgr._api_post(
-                    f"https://{pve_mgr.host}:8006/api2/json/nodes/{task.target_node}"
+                    f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json/nodes/{task.target_node}"
                     f"/qemu/{task.proxmox_vmid}/status/start")
                 if vm_running_on_ssh:
                     task.log(f"VM {task.proxmox_vmid} RESTARTED on local storage (full speed)")
@@ -5095,7 +5125,7 @@ def _do_offline_qemuimg_copy(pve_mgr, task, esxi_host, esxi_user, esxi_pass,
         task.log("Starting VM on local storage...")
         try:
             pve_mgr._api_post(
-                f"https://{pve_mgr.host}:8006/api2/json/nodes/{task.target_node}"
+                f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json/nodes/{task.target_node}"
                 f"/qemu/{task.proxmox_vmid}/status/start")
             task.log(f"VM {task.proxmox_vmid} STARTED")
         except Exception as e:

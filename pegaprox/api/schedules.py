@@ -252,21 +252,21 @@ def execute_scheduled_action(action):
             return
         
         node = vm.get('node')
-        host = mgr.host
+        host, port = mgr.host, mgr.api_port
         
         # Build the API URL based on action
         if action_type == 'start':
-            url = f"https://{host}:8006/api2/json/nodes/{node}/{vm_type}/{vmid}/status/start"
+            url = f"https://{host}:{port}/api2/json/nodes/{node}/{vm_type}/{vmid}/status/start"
         elif action_type == 'stop':
-            url = f"https://{host}:8006/api2/json/nodes/{node}/{vm_type}/{vmid}/status/stop"
+            url = f"https://{host}:{port}/api2/json/nodes/{node}/{vm_type}/{vmid}/status/stop"
         elif action_type == 'shutdown':
-            url = f"https://{host}:8006/api2/json/nodes/{node}/{vm_type}/{vmid}/status/shutdown"
+            url = f"https://{host}:{port}/api2/json/nodes/{node}/{vm_type}/{vmid}/status/shutdown"
         elif action_type == 'reboot':
-            url = f"https://{host}:8006/api2/json/nodes/{node}/{vm_type}/{vmid}/status/reboot"
+            url = f"https://{host}:{port}/api2/json/nodes/{node}/{vm_type}/{vmid}/status/reboot"
         elif action_type == 'snapshot':
             # Create a snapshot with timestamp
             snap_name = f"scheduled_{datetime.now().strftime('%Y%m%d_%H%M')}"
-            url = f"https://{host}:8006/api2/json/nodes/{node}/{vm_type}/{vmid}/snapshot"
+            url = f"https://{host}:{port}/api2/json/nodes/{node}/{vm_type}/{vmid}/snapshot"
             response = mgr._create_session().post(url, data={'snapname': snap_name})
             logging.info(f"[SCHEDULER] Snapshot result: {response.status_code}")
             return
@@ -387,6 +387,7 @@ def execute_scheduled_rolling_update(mgr, cluster_id: str, action: dict):
                                         except: break
                                         time.sleep(5); ow += 5
                                     rw = 0
+                                    came_back = False
                                     while rw < 600:
                                         try:
                                             ns = mgr.get_node_status()
@@ -394,16 +395,48 @@ def execute_scheduled_rolling_update(mgr, cluster_id: str, action: dict):
                                                 mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ✓ {node_name} back online")
                                                 if node_name in mgr._rolling_update['rebooting_nodes']:
                                                     mgr._rolling_update['rebooting_nodes'].remove(node_name)
-                                                time.sleep(10); break
+                                                came_back = True
+                                                # NS May 2026 — give HA services time to start
+                                                # before trying to disable maintenance. 10s was
+                                                # too short → ha-manager rejected the disable
+                                                # call and node stayed in maintenance.
+                                                time.sleep(30)
+                                                break
                                         except: pass
                                         time.sleep(10); rw += 10
+                                    if not came_back:
+                                        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ⚠ {node_name} did not come back online within 600s")
                                 else:
                                     mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] {node_name} rebooting (wait_for_reboot=False)")
                         else:
                             mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ✗ {node_name} update failed")
                             mgr._rolling_update['failed_nodes'].append({'node': node_name, 'error': 'Update failed'})
-                    mgr.exit_maintenance_mode(node_name)
+                    # NS May 2026 — exit_maintenance_mode now retries internally;
+                    # if it still returns False the node is stuck and we log it
+                    # for the post-loop sweep below.
+                    if not mgr.exit_maintenance_mode(node_name):
+                        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ⚠ {node_name} maintenance exit failed — will retry at end")
                 
+                # NS May 2026 — final sweep: any node still flagged as in
+                # maintenance gets one more shot, after a longer settle time.
+                # Catches the case where the node took >600s to reboot or HA
+                # services were still starting when we tried to exit.
+                stuck_nodes = []
+                try:
+                    with mgr.maintenance_lock:
+                        stuck_nodes = list(mgr.nodes_in_maintenance.keys())
+                except Exception:
+                    pass
+                if stuck_nodes:
+                    mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Cleanup: {len(stuck_nodes)} node(s) still in maintenance, retrying...")
+                    time.sleep(15)
+                    for nn in stuck_nodes:
+                        if mgr.exit_maintenance_mode(nn):
+                            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ✓ {nn} maintenance cleared on retry")
+                        else:
+                            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ✗ {nn} STILL in maintenance — manual intervention needed")
+                            mgr._rolling_update['failed_nodes'].append({'node': nn, 'error': 'Stuck in maintenance after rolling update'})
+
                 # Finished
                 mgr._rolling_update['status'] = 'completed'
                 mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Scheduled rolling update completed")

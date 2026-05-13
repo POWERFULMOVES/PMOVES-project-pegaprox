@@ -304,7 +304,7 @@ def _pve_node_exec(pve_mgr, node, cmd, timeout=600, use_controlmaster=True):
     # Method 1: Try Proxmox API exec (PVE 7.4+)
     try:
         resp = pve_mgr._api_post(
-            f"https://{pve_mgr.host}:8006/api2/json/nodes/{node}/execute",
+            f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json/nodes/{node}/execute",
             data={'commands': cmd}
         )
         if resp.status_code == 200:

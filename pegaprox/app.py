@@ -683,7 +683,37 @@ def main(debug_mode=False):
         print(f"\n  Install missing: pip install {' '.join(missing_libs)}")
     print()
 
-    # Create Flask app
+    # NS May 2026 — auto-encrypt every DB under CONFIG_DIR on first boot if
+    # sqlcipher3 is available. MUST run BEFORE create_app(): plugin loader +
+    # push-inbox initialiser open DB connections inside create_app(), so by
+    # the time we'd hit the post-create_app point it's already too late and
+    # SQLCipher fails the PRAGMA key handshake against a plain file.
+    # Idempotent on subsequent boots (state == 'encrypted' short-circuits).
+    #
+    # Covers pegaprox.db (main) + syslog.db (Apr 2026 syslog server) — both
+    # get opened through dbcrypto.connect() so both must be encrypted in lock-
+    # step. ensure_db_encrypted() handles 'missing' state cleanly (noop) so
+    # only-pegaprox-no-syslog deployments are fine.
+    try:
+        from pegaprox.core import dbcrypto as _dbcrypto
+        from pegaprox.constants import CONFIG_DIR as _CFGDIR
+        for _db_name in ('pegaprox.db', 'syslog.db'):
+            _db_path = os.path.join(_CFGDIR, _db_name)
+            _r = _dbcrypto.ensure_db_encrypted(_db_path)
+            if _r.get('action') == 'migrated':
+                print(f"  ✓ {_db_name} auto-encrypted ({_r['rows_copied']} rows, {_r['duration_s']}s)")
+                print(f"    backup: {_r['backup_path']}")
+            elif _r.get('action') == 'no-backend':
+                print(f"  ⚠ sqlcipher3 not installed — {_db_name} stays plain (field-level Fernet still active)")
+    except RuntimeError as _e:
+        # corrupt / unknown-key — refuse to start
+        print(f"\n[FATAL] {_e}\n")
+        sys.exit(1)
+    except Exception as _e:
+        # don't take down boot for a non-fatal hiccup — log and continue
+        logging.error(f"[DBCRYPTO] auto-encrypt check failed: {_e}", exc_info=True)
+
+    # Create Flask app (plugins + push inbox will hit the DB here)
     app = create_app()
 
     # Init user system

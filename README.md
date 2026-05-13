@@ -1,5 +1,9 @@
 <p align="center">
-  <img src="https://pegaprox.com/pictures/pegaprox-logo.png" alt="PegaProx Logo" width="200"/>
+  <picture>
+    <!-- GitHub dark mode → swap to light variant so it stays readable -->
+    <source media="(prefers-color-scheme: dark)" srcset="images/pegaprox-logo-light.png">
+    <img src="images/pegaprox-logo-dark.png" alt="PegaProx Logo" width="220"/>
+  </picture>
 </p>
 
 <h1 align="center">PegaProx</h1>
@@ -16,9 +20,15 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.9.9.3--beta-blue" alt="Version"/>
+  <img src="https://img.shields.io/badge/version-0.9.10--beta-blue" alt="Version"/>
   <img src="https://img.shields.io/badge/python-3.8+-green" alt="Python"/>
   <img src="https://img.shields.io/badge/license-AGPL--3.0--License-orange" alt="License"/>
+</p>
+
+<p align="center">
+  <a href="https://app.aikido.dev/audit-report/external/aklfeBsCvIheXnWMwFRveeH5/request" target="_blank">
+    <img src="https://app.aikido.dev/assets/badges/full-light-theme.svg" alt="Aikido Security Audit Report" height="40" />
+  </a>
 </p>
 ---
 
@@ -75,6 +85,10 @@ The name **PegaProx** is inspired by *Pegasus*, the winged horse of Greek mythol
 </p>
 
 <p align="center">
+  <sub><b>Individual supporters:</b>&nbsp; Andreas Huemmer</sub>
+</p>
+
+<p align="center">
   <a href="mailto:sponsor@pegaprox.com">Become a Sponsor</a> •
   <a href="https://opencollective.com/pegaprox">Open Collective</a>
 </p>
@@ -122,7 +136,7 @@ The name **PegaProx** is inspired by *Pegasus*, the winged horse of Greek mythol
 - 🛡️ **VM-Level ACLs** - Fine-grained permissions per VM
 - 🏢 **Multi-Tenancy** - Isolate clusters for different customers
 - 🚫 **IP Whitelisting / Blacklisting** - Restrict access by IP or CIDR range
-- 🔒 **AES-256-GCM Encryption** - All stored credentials encrypted at rest
+- 🔒 **Full-DB Encryption** - SQLCipher (AES-256-CBC + HMAC-SHA512, format v4) wraps the entire database at rest on Linux x86_64; sensitive fields stay individually Fernet-encrypted everywhere else. Multi-tier master-key loader resolves from env / systemd LoadCredentialEncrypted / `/etc/pegaprox/secret.key`, so a `config/` backup never carries the key alongside the data. Auto-migrates plain DBs on first boot post-update.
 - 🔍 **CVE Scanner** - Per-node package vulnerability scanning via debsecan
 - 🛡️ **CIS Hardening** - One-click security audit and hardening against CIS benchmarks
 - 🧾 **HMAC-Signed Audit Log** - Tamper-evident integrity verification on every entry
@@ -308,7 +322,7 @@ Password: admin
 │   ├── index.html              # Compiled frontend
 │   └── src/                    # Frontend source (JSX)
 ├── config/
-│   └── pegaprox.db             # SQLite database (credentials encrypted)
+│   └── pegaprox.db             # SQLite database — fully encrypted at rest via SQLCipher (Linux x86_64); plain SQLite + Fernet-encrypted fields elsewhere
 ├── static/                     # JS/CSS libraries (offline mode)
 ├── logs/                       # Application logs
 └── update.sh                   # Update script
@@ -316,13 +330,16 @@ Password: admin
 
 ## 🔒 Security
 
-- Credentials (Cluster PW, SSH Keys, TOTP, LDAP Bind) → AES-256-GCM
-- API Tokens → SHA-256 Hash
-- Passwords → Argon2id
-- HTTPS required for production
-- Session tokens expire after inactivity
-- Rate limiting on all endpoints
-- Input sanitization and RBAC enforcement
+- **Database at rest** → SQLCipher (AES-256-CBC + HMAC-SHA512, SQLCipher format v4) on Linux x86_64. Plain SQLite + per-field Fernet on other platforms (ARM / macOS / Windows). See [`docs/SECURITY.md`](docs/SECURITY.md) for the threat model and recovery story.
+- **Master key custody** → Multi-tier loader: `PEGAPROX_DB_KEY` env / systemd `LoadCredentialEncrypted` (TPM2-bound) / `/etc/pegaprox/secret.key` / `~/.config/pegaprox/secret.key` / legacy `config/`. Default chmod 0600, files with loose permissions are skipped rather than used silently.
+- **Sensitive fields** (Cluster PW, SSH keys, TOTP secrets, OIDC client secrets, LDAP bind) → Fernet (AES-256-GCM equivalent), works even when full-DB encryption isn't available.
+- **API Tokens** → SHA-256 hash (constant-time compare).
+- **Passwords** → Argon2id (3 iter, 64 MB memory cost).
+- HTTPS required for production.
+- Session tokens expire after inactivity; optional strict-IP binding.
+- Per-IP rate limiting on login + every authenticated endpoint.
+- Input sanitization, CSRF Origin matching, RBAC enforced server-side on every route.
+- Auto-encryption on first boot — operators can opt out with `PEGAPROX_DISABLE_AUTO_ENCRYPT=1` if they want to take their own pre-encryption backup first.
 
 ## 📖 Documentation
 

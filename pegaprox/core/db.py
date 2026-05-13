@@ -15,7 +15,11 @@ import hashlib
 import hmac
 import base64
 import uuid
+# MK May 2026 — DB connections now go through `dbcrypto.connect()` so
+# SQLCipher kicks in automatically when available.  The legacy `sqlite3`
+# alias is kept for the Row / IntegrityError types we use in queries below.
 import sqlite3
+from pegaprox.core import dbcrypto
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Set
@@ -161,15 +165,21 @@ class PegaProxDB:
         shouldn't be shared across threads. Each thread gets its own.
         """
         if not hasattr(self._local, 'conn') or self._local.conn is None:
-            self._local.conn = sqlite3.connect(
+            # MK May 2026 — dbcrypto.connect() picks SQLCipher when available
+            # (full-DB AES-256 + HMAC-SHA512 at rest) and falls back to plain
+            # sqlite3 otherwise. The PRAGMA key handshake happens inside the
+            # helper, before any other query runs.
+            self._local.conn = dbcrypto.connect(
                 self.db_path,
                 check_same_thread=False,  # We handle thread safety ourselves
                 timeout=30.0
             )
-            self._local.conn.row_factory = sqlite3.Row
+            self._local.conn.row_factory = dbcrypto.Row
             # Enable foreign keys
             self._local.conn.execute("PRAGMA foreign_keys = ON")
-            # WAL mode for better concurrency (multiple readers, one writer)
+            # WAL mode for better concurrency (multiple readers, one writer).
+            # Note: with SQLCipher, WAL is still supported but the WAL/SHM
+            # auxiliary files are also encrypted — backups must include them.
             self._local.conn.execute("PRAGMA journal_mode = WAL")
         return self._local.conn
     
@@ -217,6 +227,7 @@ class PegaProxDB:
                 ssh_user TEXT DEFAULT '',
                 ssh_key_encrypted TEXT DEFAULT '',
                 ssh_port INTEGER DEFAULT 22,
+                api_port INTEGER DEFAULT 8006,
                 ha_settings TEXT DEFAULT '{}',
                 created_at TEXT,
                 updated_at TEXT
@@ -974,6 +985,9 @@ class PegaProxDB:
                 ('cpu_baseline', "TEXT DEFAULT ''"),
                 ('vnc_tunnel', "INTEGER DEFAULT 0"),
                 ('backup_sla_max_age_hours', "INTEGER DEFAULT 0"),
+                # MK May 2026 — Proxmox API port override (default 8006). Direct
+                # TLS only — we don't support reverse-proxied PVE by design.
+                ('api_port', "INTEGER DEFAULT 8006"),
             ]:
                 if col_name not in cluster_columns:
                     try:
@@ -1776,7 +1790,7 @@ class PegaProxDB:
                     if not salt or salt == '':  # password_salt is empty or missing
                         logging.warning("Users have empty password_salt - will re-migrate from legacy files")
                         needs_user_remigration = True
-            except sqlite3.OperationalError as e:
+            except dbcrypto.OperationalError as e:
                 # Column might not exist
                 logging.warning(f"Could not check password_salt: {e} - will re-migrate")
                 needs_user_remigration = True
@@ -2619,6 +2633,7 @@ class PegaProxDB:
                 'cpu_baseline': row['cpu_baseline'] if 'cpu_baseline' in row.keys() else '',
                 'vnc_tunnel': bool(row['vnc_tunnel']) if 'vnc_tunnel' in row.keys() else False,
                 'backup_sla_max_age_hours': int(row['backup_sla_max_age_hours']) if 'backup_sla_max_age_hours' in row.keys() and row['backup_sla_max_age_hours'] is not None else 0,
+                'api_port': int(row['api_port']) if 'api_port' in row.keys() and row['api_port'] is not None else 8006,
             }
 
         return clusters
@@ -2699,6 +2714,8 @@ class PegaProxDB:
             'cpu_baseline': row['cpu_baseline'] if 'cpu_baseline' in row.keys() else '',
             'vnc_tunnel': bool(row['vnc_tunnel']) if 'vnc_tunnel' in row.keys() else False,
             'backup_sla_max_age_hours': int(row['backup_sla_max_age_hours']) if 'backup_sla_max_age_hours' in row.keys() and row['backup_sla_max_age_hours'] is not None else 0,
+            # MK May 2026 — Proxmox API port override (default 8006). Direct-TLS only, never proxied.
+            'api_port': int(row['api_port']) if 'api_port' in row.keys() and row['api_port'] is not None else 8006,
         }
 
     def save_cluster(self, cluster_id: str, data: dict):
@@ -2724,9 +2741,10 @@ class PegaProxDB:
              balance_cpu_weight, balance_mem_weight, balance_io_weight,
              cpu_baseline, vnc_tunnel,
              backup_sla_max_age_hours,
+             api_port,
              created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             cluster_id,
             data.get('name', ''),
@@ -2764,6 +2782,7 @@ class PegaProxDB:
             data.get('cpu_baseline', '') or '',
             1 if data.get('vnc_tunnel', False) else 0,
             int(data.get('backup_sla_max_age_hours', 0) or 0),
+            int(data.get('api_port', 8006) or 8006),
             existing['created_at'] if existing else now,
             now
         ))
@@ -3931,14 +3950,14 @@ class PegaProxDB:
     def query(self, sql: str, params: tuple = ()) -> list:
         """Execute SQL query and return all results as list of Row objects"""
         cursor = self.conn.cursor()
-        cursor.row_factory = sqlite3.Row
+        cursor.row_factory = dbcrypto.Row
         cursor.execute(sql, params)
         return cursor.fetchall()
     
     def query_one(self, sql: str, params: tuple = ()):
         """Execute SQL query and return first result or None"""
         cursor = self.conn.cursor()
-        cursor.row_factory = sqlite3.Row
+        cursor.row_factory = dbcrypto.Row
         cursor.execute(sql, params)
         return cursor.fetchone()
 
@@ -3976,7 +3995,7 @@ class PegaProxDB:
 
     def get_efficient_snapshots(self, cluster_id: str, vmid: int) -> list:
         cursor = self.conn.cursor()
-        cursor.row_factory = sqlite3.Row
+        cursor.row_factory = dbcrypto.Row
         cursor.execute(
             'SELECT * FROM efficient_snapshots WHERE cluster_id = ? AND vmid = ? ORDER BY created_at DESC',
             (cluster_id, vmid)
@@ -3987,7 +4006,7 @@ class PegaProxDB:
     def get_efficient_snapshot(self, snap_id: str) -> dict:
         # MK: returns None if not found
         cursor = self.conn.cursor()
-        cursor.row_factory = sqlite3.Row
+        cursor.row_factory = dbcrypto.Row
         cursor.execute('SELECT * FROM efficient_snapshots WHERE id = ?', (snap_id,))
         row = cursor.fetchone()
         return self._row_to_efficient_snapshot(row) if row else None
@@ -4025,7 +4044,7 @@ class PegaProxDB:
     def get_all_efficient_snapshots(self, cluster_id: str) -> list:
         """Get all efficient snapshots for a given cluster, ordered by creation date."""
         cursor = self.conn.cursor()
-        cursor.row_factory = sqlite3.Row
+        cursor.row_factory = dbcrypto.Row
         cursor.execute(
             'SELECT * FROM efficient_snapshots WHERE cluster_id = ? ORDER BY created_at DESC',
             (cluster_id,)

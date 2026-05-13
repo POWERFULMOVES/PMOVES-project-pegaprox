@@ -17,8 +17,8 @@ bp = Blueprint('ceph', __name__)
 
 
 def _ceph_url(manager, node, sub=''):
-    host = manager.host
-    return f"https://{host}:8006/api2/json/nodes/{node}/ceph{sub}"
+    host, port = manager.host, manager.api_port
+    return f"https://{host}:{port}/api2/json/nodes/{node}/ceph{sub}"
 
 
 # MK: Mar 2026 - PVE returns OSD data as CRUSH tree, not flat list
@@ -70,9 +70,9 @@ def _valid_image(name):
 def _get_any_online_node(manager):
     """NS: grab first online node - same approach as get_ceph_overview"""
     try:
-        host = manager.host
+        host, port = manager.host, manager.api_port
         session = manager._create_session()
-        nr = session.get(f"https://{host}:8006/api2/json/nodes", timeout=5)
+        nr = session.get(f"https://{host}:{port}/api2/json/nodes", timeout=5)
         if nr.status_code == 200:
             for n in nr.json().get('data', []):
                 if n.get('status') == 'online':
@@ -87,7 +87,7 @@ def _resolve_node_ip(manager, node_name):
     We need the actual IP for SSH, not the node name."""
     try:
         session = manager._create_session()
-        resp = session.get(f"https://{manager.host}:8006/api2/json/cluster/status", timeout=8)
+        resp = session.get(f"https://{manager.host}:{manager.api_port}/api2/json/cluster/status", timeout=8)
         if resp.status_code == 200:
             for item in resp.json().get('data', []):
                 if item.get('type') == 'node' and item.get('name') == node_name:
@@ -180,11 +180,11 @@ def get_ceph_overview(cluster_id):
     }
 
     try:
-        host = manager.host
+        host, port = manager.host, manager.api_port
         session = manager._create_session()
 
         # Find first online node to query Ceph
-        nodes_url = f"https://{host}:8006/api2/json/nodes"
+        nodes_url = f"https://{host}:{port}/api2/json/nodes"
         nr = session.get(nodes_url, timeout=5)
         online_nodes = []
         if nr.status_code == 200:
@@ -254,7 +254,7 @@ def get_ceph_overview(cluster_id):
                     continue
 
         # last resort: cluster-level metadata endpoint (PVE 9+)
-        cluster_url = f"https://{host}:8006/api2/json/cluster/ceph"
+        cluster_url = f"https://{host}:{port}/api2/json/cluster/ceph"
         if not result.get('osd') or not result.get('mon'):
             try:
                 r = session.get(f"{cluster_url}/metadata", timeout=10)

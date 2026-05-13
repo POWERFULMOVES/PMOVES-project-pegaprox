@@ -220,12 +220,12 @@ def check_and_send_alerts():
                                 last_bk = {}
                                 try:
                                     sess = manager._create_session()
-                                    nr = sess.get(f"https://{manager.host}:8006/api2/json/nodes", timeout=10)
+                                    nr = sess.get(f"https://{manager.host}:{manager.api_port}/api2/json/nodes", timeout=10)
                                     nodes = [n['node'] for n in (nr.json().get('data') or [])
                                              if n.get('status') == 'online'] if nr.status_code == 200 else []
                                     seen = set()
                                     for nd in nodes:
-                                        sr = sess.get(f"https://{manager.host}:8006/api2/json/nodes/{nd}/storage", timeout=10)
+                                        sr = sess.get(f"https://{manager.host}:{manager.api_port}/api2/json/nodes/{nd}/storage", timeout=10)
                                         if sr.status_code != 200: continue
                                         for st in sr.json().get('data') or []:
                                             if 'backup' not in (st.get('content') or ''): continue
@@ -233,7 +233,7 @@ def check_and_send_alerts():
                                             if not sname or (nd, sname) in seen: continue
                                             seen.add((nd, sname))
                                             try:
-                                                cr = sess.get(f"https://{manager.host}:8006/api2/json/nodes/{nd}/storage/{sname}/content",
+                                                cr = sess.get(f"https://{manager.host}:{manager.api_port}/api2/json/nodes/{nd}/storage/{sname}/content",
                                                               params={'content': 'backup'}, timeout=(5, 30))
                                             except Exception:
                                                 continue

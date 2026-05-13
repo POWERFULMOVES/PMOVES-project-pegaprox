@@ -1027,7 +1027,7 @@ def get_cluster_creds_internal(cluster_id):
     
     # Get node IPs - the cluster_host is our reliable fallback
     node_ips = {}
-    cluster_host = mgr.host
+    cluster_host, cluster_port = mgr.host, mgr.api_port
 
     logging.info(f"[CLUSTER-CREDS] Getting node IPs for cluster {cluster_id}, host={cluster_host}")
 
@@ -1076,7 +1076,7 @@ def get_cluster_creds_internal(cluster_id):
                 nodes = getattr(mgr, '_cached_nodes', None)
                 if not nodes:
                     try:
-                        r = mgr._create_session().get(f"https://{cluster_host}:8006/api2/json/nodes", timeout=10)
+                        r = mgr._create_session().get(f"https://{cluster_host}:{cluster_port}/api2/json/nodes", timeout=10)
                         if r.status_code == 200:
                             nodes = r.json().get('data', []) or []
                             try:

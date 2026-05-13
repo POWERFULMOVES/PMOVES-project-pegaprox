@@ -44,7 +44,14 @@ USER pegaprox
 
 EXPOSE 5000 5001 5002
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+# MK May 2026 — start_period bumped from 15s to 120s and retries from 3 to 5
+# to give the one-time plain→SQLCipher DB migration room to finish on first
+# boot post-update. Empirical timing: ~0.5s per MB of DB. start_period covers
+# DBs up to ~240MB cleanly; retries (5×30s = 150s extra) extend the tolerance
+# to ~4.5 minutes total before the container gets marked unhealthy. After the
+# initial migration, all subsequent boots short-circuit (state == 'encrypted')
+# so the long start_period only costs operators on the upgrade boot.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=5 \
     CMD python3 -c "import urllib.request; urllib.request.urlopen('https://localhost:5000/api/health', context=__import__('ssl')._create_unverified_context())" || exit 1
 
 ENTRYPOINT ["python3", "pegaprox_multi_cluster.py"]

@@ -100,6 +100,17 @@ class PegaProxConfig:
         self.ssh_user = cluster_data.get('ssh_user', '')
         self.ssh_key = cluster_data.get('ssh_key', '')
         self.ssh_port = cluster_data.get('ssh_port', 22)
+        # MK May 2026 — Proxmox API port. Default :8006 covers ~all installs,
+        # but ops running PVE on a non-standard port (firewall constraint,
+        # multi-tenant single-IP, hardened jumpbox) need to override this.
+        # NOTE: We do NOT support reverse-proxied PVE — direct TLS to PVE is
+        # the only supported path, by design (no MitM-able intermediate hop).
+        try:
+            self.api_port = int(cluster_data.get('api_port', 8006) or 8006)
+            if not (1 <= self.api_port <= 65535):
+                self.api_port = 8006
+        except (TypeError, ValueError):
+            self.api_port = 8006
         self.ha_settings = cluster_data.get('ha_settings', {})
         self.excluded_nodes = cluster_data.get('excluded_nodes', [])
         self.smbios_autoconfig = cluster_data.get('smbios_autoconfig', {})

@@ -141,12 +141,23 @@ def load_plugin(app, plugin_id):
     WARNING: Plugins execute arbitrary Python with full process privileges.
     Only load plugins from trusted sources. There is no sandbox.
     NS Apr 2026: idempotent — if already loaded, return success without re-registering."""
+    # NS May 2026 (Aikido SAST hardening) — defense-in-depth on plugin_id.
+    # All API entry points already validate via _valid_plugin_id, but if a
+    # future caller bypasses that we still refuse a path-traversal name here.
+    if not _valid_plugin_id(plugin_id):
+        return False, 'Invalid plugin id'
     # idempotency — re-enable clicks used to double-register routes
     with _plugin_lock:
         if plugin_id in _loaded_plugins:
             return True, ''
 
-    plugin_dir = Path(PLUGINS_DIR) / plugin_id
+    plugins_root = Path(PLUGINS_DIR).resolve()
+    plugin_dir = (plugins_root / plugin_id).resolve()
+    # belt + suspenders: ensure resolved path is still under plugins/.
+    try:
+        plugin_dir.relative_to(plugins_root)
+    except ValueError:
+        return False, 'Plugin path escapes plugins root'
     init_file = plugin_dir / '__init__.py'
 
     if not init_file.exists():

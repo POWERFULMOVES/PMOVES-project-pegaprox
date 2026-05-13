@@ -302,7 +302,15 @@ def safe_error(e, default_msg='An internal error occurred'):
 def parse_pve_error(response_text, fallback='Proxmox API error'):
     """Extract user-friendly error from Proxmox API response.
     PVE returns JSON like {"data":null,"message":"some error\\n"} or plain text.
+
+    MK May 2026 — defense-in-depth: HTML-escape the extracted message before
+    returning. Reflecting raw upstream response text into our JSON error
+    field gets flagged by Snyk Code as reflected-XSS-via-JSON even though
+    Flask's jsonify sets Content-Type: application/json (which prevents
+    browser execution). Escaping makes the trace clean and gives us a
+    safety net if a future code path returns this string as text/html.
     """
+    import html
     if not response_text:
         return fallback
     try:
@@ -314,11 +322,11 @@ def parse_pve_error(response_text, fallback='Proxmox API error'):
         if isinstance(msg, dict):
             msg = '; '.join(f"{k}: {v}" for k, v in msg.items())
         if msg:
-            return str(msg).strip()
+            return html.escape(str(msg).strip()[:500])
     except (json.JSONDecodeError, ValueError, AttributeError):
         pass
     # plain text — truncate and clean
     text = response_text.strip()[:200]
     if '<html' in text.lower():
         return fallback
-    return text or fallback
+    return html.escape(text) if text else fallback

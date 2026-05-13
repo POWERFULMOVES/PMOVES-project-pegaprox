@@ -384,7 +384,7 @@ def plan_pve_to_xcpng(source_cluster_id, source_node, source_vmid, target_cluste
     # check stopped
     status_ok = False
     try:
-        st_url = f"https://{src.host}:8006/api2/json/nodes/{source_node}/qemu/{source_vmid}/status/current"
+        st_url = f"https://{src.host}:{src.api_port}/api2/json/nodes/{source_node}/qemu/{source_vmid}/status/current"
         st_resp = src._api_get(st_url)
         if st_resp.status_code == 200:
             st_data = st_resp.json().get('data', {})
@@ -516,7 +516,7 @@ def _get_pve_targets(pve_mgr):
     node_bridges = {}
     for n in nodes:
         try:
-            sr = pve_mgr._api_get(f"https://{pve_mgr.host}:8006/api2/json/nodes/{n}/storage")
+            sr = pve_mgr._api_get(f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json/nodes/{n}/storage")
             if sr.status_code == 200:
                 node_storages[n] = [s['storage'] for s in sr.json().get('data', [])
                                     if s.get('active') and 'images' in s.get('content', '')]
@@ -526,7 +526,7 @@ def _get_pve_targets(pve_mgr):
             node_storages[n] = []
         # bridges
         try:
-            nr = pve_mgr._api_get(f"https://{pve_mgr.host}:8006/api2/json/nodes/{n}/network")
+            nr = pve_mgr._api_get(f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json/nodes/{n}/network")
             if nr.status_code == 200:
                 node_bridges[n] = [iface['iface'] for iface in nr.json().get('data', [])
                                    if iface.get('type') == 'bridge' and iface.get('active')]
@@ -637,7 +637,7 @@ def _run_xcpng_to_pve(task):
 
         # get next VMID on target
         try:
-            nxt = tgt_mgr._api_get(f"https://{tgt_mgr.host}:8006/api2/json/cluster/nextid")
+            nxt = tgt_mgr._api_get(f"https://{tgt_mgr.host}:{tgt_mgr.api_port}/api2/json/cluster/nextid")
             new_vmid = int(nxt.json().get('data', 100))
         except:
             new_vmid = 100
@@ -830,7 +830,7 @@ def _run_xcpng_to_pve(task):
 
         try:
             resp = tgt_mgr._api_post(
-                f"https://{tgt_mgr.host}:8006/api2/json/nodes/{task.target_node}/qemu",
+                f"https://{tgt_mgr.host}:{tgt_mgr.api_port}/api2/json/nodes/{task.target_node}/qemu",
                 data=create_data
             )
             if resp.status_code not in (200, 201):
@@ -851,7 +851,7 @@ def _run_xcpng_to_pve(task):
             try:
                 attach_data = {f'scsi{vol_info["index"]}': vol_info['vol_id']}
                 resp = tgt_mgr._api_post(
-                    f"https://{tgt_mgr.host}:8006/api2/json/nodes/{task.target_node}/qemu/{new_vmid}/config",
+                    f"https://{tgt_mgr.host}:{tgt_mgr.api_port}/api2/json/nodes/{task.target_node}/qemu/{new_vmid}/config",
                     data=attach_data
                 )
                 if resp.status_code == 200:
@@ -866,7 +866,7 @@ def _run_xcpng_to_pve(task):
             try:
                 efi_data = {'efidisk0': f'{task.target_storage}:1,efitype=4m,pre-enrolled-keys=1'}
                 tgt_mgr._api_post(
-                    f"https://{tgt_mgr.host}:8006/api2/json/nodes/{task.target_node}/qemu/{new_vmid}/config",
+                    f"https://{tgt_mgr.host}:{tgt_mgr.api_port}/api2/json/nodes/{task.target_node}/qemu/{new_vmid}/config",
                     data=efi_data
                 )
                 task.log("Added EFI disk")
@@ -878,7 +878,7 @@ def _run_xcpng_to_pve(task):
         # boot order
         try:
             tgt_mgr._api_post(
-                f"https://{tgt_mgr.host}:8006/api2/json/nodes/{task.target_node}/qemu/{new_vmid}/config",
+                f"https://{tgt_mgr.host}:{tgt_mgr.api_port}/api2/json/nodes/{task.target_node}/qemu/{new_vmid}/config",
                 data={'boot': 'order=scsi0'}
             )
         except:
@@ -889,7 +889,7 @@ def _run_xcpng_to_pve(task):
             try:
                 time.sleep(2)  # give PVE a moment
                 tgt_mgr._api_post(
-                    f"https://{tgt_mgr.host}:8006/api2/json/nodes/{task.target_node}/qemu/{new_vmid}/status/start",
+                    f"https://{tgt_mgr.host}:{tgt_mgr.api_port}/api2/json/nodes/{task.target_node}/qemu/{new_vmid}/status/start",
                     data={}
                 )
                 task.log(f"Started VM {new_vmid}")
@@ -1372,7 +1372,7 @@ def _resolve_pve_node_ip(pve_mgr, node_name):
     """Get the SSH-reachable IP of a Proxmox node. Tries API, then cluster host."""
     try:
         nr = pve_mgr._api_get(
-            f"https://{pve_mgr.host}:8006/api2/json/nodes/{node_name}/network")
+            f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json/nodes/{node_name}/network")
         if nr.status_code == 200:
             for iface in nr.json().get('data', []):
                 if iface.get('type') == 'bridge' and iface.get('address'):
@@ -1893,7 +1893,7 @@ def _run_esxi_to_pve(task):
 
         try:
             resp = tgt_mgr._api_post(
-                f"https://{tgt_mgr.host}:8006/api2/json/nodes/{task.target_node}/qemu",
+                f"https://{tgt_mgr.host}:{tgt_mgr.api_port}/api2/json/nodes/{task.target_node}/qemu",
                 data=create_data
             )
             if resp.status_code not in (200, 201):
@@ -1913,7 +1913,7 @@ def _run_esxi_to_pve(task):
             try:
                 attach_data = {f'scsi{vol["index"]}': vol['vol_id']}
                 resp = tgt_mgr._api_post(
-                    f"https://{tgt_mgr.host}:8006/api2/json/nodes/{task.target_node}/qemu/{new_vmid}/config",
+                    f"https://{tgt_mgr.host}:{tgt_mgr.api_port}/api2/json/nodes/{task.target_node}/qemu/{new_vmid}/config",
                     data=attach_data
                 )
                 if resp.status_code == 200:

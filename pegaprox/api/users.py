@@ -521,11 +521,11 @@ def get_security_audit(cluster_id):
     manager = cluster_managers[cluster_id]
     
     try:
-        host = manager.host
+        host, port = manager.host, manager.api_port
         session = manager._create_session()
         
         # Get nodes
-        nodes_url = f"https://{host}:8006/api2/json/nodes"
+        nodes_url = f"https://{host}:{port}/api2/json/nodes"
         nodes_resp = session.get(nodes_url, timeout=10)
         nodes = [n.get('node') for n in nodes_resp.json().get('data', []) if n.get('status') == 'online']
         
@@ -553,7 +553,7 @@ def get_security_audit(cluster_id):
         
         # Check cluster firewall
         try:
-            fw_url = f"https://{host}:8006/api2/json/cluster/firewall/options"
+            fw_url = f"https://{host}:{port}/api2/json/cluster/firewall/options"
             fw_resp = session.get(fw_url, timeout=5)
             if fw_resp.status_code == 200:
                 fw_data = fw_resp.json().get('data', {})
@@ -565,13 +565,13 @@ def get_security_audit(cluster_id):
         for node in nodes:
             # Node firewall
             try:
-                node_fw_url = f"https://{host}:8006/api2/json/nodes/{node}/firewall/options"
+                node_fw_url = f"https://{host}:{port}/api2/json/nodes/{node}/firewall/options"
                 node_fw_resp = session.get(node_fw_url, timeout=5)
                 if node_fw_resp.status_code == 200:
                     node_fw_data = node_fw_resp.json().get('data', {})
                     
                     # Count rules
-                    rules_url = f"https://{host}:8006/api2/json/nodes/{node}/firewall/rules"
+                    rules_url = f"https://{host}:{port}/api2/json/nodes/{node}/firewall/rules"
                     rules_resp = session.get(rules_url, timeout=5)
                     rules_count = len(rules_resp.json().get('data', [])) if rules_resp.status_code == 200 else 0
                     
@@ -619,7 +619,7 @@ def get_security_audit(cluster_id):
         
         # Check 2FA status
         try:
-            tfa_url = f"https://{host}:8006/api2/json/access/tfa"
+            tfa_url = f"https://{host}:{port}/api2/json/access/tfa"
             tfa_resp = session.get(tfa_url, timeout=5)
             if tfa_resp.status_code == 200:
                 tfa_data = tfa_resp.json().get('data', [])

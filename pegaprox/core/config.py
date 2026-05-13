@@ -23,35 +23,29 @@ except ImportError:
     pass
 
 def get_or_create_encryption_key():
-    """Get existing encryption key or create a new one"""
+    """Get the master key — now resolved by `pegaprox.core.keystore`.
+
+    Kept as a back-compat shim so older imports (audit.py, plugins) keep
+    working.  The actual resolution logic moved to keystore.load_master_key()
+    which supports systemd LoadCredentialEncrypted, env vars, /etc/pegaprox/,
+    user-config and the legacy CONFIG_DIR location (in priority order).
+
+    MK May 2026 (Stufe 1+2 of the security-review response).
+    """
     if not ENCRYPTION_AVAILABLE:
         return None
-    
-    if os.path.exists(KEY_FILE):
-        with open(KEY_FILE, 'rb') as f:
-            return f.read()
-    
-    # Generate new key
-    key = Fernet.generate_key()
-    
-    # Save key with restricted permissions
-    with open(KEY_FILE, 'wb') as f:
-        f.write(key)
-    
-    # Set file permissions to owner only (Unix)
     try:
-        os.chmod(KEY_FILE, 0o600)
+        from pegaprox.core.keystore import load_master_key
+        return load_master_key().key_b64
     except Exception as e:
-        logging.warning(f"Could not set key file permissions: {e}")
-    
-    logging.info("Generated new encryption key")
-    return key
+        logging.error(f"[CONFIG] keystore.load_master_key() failed: {e}")
+        return None
 
 def get_fernet():
     """Get Fernet encryption instance"""
     if not ENCRYPTION_AVAILABLE:
         return None
-    
+
     key = get_or_create_encryption_key()
     if key:
         return Fernet(key)
@@ -171,6 +165,8 @@ def save_config():
                     'balance_io_weight': float(getattr(manager.config, 'balance_io_weight', 1.0) or 1.0),
                     'cpu_baseline': getattr(manager.config, 'cpu_baseline', '') or '',
                     'backup_sla_max_age_hours': int(getattr(manager.config, 'backup_sla_max_age_hours', 0) or 0),
+                    # MK May 2026 — Proxmox API port override (default 8006). Direct-TLS only.
+                    'api_port': int(getattr(manager.config, 'api_port', 8006) or 8006),
                 }
 
                 db.save_cluster(cluster_id, cluster_data)

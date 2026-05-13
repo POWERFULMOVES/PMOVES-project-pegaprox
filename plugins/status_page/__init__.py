@@ -10,11 +10,15 @@ import json
 import hmac
 import logging
 import uuid
-import sqlite3
+import sqlite3  # kept for Row + type re-exports
 from datetime import datetime, timedelta
 from flask import request, jsonify, send_file, Response
 
 from pegaprox.api.plugins import register_plugin_route
+# MK May 2026 — plugins must route DB connections through dbcrypto so SQLCipher
+# unlocks the encrypted DB. Direct sqlite3.connect() will fail once encryption
+# is active.
+from pegaprox.core import dbcrypto
 from pegaprox.globals import cluster_managers, pbs_managers
 from pegaprox.constants import CONFIG_DIR
 
@@ -343,9 +347,10 @@ def _public_status():
 # ─── Incident CRUD (admin) ───
 
 def _get_db():
+    # MK May 2026: route via dbcrypto so the SQLCipher handshake runs first.
     db_path = os.path.join(CONFIG_DIR, 'pegaprox.db')
-    conn = sqlite3.connect(db_path, timeout=5)
-    conn.row_factory = sqlite3.Row
+    conn = dbcrypto.connect(db_path, timeout=5)
+    conn.row_factory = dbcrypto.Row
     return conn
 
 def _get_recent_incidents(days=14):

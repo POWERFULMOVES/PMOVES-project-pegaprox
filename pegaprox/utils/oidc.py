@@ -13,6 +13,9 @@ import requests
 from datetime import datetime
 from urllib.parse import urlencode
 
+# NS May 2026 — SSRF guard for admin-supplied OIDC URLs (discovery / token / userinfo).
+from pegaprox.utils.url_security import sanitize_outbound_url, SsrfError
+
 # MK Mar 2026 - PyJWT for proper signature verification
 try:
     import jwt as pyjwt
@@ -150,6 +153,11 @@ def get_oidc_endpoints(config: dict) -> dict:
 
         skip_ssl = bool(config.get('oidc_skip_ssl_verify', False))
         try:
+            try:
+                sanitize_outbound_url(discovery_url)
+            except SsrfError as guard_err:
+                logging.warning(f"[OIDC] discovery_url rejected by SSRF guard: {guard_err}")
+                return None
             resp = requests.get(discovery_url, timeout=15, verify=not skip_ssl)
             if resp.status_code == 200:
                 try:
@@ -263,6 +271,11 @@ def oidc_exchange_code(config: dict, code: str, code_verifier: str = None) -> di
         data['code_verifier'] = code_verifier
     
     try:
+        try:
+            sanitize_outbound_url(endpoints['token'])
+        except SsrfError as guard_err:
+            logging.warning(f"[OIDC] token endpoint rejected by SSRF guard: {guard_err}")
+            return {'error': 'Token endpoint failed pre-flight URL validation'}
         resp = requests.post(endpoints['token'], data=data, timeout=15)
         if resp.status_code != 200:
             logging.error(f"[OIDC] Token exchange failed: {resp.status_code} {resp.text[:300]}")
@@ -391,6 +404,11 @@ def oidc_get_user_info(config: dict, access_token: str) -> dict:
         
         # Fallback or generic OIDC: use standard userinfo endpoint
         if not user_info and endpoints.get('userinfo'):
+            try:
+                sanitize_outbound_url(endpoints['userinfo'])
+            except SsrfError as guard_err:
+                logging.warning(f"[OIDC] userinfo endpoint rejected by SSRF guard: {guard_err}")
+                return {'error': 'Userinfo endpoint failed pre-flight URL validation'}
             resp = requests.get(endpoints['userinfo'], headers=headers, timeout=10)
             if resp.status_code == 200:
                 user_info = resp.json()

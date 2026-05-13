@@ -137,6 +137,13 @@ def request_certificate(domain, email, ssl_dir, staging=False, directory_url=Non
         # Step 1: Load directory
         env = 'custom' if (directory_url or '').strip() else ('staging' if staging else 'production')
         logging.info(f"[ACME] Starting certificate request for {domain} ({env}) via {acme_url}")
+        # NS May 2026 — SSRF guard: ACME directory URL is admin-supplied for
+        # custom installs. Public ACME servers (LE / ZeroSSL) always pass.
+        try:
+            from pegaprox.utils.url_security import sanitize_outbound_url, SsrfError
+            sanitize_outbound_url(acme_url)
+        except SsrfError as guard_err:
+            return {'success': False, 'message': f'ACME directory URL rejected: {guard_err}'}
         dir_resp = requests.get(acme_url, timeout=15)
         dir_resp.raise_for_status()
         directory = dir_resp.json()

@@ -96,6 +96,10 @@ def get_oidc_settings() -> dict:
         # NS Apr 2026 (#188) — let admins disable TLS verification for self-hosted
         # Authentik / Keycloak with self-signed certs. Default OFF (secure).
         'oidc_skip_ssl_verify': settings.get('oidc_skip_ssl_verify', False),
+        # MK May 2026 (#412) — opt-in: skip the SSRF guard's private-IP check
+        # for the OIDC discovery URL only. Metadata-IP blocklist (169.254.x.x
+        # etc.) still binds. See helpers.py default-block for rationale.
+        'oidc_allow_private_ip': settings.get('oidc_allow_private_ip', False),
     }
 
 
@@ -152,15 +156,24 @@ def get_oidc_endpoints(config: dict) -> dict:
             }
 
         skip_ssl = bool(config.get('oidc_skip_ssl_verify', False))
+        allow_private_ip = bool(config.get('oidc_allow_private_ip', False))
         try:
             try:
-                sanitize_outbound_url(discovery_url)
+                # MK May 2026 (#412): pass allow_private through so internal
+                # IdPs at 10.x / 192.168.x can be used when the operator
+                # explicitly opted in. Metadata blocklist still binds.
+                sanitize_outbound_url(discovery_url, allow_private=allow_private_ip)
             except SsrfError as guard_err:
                 logging.warning(f"[OIDC] discovery_url rejected by SSRF guard: {guard_err}")
                 # MK May 2026 (#188 follow-up): never return None — callers
                 # crash with `'NoneType' object has no attribute 'get'`. Return
                 # a structured dict with an `_error` flag so the test endpoint
                 # can surface "your authority URL is malformed" instead of 500.
+                hint = ""
+                if not allow_private_ip and "private" in str(guard_err).lower():
+                    hint = (" If your IdP is on an internal network and this is "
+                            "intentional, enable `oidc_allow_private_ip` in OIDC "
+                            "settings — metadata IPs stay blocked regardless.")
                 return {
                     'authorization': '', 'token': '', 'jwks': '', 'userinfo': '',
                     'graph_me': '', 'graph_groups': '',
@@ -168,7 +181,7 @@ def get_oidc_endpoints(config: dict) -> dict:
                     '_error': 'ssrf_guard_rejected',
                     '_error_detail': f"Discovery URL '{discovery_url}' rejected by URL safety guard: {guard_err}. "
                                      f"Authority/issuer URL is probably empty, malformed, or pointing at a "
-                                     f"local/private address. Fix the OIDC settings and retry.",
+                                     f"local/private address. Fix the OIDC settings and retry.{hint}",
                 }
             resp = requests.get(discovery_url, timeout=15, verify=not skip_ssl)
             if resp.status_code == 200:

@@ -1275,6 +1275,8 @@ def update_server_settings():
                 'oidc_skip_jwt_verification': lambda v: bool(v),
                 # NS Apr 2026 (#188) — opt-in TLS-skip for self-hosted IdPs with self-signed certs
                 'oidc_skip_ssl_verify': lambda v: bool(v),
+                # MK May 2026 (#412) — opt-in private-IP allowlist for OIDC discovery URL
+                'oidc_allow_private_ip': lambda v: bool(v),
             }
             
             for key, transform in oidc_keys.items():

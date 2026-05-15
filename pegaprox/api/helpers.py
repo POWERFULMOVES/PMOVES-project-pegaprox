@@ -135,6 +135,14 @@ def load_server_settings():
         'oidc_group_mappings': [],
         'oidc_skip_jwt_verification': False,  # NS: disable JWT sig check for broken JWKS envs
         'oidc_skip_ssl_verify': False,        # NS Apr 2026 (#188): self-signed-cert escape hatch
+        # MK May 2026 (#412 SeeJayEmm): SSRF guard's default behaviour rejects
+        # any discovery URL that resolves to a private/loopback IP. Internal IdPs
+        # (Keycloak/Authentik/Authentik-on-LAN at 10.x or 192.168.x) are the
+        # exact use case that breaks. Opt-in knob to relax the guard for the
+        # OIDC discovery path SPECIFICALLY — metadata IPs (169.254.169.254
+        # etc.) are still rejected, and the guard remains on for all other
+        # outbound paths (webhook, SAML metadata fetch, plugin upstream).
+        'oidc_allow_private_ip': False,
     }
     
     try:

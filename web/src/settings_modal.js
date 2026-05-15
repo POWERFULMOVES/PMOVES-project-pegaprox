@@ -648,6 +648,7 @@
                 oidc_group_mappings: [],
                 oidc_skip_jwt_verification: false,
                 oidc_skip_ssl_verify: false,
+                oidc_allow_private_ip: false,   // MK May 2026 (#412)
             });
             const [oidcTesting, setOidcTesting] = useState(false);
             const [oidcTestResult, setOidcTestResult] = useState(null);
@@ -1595,6 +1596,7 @@
                             oidc_button_text: data.oidc_button_text || 'Sign in with Microsoft',
                             oidc_skip_jwt_verification: data.oidc_skip_jwt_verification || false,
                             oidc_skip_ssl_verify: data.oidc_skip_ssl_verify || false,
+                            oidc_allow_private_ip: data.oidc_allow_private_ip || false,
                             oidc_group_mappings: data.oidc_group_mappings || [],
                         }));
                     }
@@ -5206,6 +5208,36 @@
                                         )}
                                         <p className="text-[11px] text-gray-500 leading-snug">
                                             {t('oidcTlsHint') || 'Affects: discovery (.well-known/openid-configuration) and authorization-endpoint reachability checks. Token-exchange and JWKS calls also honor this flag.'}
+                                        </p>
+                                    </div>
+
+                                    {/* MK May 2026 (#412 SeeJayEmm): opt-in private-IP allowlist for internal IdPs */}
+                                    <div className="bg-proxmox-dark border border-proxmox-border rounded-xl p-4 space-y-3">
+                                        <div className="flex items-center justify-between">
+                                            <h4 className="text-white font-medium flex items-center gap-2">
+                                                <Icons.Globe />
+                                                {t('oidcAllowPrivateIp') || 'Internal IdP / Private Network'}
+                                            </h4>
+                                            <label className="flex items-center gap-2 cursor-pointer">
+                                                <input type="checkbox"
+                                                    checked={oidcConfig.oidc_allow_private_ip}
+                                                    onChange={e => setOidcConfig(prev => ({...prev, oidc_allow_private_ip: e.target.checked}))}
+                                                    className="rounded border-proxmox-border bg-proxmox-darker" />
+                                                <span className="text-sm text-gray-300">{t('allowPrivateIp') || 'Allow private IPs'}</span>
+                                            </label>
+                                        </div>
+                                        {oidcConfig.oidc_allow_private_ip ? (
+                                            <div className="p-3 bg-yellow-500/10 border border-yellow-500/30 rounded-lg">
+                                                <p className="text-sm text-yellow-400 font-medium mb-1">⚠ {t('oidcPrivateIpOptIn') || 'Opt-in active'}</p>
+                                                <p className="text-xs text-yellow-300/80">{t('oidcPrivateIpWarning') || 'SSRF guard relaxed for OIDC discovery. Cloud metadata endpoints (169.254.x.x, fd00:ec2::, etc.) are still blocked. Make sure your IdP host is one you actually own.'}</p>
+                                            </div>
+                                        ) : (
+                                            <div className="p-3 bg-green-500/10 border border-green-500/30 rounded-lg">
+                                                <p className="text-xs text-green-400">✓ {t('oidcPrivateIpDisabled') || 'SSRF guard active — private/loopback IPs rejected. Turn on only if your IdP runs on an internal network (10.x / 192.168.x / 172.16-31.x).'}</p>
+                                            </div>
+                                        )}
+                                        <p className="text-[11px] text-gray-500 leading-snug">
+                                            {t('oidcPrivateIpHint') || 'Affects: the /.well-known/openid-configuration discovery call only. Other outbound paths (webhooks, plugin upstreams, SAML metadata) keep the strict guard.'}
                                         </p>
                                     </div>
 

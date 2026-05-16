@@ -26,6 +26,10 @@ INSTALL_DIR="/opt/PegaProx"
 SERVICE_USER="pegaprox"
 SERVICE_GROUP="pegaprox"
 GITHUB_REPO="https://github.com/PegaProx/project-pegaprox.git"
+# MK May 2026 (#417 follow-up, elektronen): allow installing from a specific
+# branch via `PEGAPROX_BRANCH=Testing curl ... | sudo bash`. Default still main
+# so existing curl-pipe invocations don't change behaviour.
+GITHUB_BRANCH="${PEGAPROX_BRANCH:-main}"
 PYTHON_FILE="pegaprox_multi_cluster.py"
 
 # Default options
@@ -175,8 +179,8 @@ main() {
         TEMP_DIR=$(mktemp -d)
         print_info "Cloning repository..."
 
-        if git clone --depth 1 --quiet "$GITHUB_REPO" "$TEMP_DIR/pegaprox" 2>/dev/null; then
-            print_success "Repository cloned"
+        if git clone --depth 1 --branch "$GITHUB_BRANCH" --quiet "$GITHUB_REPO" "$TEMP_DIR/pegaprox" 2>/dev/null; then
+            print_success "Repository cloned (branch: $GITHUB_BRANCH)"
 
             # Copy ALL files from repo
             cp -r "$TEMP_DIR/pegaprox/"* "$INSTALL_DIR/" 2>/dev/null || true

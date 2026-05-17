@@ -707,8 +707,93 @@ def heartbeat_loop():
         time.sleep(30)
 
 
+def recover_orphan_runs():
+    """One-shot cleanup of in-flight rows left over from a previous PegaProx
+    process. Without this, `site_recovery_events` rows that were `status=running`
+    when the service crashed/restarted stay that way forever — and the matching
+    `site_recovery_plans.status` keeps showing 'running' / 'testing' in the UI,
+    which is what @blackshocks hit on #413 ("tasks still visible after reboot").
+
+    Run once at app startup, just before the heartbeat loop spawns. Best-effort
+    — if the DB isn't ready yet we log and move on; the heartbeat will reconcile
+    on its next pass.
+
+    MK May 2026 (#413).
+    """
+    try:
+        db = get_db()
+    except Exception as e:
+        logger.warning(f"[SR] orphan-cleanup: DB not ready ({e}); skipping")
+        return
+
+    now = datetime.utcnow().isoformat()
+    aborted_events = 0
+    reset_plans = 0
+    try:
+        # Events that were mid-run when the previous process died. completed_at
+        # is the actual "did this finish?" signal — status alone is insufficient
+        # because completed rows can be 'failed' too.
+        ev_rows = db.query(
+            "SELECT id, plan_id, event_type FROM site_recovery_events "
+            "WHERE status = 'running' AND (completed_at IS NULL OR completed_at = '')"
+        ) or []
+        for row in ev_rows:
+            details = json.dumps({
+                'reason': 'pegaprox_restart',
+                'note': 'event was in flight when the service restarted; auto-aborted at boot',
+            })
+            db.execute(
+                "UPDATE site_recovery_events SET status = 'aborted', "
+                "completed_at = ?, details = ? WHERE id = ?",
+                (now, details, row['id']),
+            )
+            aborted_events += 1
+
+        # Plans whose status is mid-state. If the heartbeat or operator wants
+        # to run it again, the state machine needs them back in 'failed' (which
+        # then transitions to 'ready' on a manual reset).
+        plan_rows = db.query(
+            "SELECT id, name, status FROM site_recovery_plans "
+            "WHERE status IN ('running', 'testing')"
+        ) or []
+        for row in plan_rows:
+            db.execute(
+                "UPDATE site_recovery_plans SET status = 'failed', updated_at = ? WHERE id = ?",
+                (now, row['id']),
+            )
+            reset_plans += 1
+    except Exception as e:
+        logger.error(f"[SR] orphan-cleanup query failed: {e}")
+        return
+
+    if aborted_events or reset_plans:
+        logger.warning(
+            f"[SR] orphan-cleanup at boot: aborted {aborted_events} stuck event(s), "
+            f"reset {reset_plans} plan(s) from running/testing → failed"
+        )
+        # Audit-log so an admin reading the audit feed sees what got rolled back.
+        try:
+            log_audit(
+                user='system',
+                action='site_recovery.boot_cleanup',
+                details=f"aborted={aborted_events} events, reset={reset_plans} plans",
+                ip_address='127.0.0.1',
+            )
+        except Exception as e:
+            logger.debug(f"[SR] orphan-cleanup audit-log failed (non-fatal): {e}")
+    else:
+        logger.info("[SR] orphan-cleanup at boot: nothing to do")
+
+
 def start_heartbeat():
     import gevent
+    # MK May 2026 (#413): clean up any in-flight rows from the previous process
+    # before the heartbeat starts so the UI doesn't keep showing aborted runs
+    # as active.
+    try:
+        recover_orphan_runs()
+    except Exception as e:
+        logger.error(f"[SR] orphan-cleanup wrapper crashed: {e}")
     gevent.spawn(heartbeat_loop)
 
 

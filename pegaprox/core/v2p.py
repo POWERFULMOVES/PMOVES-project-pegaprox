@@ -4688,7 +4688,9 @@ exit $((S + R))
             _pve_node_exec(pve_mgr, task.target_node,
                 f"cat > {nc_s} << 'NCEOF'\n{nc_body}\nNCEOF\nchmod +x {nc_s}", timeout=10)
             start_time = time.time()
-            rc_bg, _, _ = _pve_node_exec(pve_mgr, task.target_node,
+            # MK May 2026 (#411): capture output so a fast-failing nc path
+            # (auth, port conflict, missing nc, etc.) surfaces in the task log.
+            rc_bg, bg_out, bg_err = _pve_node_exec(pve_mgr, task.target_node,
                 f"bash {nc_s} 2>&1", timeout=86400)
             _pve_node_exec(pve_mgr, task.target_node, f"rm -f {nc_s}", timeout=5)
             elapsed = time.time() - start_time
@@ -4697,6 +4699,14 @@ exit $((S + R))
                 task.log(f"  ✓ {elapsed:.0f}s, {speed:.0f} MB/s effective")
                 bg_copied = True
             else:
+                # nc didn't take. Log the tail before we fall through to
+                # the SSH+compress path so the user knows why nc bailed.
+                tail = ((bg_err or bg_out) or '').strip()
+                if tail and rc_bg != 0:
+                    excerpt = '\n'.join(tail.splitlines()[-6:])[:400]
+                    task.log(f"  nc rc={rc_bg} after {elapsed:.0f}s — falling through to SSH+compress")
+                    for line in excerpt.splitlines():
+                        task.log(f"    {line}")
                 _pve_node_exec(pve_mgr, task.target_node,
                     f"kill $(lsof -ti :{port}) 2>/dev/null; true", timeout=5)
         
@@ -4723,10 +4733,21 @@ exit $((S + R))
                     f'| {BG_NICE} {BG_DD_SEEK} of={dev_path} seek={sk} 2>/dev/null &'
                 )
             lines.append("wait")
+            # MK May 2026 (#411 crcro): two bugs here, fixing both.
+            # (1) the chmod line was a concat with a non-f-string, so `{ss}`
+            #     was being passed as a literal to the remote shell, making
+            #     chmod fail (cosmetic — bash still ran the script without
+            #     exec bit, but it polluted stderr and obscured real errors).
+            # (2) stdout+stderr of the failed bash run was being thrown
+            #     away. When SSH+compress fails fast (auth, missing
+            #     binaries, network), the user sees only "Copy failed!"
+            #     with no clue what failed. Capture and surface the tail
+            #     of the output on rc!=0 so the next ticket on this has
+            #     something actionable.
             _pve_node_exec(pve_mgr, task.target_node,
-                f"cat > {ss} << 'SEOF'\n" + "\n".join(lines) + "\nSEOF\nchmod +x {ss}", timeout=10)
+                f"cat > {ss} << 'SEOF'\n" + "\n".join(lines) + f"\nSEOF\nchmod +x {ss}", timeout=10)
             start_time = time.time()
-            rc_bg, _, _ = _pve_node_exec(pve_mgr, task.target_node,
+            rc_bg, bg_out, bg_err = _pve_node_exec(pve_mgr, task.target_node,
                 f"bash {ss} 2>&1", timeout=86400)
             _pve_node_exec(pve_mgr, task.target_node, f"rm -f {ss}", timeout=5)
             elapsed = time.time() - start_time
@@ -4734,6 +4755,17 @@ exit $((S + R))
                 speed = disk_gb * 1024 / max(elapsed, 1)
                 task.log(f"  ✓ {elapsed:.0f}s, {speed:.0f} MB/s effective")
                 bg_copied = True
+            else:
+                # Surface what actually broke instead of just "Copy failed".
+                tail = ((bg_err or bg_out) or '').strip()
+                if tail:
+                    # last ~10 lines, trimmed length — keeps the task log readable
+                    excerpt = '\n'.join(tail.splitlines()[-10:])[:600]
+                    task.log(f"  SSH+compress rc={rc_bg} after {elapsed:.0f}s, output tail:")
+                    for line in excerpt.splitlines():
+                        task.log(f"    {line}")
+                else:
+                    task.log(f"  SSH+compress rc={rc_bg} after {elapsed:.0f}s (no output captured)")
         
         if bg_copied:
             task.update_progress(dk, disk_total, disk_total)

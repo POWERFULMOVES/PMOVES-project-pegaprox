@@ -103,7 +103,6 @@ class XcpngManager:
         # node/vm caches
         self._cached_nodes = None
         self._nodes_cache_time = 0
-        self._net_accum = {}  # LW: accumulate rate→cumulative for frontend compat
         self._nodes_cache_ttl = 8  # seconds, same as PegaProxManager
         self._cached_vms = None
         self._vms_cache_time = 0
@@ -403,18 +402,11 @@ class XcpngManager:
             product_brand = sw_ver.get('product_brand', 'XCP-ng')
             xen_ver = sw_ver.get('xen', '')
 
-            # LW: frontend expects cumulative byte counters (like Proxmox), not rates
-            # accumulate rate * dt to simulate cumulative values
+            # #419 follow-up: emit node netin/netout as bytes/sec rate to match the
+            # post-#419 Proxmox contract on /api/clusters/<id>/metrics. NodeCard now
+            # consumes a rate directly; the previous accumulator-to-counter dance is
+            # no longer needed.
             hostname = _sanitize_str(rec.get('hostname', rec.get('name_label', '')))
-            now = time.time()
-            if hostname not in self._net_accum:
-                self._net_accum[hostname] = {'in': 0, 'out': 0, 't': now}
-            acc = self._net_accum[hostname]
-            dt = now - acc['t']
-            if dt > 0 and dt < 120:  # skip if gap too large (reconnect etc)
-                acc['in'] += netin * dt
-                acc['out'] += netout * dt
-            acc['t'] = now
 
             nodes.append({
                 'node': hostname,
@@ -427,8 +419,8 @@ class XcpngManager:
                 'mem': mem_total - mem_free,
                 'maxmem': mem_total,
                 'uptime': uptime_secs,
-                'netin': acc['in'],
-                'netout': acc['out'],
+                'netin': netin,
+                'netout': netout,
                 'type': 'node',
                 '_enabled': rec.get('enabled', True),
                 '_ref': ref,

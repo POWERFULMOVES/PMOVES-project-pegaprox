@@ -124,6 +124,26 @@ def health_status() -> dict:
 
 # ─── Internal: resolve in priority order ────────────────────────────────────
 
+def _safe_is_file(p: Path) -> bool:
+    """Path.is_file() but returns False on any OSError instead of propagating.
+
+    MK May 2026 (#417 follow-up from tfoks): if a tier path lives under a
+    parent the service user can't traverse (e.g. systemd `ProtectHome=true`,
+    or `/home/pegaprox` exists but is mode 700 owned by someone else, or
+    an ACL blocks lookup), Path.is_file() raises PermissionError. The
+    previous resolver propagated that out of `_resolve()` and never
+    reached the legacy tier — so an upgrade from 0.9.9.x with a perfectly
+    valid `config/.pegaprox.key` in place failed at boot with
+    `[Errno 13] Permission denied: '/home/pegaprox/.config/...'`. Each
+    tier check should treat "I can't even check this path" the same as
+    "this path isn't present" and fall through.
+    """
+    try:
+        return p.is_file()
+    except OSError:
+        return False
+
+
 def _resolve() -> MasterKey:
     # Tier 1: PEGAPROX_DB_KEY env (Docker / k8s / explicit)
     if env_val := os.environ.get('PEGAPROX_DB_KEY'):
@@ -132,7 +152,7 @@ def _resolve() -> MasterKey:
     # Tier 2: systemd LoadCredentialEncrypted
     if cred_dir := os.environ.get('CREDENTIALS_DIRECTORY'):
         cred_path = Path(cred_dir) / 'db-key'
-        if cred_path.is_file():
+        if _safe_is_file(cred_path):
             return _from_file(cred_path, source='systemd-credential', strict_perms=False)
             # systemd already enforces tmpfs + service-uid-only, so we don't
             # require chmod 0600 here (the directory is 0700 by systemd).
@@ -140,22 +160,22 @@ def _resolve() -> MasterKey:
     # Tier 3: explicit path override
     if path_val := os.environ.get('PEGAPROX_KEY_FILE'):
         p = Path(path_val).expanduser()
-        if p.is_file():
+        if _safe_is_file(p):
             return _from_file(p, source='env:PEGAPROX_KEY_FILE')
 
     # Tier 4: /etc/pegaprox/secret.key (system-service install default)
     p = Path('/etc/pegaprox/secret.key')
-    if p.is_file():
+    if _safe_is_file(p):
         return _from_file(p, source='/etc/pegaprox/secret.key')
 
     # Tier 5: ~/.config/pegaprox/secret.key (user install default)
     p = Path('~/.config/pegaprox/secret.key').expanduser()
-    if p.is_file():
+    if _safe_is_file(p):
         return _from_file(p, source='user-config')
 
     # Tier 6 (legacy): CONFIG_DIR/secret.key — warned-on-use
     legacy = _legacy_key_path()
-    if legacy.is_file():
+    if _safe_is_file(legacy):
         mk = _from_file(legacy, source='legacy:CONFIG_DIR', strict_perms=False)
         return MasterKey(mk.key_b64, mk.key_raw, mk.source, mk.source_path, is_legacy=True)
 

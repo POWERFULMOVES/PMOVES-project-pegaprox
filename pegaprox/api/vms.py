@@ -3810,6 +3810,53 @@ def get_vm_guest_fsinfo_api(cluster_id, node, vm_type, vmid):
     return jsonify(payload)
 
 
+# NS May 2026 — read a file from a running VM via the qemu-guest-agent.
+# PVE 9.2 added optional `count`, `offset`, `decode` (base64) params so you
+# can stream large files in chunks without dragging the whole thing through
+# memory. We pass them through; older PVE silently ignores extras.
+@bp.route('/api/clusters/<cluster_id>/vms/<node>/<vm_type>/<int:vmid>/guest-file-read', methods=['POST'])
+@require_auth(perms=['vm.view'])
+def get_vm_guest_file_read_api(cluster_id, node, vm_type, vmid):
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    if vm_type != 'qemu':
+        return jsonify({'error': 'Guest-agent file-read is QEMU-only'}), 400
+
+    mgr = cluster_managers[cluster_id]
+    body = request.json or {}
+    file_path = body.get('file')
+    if not file_path:
+        return jsonify({'error': 'file path required'}), 400
+
+    params = {'file': file_path}
+    # 9.2 optional params — accept ints + a base64 toggle
+    for k in ('count', 'offset'):
+        if k in body and body[k] not in (None, ''):
+            try:
+                params[k] = int(body[k])
+            except (TypeError, ValueError):
+                return jsonify({'error': f'{k} must be an integer'}), 400
+    if body.get('decode'):
+        # PVE expects '1' / '0', accept boolean or string
+        params['decode'] = 1 if body['decode'] in (True, 1, '1', 'true') else 0
+
+    try:
+        url = f"https://{mgr.host}:{mgr.api_port}/api2/json/nodes/{node}/qemu/{vmid}/agent/file-read"
+        resp = mgr._api_post(url, data=params)
+        if resp.status_code == 200:
+            data = (resp.json().get('data') or {})
+            return jsonify({
+                'content': data.get('content'),
+                'truncated': bool(data.get('truncated', False)),
+                'bytes_read': data.get('bytes-read') or data.get('content-size'),
+            })
+        return jsonify({'error': resp.text or f'HTTP {resp.status_code}'}), resp.status_code
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/<vm_type>/<int:vmid>/rrd/<timeframe>', methods=['GET'])
 @require_auth(perms=['vm.view'])
 def get_vm_rrd_api(cluster_id, node, vm_type, vmid, timeframe):

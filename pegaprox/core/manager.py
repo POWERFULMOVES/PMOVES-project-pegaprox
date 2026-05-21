@@ -6811,33 +6811,45 @@ echo "AGENT_INSTALLED_OK"
             self.logger.error(f"Error getting Proxmox HA groups: {e}")
             return []
     
-    def add_vm_to_proxmox_ha(self, vmid: int, vm_type: str = 'vm', group: str = None, 
+    def add_vm_to_proxmox_ha(self, vmid: int, vm_type: str = 'vm', group: str = None,
                              max_restart: int = 1, max_relocate: int = 1, state: str = 'started',
-                             comment: str = None) -> Dict:
-        """add VM/CT to Proxmox native HA with restart/relocate limits"""
+                             comment: str = None, auto_rebalance=None) -> Dict:
+        """add VM/CT to Proxmox native HA with restart/relocate limits.
+
+        MK May 2026 (PVE 9.2) — auto_rebalance is the per-resource opt-out for
+        dynamic CRS rebalancing introduced in 9.2. Accept None (don't send),
+        True/1, or False/0. Stripped for pre-9.2 clusters so the rest of the
+        request still goes through.
+        """
         if not self.is_connected:
             if not self.connect_to_proxmox():
                 return {'success': False, 'error': 'Not connected'}
-        
+
         try:
             host = self.host
             url = f"https://{host}:{self.api_port}/api2/json/cluster/ha/resources"
-            
+
             # sid format: vm:100 or ct:100
             sid = f"{vm_type}:{vmid}"
-            
+
             data = {
                 'sid': sid,
                 'max_restart': max_restart,
                 'max_relocate': max_relocate,
                 'state': state or 'started'
             }
-            
+
             if group:
                 data['group'] = group
             if comment:
                 data['comment'] = comment
-            
+            if auto_rebalance is not None:
+                pve_ver = self.get_pve_version_tuple()
+                if pve_ver is None or pve_ver >= (9, 2):
+                    data['auto-rebalance'] = 1 if auto_rebalance else 0
+                else:
+                    self.logger.debug(f"[HA] auto-rebalance skipped (PVE {pve_ver} < 9.2)")
+
             response = self._api_post(url, data=data)
             
             if response.status_code == 200:
@@ -8506,13 +8518,25 @@ echo "AGENT_INSTALLED_OK"
             data['rootfs'] = f"{storage}:{disk_size}"
             
             # MK: Additional Mount Points
+            # NS May 2026 (PVE 9.2) — mountpoints gained idmap=<map> and
+            # keepattrs=1 sub-options. Both are optional in our request
+            # dict; we only emit them when the caller set them, so older
+            # clusters that don't know the keys aren't surprised.
+            pve_ver = self.get_pve_version_tuple()
+            mp_supports_92 = (pve_ver is None or pve_ver >= (9, 2))
             additional_disks = ct_config.get('additional_disks', [])
             for idx, mp in enumerate(additional_disks):
                 mp_storage = mp.get('storage', storage)
                 mp_size = str(mp.get('size', '8')).replace('G', '').replace('g', '')
                 mp_path = mp.get('path', f'/mnt/data{idx}')
-                # Format: storage:size,mp=/path
-                data[f'mp{idx}'] = f"{mp_storage}:{mp_size},mp={mp_path}"
+                # Format: storage:size,mp=/path[,idmap=...][,keepattrs=1]
+                parts = [f"{mp_storage}:{mp_size}", f"mp={mp_path}"]
+                if mp_supports_92:
+                    if mp.get('idmap'):
+                        parts.append(f"idmap={mp['idmap']}")
+                    if mp.get('keepattrs'):
+                        parts.append('keepattrs=1')
+                data[f'mp{idx}'] = ','.join(parts)
             
             # Network configuration
             # NS: this networking stuff is confusing, proxmox docs are not great

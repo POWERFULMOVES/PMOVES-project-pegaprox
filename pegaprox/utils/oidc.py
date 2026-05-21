@@ -351,12 +351,23 @@ def oidc_decode_id_token(id_token: str, expected_nonce: str = None,
 
                 signing_key = _jwks_clients[jwks_uri].get_signing_key_from_jwt(id_token)
 
+                # NS May 2026 — audience list: client_id is always accepted,
+                # plus any additional audiences the admin configured. PVE 9.2's
+                # OIDC realm gained the same `audiences` field — mirroring it
+                # here lets us accept tokens issued for a logical audience
+                # (e.g. "pegaprox-prod") that maps to multiple deployments.
+                client_id = config.get('client_id')
+                extra_auds = config.get('oidc_audiences', '') or ''
+                if isinstance(extra_auds, str):
+                    extra_auds = [a.strip() for a in extra_auds.split(',') if a.strip()]
+                accepted = [client_id] + extra_auds if client_id else extra_auds or None
+
                 # #188: support more algorithms (Authentik uses RS256, but others exist)
                 claims = pyjwt.decode(
                     id_token,
                     signing_key.key,
                     algorithms=["RS256", "ES256", "PS256", "EdDSA"],
-                    audience=config.get('client_id'),
+                    audience=accepted,
                     options={
                         "verify_exp": True,
                         "verify_aud": True,

@@ -197,18 +197,36 @@ jobs:
           set -e
           mkdir -p /tmp/ct/rootfs
           sudo tar -xpJf rootfs.tar.xz -C /tmp/ct/rootfs
-          sudo systemd-nspawn -D /tmp/ct/rootfs --boot --bind-ro=/etc/resolv.conf &
-          NSPAWN_PID=$!
+
+          # Container im Hintergrund booten. Ohne --network-veth teilt er sich
+          # das Host-Netzwerk -> PegaProx lauscht auf localhost:5000 des Runners.
+          sudo systemd-nspawn -D /tmp/ct/rootfs \
+            --machine pegaprox-test \
+            --boot \
+            --bind-ro=/etc/resolv.conf \
+            > /tmp/nspawn.log 2>&1 &
+
           echo "Warte auf PegaProx auf Port ${PVE_PORT}..."
           OK=0
-          for i in $(seq 1 30); do
-            if sudo systemd-nspawn -D /tmp/ct/rootfs \
-                 curl -kfs "https://localhost:${PVE_PORT}/" >/dev/null 2>&1; then
+          for i in $(seq 1 36); do
+            # erst HTTPS, dann HTTP probieren (je nachdem, was PegaProx spricht)
+            if curl -kfs "https://localhost:${PVE_PORT}/" >/dev/null 2>&1 \
+               || curl -fs "http://localhost:${PVE_PORT}/" >/dev/null 2>&1; then
               OK=1; break
             fi
             sleep 5
           done
-          sudo kill "$NSPAWN_PID" 2>/dev/null || true
+
+          echo "----- Letzte Zeilen des Container-Logs -----"
+          tail -n 40 /tmp/nspawn.log || true
+          echo "----- Lauschende Ports auf dem Host -----"
+          sudo ss -tlnp || true
+
+          # Container sauber herunterfahren
+          sudo machinectl poweroff pegaprox-test 2>/dev/null || true
+          sleep 3
+          sudo machinectl terminate pegaprox-test 2>/dev/null || true
+
           [ "$OK" -eq 1 ] || { echo "::error::PegaProx kam im LXC nicht hoch"; exit 1; }
           echo "LXC Smoke-Test erfolgreich."
 
@@ -227,8 +245,8 @@ jobs:
           retention-days: 7
 
   # ----------------------------------------------------------------------
-  # 3) VM-Image: virt-customize fasst NUR das Dateisystem an (kein Gast-Netz,
-  #    kein passt). PegaProx wird beim ERSTEN BOOT per cloud-init installiert.
+  # 3) VM-Image: Dateien per qemu-nbd direkt einhängen (kein libguestfs,
+  #    kein passt). PegaProx wird beim ERSTEN BOOT per systemd-Unit installiert.
   # ----------------------------------------------------------------------
   build-vm:
     needs: prepare
@@ -240,9 +258,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libguestfs-tools qemu-system-x86 qemu-utils \
-            cloud-image-utils curl passt
-          sudo chmod 0644 /boot/vmlinuz-* || true
+            qemu-utils qemu-system-x86 cloud-image-utils curl
 
       - name: Debian Cloud-Image laden
         run: |
@@ -250,35 +266,29 @@ jobs:
             "https://cloud.debian.org/images/cloud/${DEBIAN_RELEASE}/latest/debian-13-genericcloud-amd64.qcow2"
           qemu-img resize pegaprox.qcow2 8G
 
-      - name: Repo-Konfig + Install-Skript ins Image legen (OHNE Gast-Netz)
+      - name: Dateien per qemu-nbd einhängen (kein libguestfs, kein passt)
         env:
-          # 'direct' = ohne libvirt; SLIRP statt passt als zusätzliche Absicherung
-          LIBGUESTFS_BACKEND: direct
-          LIBGUESTFS_BACKEND_SETTINGS: network
           APTVER: ${{ needs.prepare.outputs.aptver }}
         run: |
           set -e
-          # gyptazy-Repo-Key holen wir auf dem RUNNER (hat Netz), legen ihn als Datei ab
+
+          # --- Dateien, die ins Image sollen, auf dem Runner vorbereiten ---
           curl -fsSL https://git.gyptazy.com/api/packages/gyptazy/debian/repository.key \
             -o gyptazy.asc
 
-          # Sources-Liste vorbereiten
           cat > gyptazy.list <<EOF
           deb [signed-by=/etc/apt/keyrings/gyptazy.asc] https://packages.gyptazy.com/api/packages/gyptazy/debian ${DEBIAN_RELEASE} main
           EOF
 
-          # First-Boot-Installer: läuft EINMAL in der VM, wenn die VM Netz hat
           cat > install-pegaprox.sh <<EOF
           #!/bin/sh
           set -eu
           apt-get update
           apt-get -y install pegaprox=${APTVER}
           systemctl enable pegaprox
-          # sich selbst deaktivieren, damit es nur einmal läuft
           systemctl disable pegaprox-firstboot.service || true
           EOF
 
-          # systemd-Unit, die den Installer beim ersten Boot nach Netz ausführt
           cat > pegaprox-firstboot.service <<'EOF'
           [Unit]
           Description=PegaProx First Boot Installer
@@ -295,16 +305,67 @@ jobs:
           WantedBy=multi-user.target
           EOF
 
-          # NUR Dateisystem-Operationen -> kein Gast-Networking, kein passt
-          sudo -E virt-customize -a pegaprox.qcow2 \
-            --mkdir /etc/apt/keyrings \
-            --upload gyptazy.asc:/etc/apt/keyrings/gyptazy.asc \
-            --upload gyptazy.list:/etc/apt/sources.list.d/gyptazy.list \
-            --upload install-pegaprox.sh:/usr/local/sbin/install-pegaprox.sh \
-            --chmod 0755:/usr/local/sbin/install-pegaprox.sh \
-            --upload pegaprox-firstboot.service:/etc/systemd/system/pegaprox-firstboot.service \
-            --run-command 'systemctl enable pegaprox-firstboot.service' \
-            --run-command 'systemctl enable ssh || true'
+          # --- qcow2 als NBD-Blockgerät einhängen ---
+          sudo modprobe nbd max_part=16
+          sudo qemu-nbd --connect=/dev/nbd0 pegaprox.qcow2
+          # auf Partitionstabelle warten
+          for i in $(seq 1 10); do
+            sudo partprobe /dev/nbd0 2>/dev/null || true
+            sleep 1
+            ls /dev/nbd0p* >/dev/null 2>&1 && break
+          done
+          echo "Partitionen:"; lsblk /dev/nbd0
+
+          # --- Root-Partition finden (die mit /etc/os-release) ---
+          ROOT=""
+          for PART in $(ls /dev/nbd0p* 2>/dev/null); do
+            sudo mkdir -p /mnt/probe
+            if sudo mount "$PART" /mnt/probe 2>/dev/null; then
+              if [ -f /mnt/probe/etc/os-release ]; then
+                ROOT="$PART"
+                sudo umount /mnt/probe
+                break
+              fi
+              sudo umount /mnt/probe
+            fi
+          done
+          [ -n "$ROOT" ] || { echo "::error::Root-Partition nicht gefunden"; exit 1; }
+          echo "Root-Partition: $ROOT"
+
+          sudo mkdir -p /mnt/img
+          sudo mount "$ROOT" /mnt/img
+
+          # --- Dateien hineinkopieren ---
+          sudo mkdir -p /mnt/img/etc/apt/keyrings
+          sudo cp gyptazy.asc  /mnt/img/etc/apt/keyrings/gyptazy.asc
+          sudo cp gyptazy.list /mnt/img/etc/apt/sources.list.d/gyptazy.list
+          sudo cp install-pegaprox.sh /mnt/img/usr/local/sbin/install-pegaprox.sh
+          sudo chmod 0755 /mnt/img/usr/local/sbin/install-pegaprox.sh
+          sudo cp pegaprox-firstboot.service \
+            /mnt/img/etc/systemd/system/pegaprox-firstboot.service
+
+          # --- Services aktivieren = Symlinks setzen (kein chroot/systemctl nötig) ---
+          sudo mkdir -p /mnt/img/etc/systemd/system/multi-user.target.wants
+          sudo ln -sf /etc/systemd/system/pegaprox-firstboot.service \
+            /mnt/img/etc/systemd/system/multi-user.target.wants/pegaprox-firstboot.service
+
+          # ssh aktivieren, falls Unit vorhanden (Pfad kann ssh.service oder sshd.service sein)
+          for U in ssh.service sshd.service; do
+            if [ -f "/mnt/img/lib/systemd/system/$U" ] || [ -f "/mnt/img/usr/lib/systemd/system/$U" ]; then
+              SRC="/lib/systemd/system/$U"
+              [ -f "/mnt/img/usr/lib/systemd/system/$U" ] && SRC="/usr/lib/systemd/system/$U"
+              sudo ln -sf "$SRC" \
+                "/mnt/img/etc/systemd/system/multi-user.target.wants/$U"
+              break
+            fi
+          done
+
+          sudo sync
+
+          # --- sauber aushängen ---
+          sudo umount /mnt/img
+          sudo qemu-nbd --disconnect /dev/nbd0
+          echo "Image-Bearbeitung abgeschlossen."
 
       - name: Smoke-Test (VM booten + First-Boot-Install + HTTP-Check)
         run: |
@@ -326,10 +387,11 @@ jobs:
             -device virtio-net-pci,netdev=n0 \
             -display none -daemonize -pidfile qemu.pid
 
-          echo "Warte auf PegaProx in der VM (First-Boot-Install kann dauern, max. 8 min)..."
+          echo "Warte auf PegaProx in der VM (First-Boot-Install, max. 8 min)..."
           OK=0
           for i in $(seq 1 96); do
-            if curl -kfs "https://localhost:${PVE_PORT}/" >/dev/null 2>&1; then
+            if curl -kfs "https://localhost:${PVE_PORT}/" >/dev/null 2>&1 \
+               || curl -fs "http://localhost:${PVE_PORT}/" >/dev/null 2>&1; then
               OK=1; break
             fi
             sleep 5

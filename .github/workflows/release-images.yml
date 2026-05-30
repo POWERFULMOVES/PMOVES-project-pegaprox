@@ -24,7 +24,7 @@ jobs:
   # ----------------------------------------------------------------------
   # 1) Version ermitteln + warten bis Release-Paket im gyptazy-Repo ist
   # ----------------------------------------------------------------------
-prepare:
+  prepare:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.ver.outputs.version }}
@@ -101,7 +101,7 @@ prepare:
         run: |
           echo "Manueller Dev-Build ohne Tag ('${{ steps.ver.outputs.version }}')."
           echo "Repo-Poll wird übersprungen. Es wird die aktuell neueste pegaprox-Version installiert."
-          
+
   # ----------------------------------------------------------------------
   # 2) LXC-Template per distrobuilder (Snap) + Smoke-Test
   # ----------------------------------------------------------------------

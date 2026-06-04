@@ -13,6 +13,10 @@ from pegaprox.models.permissions import *
 from pegaprox.core.db import get_db
 from pegaprox.utils.auth import require_auth
 from pegaprox.utils.audit import log_audit
+# MK 2026-06-04 (CWE-117): plan-name + status are admin-controlled but the
+# scanner can't tell — apply _sl consistently with the other log-injection
+# fixes so future grep stays clean.
+from pegaprox.utils.sanitization import sanitize_log_message as _sl
 from pegaprox.api.helpers import check_cluster_access
 
 bp = Blueprint('site_recovery', __name__)
@@ -221,7 +225,7 @@ def delete_plan(plan_id):
         force = request.args.get('force', '').lower() in ('1', 'true')
         if not force:
             return jsonify({'error': 'Plan is currently active. Use force=1 to delete anyway.'}), 409
-        logging.warning(f"[SR] Force-deleting plan '{plan['name']}' while status={plan['status']}")
+        logging.warning(f"[SR] Force-deleting plan '{_sl(plan['name'])}' while status={_sl(plan['status'])}")
 
     db = get_db()
     db.execute('DELETE FROM site_recovery_vms WHERE plan_id = ?', (plan_id,))

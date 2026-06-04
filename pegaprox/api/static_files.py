@@ -12,6 +12,10 @@ from pegaprox.core.db import get_db
 
 from pegaprox.utils.auth import require_auth, load_users, save_users
 from pegaprox.utils.audit import log_audit
+# MK 2026-06-04 (CWE-117 log-injection): user-input from URL params + request
+# body lands in the four loggers below — wrap with _sl so CRLF can't forge new
+# log lines.
+from pegaprox.utils.sanitization import sanitize_log_message as _sl
 from pegaprox.utils.rbac import (
     get_user_permissions, get_vm_acls,
     get_pool_membership_cache, invalidate_pool_cache,
@@ -170,7 +174,7 @@ def delete_pool(cluster_id, pool_id):
 @require_auth(perms=['admin.users'])
 def add_pool_member(cluster_id, pool_id):
     """Add a VM/CT to a pool"""
-    logging.info(f"add_pool_member called: cluster={cluster_id}, pool={pool_id}")
+    logging.info(f"add_pool_member called: cluster={_sl(cluster_id)}, pool={_sl(pool_id)}")
     
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
@@ -179,14 +183,14 @@ def add_pool_member(cluster_id, pool_id):
     vmid = data.get('vmid')
     vm_type = data.get('type', 'qemu')  # qemu or lxc
     
-    logging.info(f"Request data: vmid={vmid}, type={vm_type}")
+    logging.info(f"Request data: vmid={_sl(vmid)}, type={_sl(vm_type)}")
     
     if not vmid:
         return jsonify({'error': 'VMID is required'}), 400
     
     manager = cluster_managers.get(cluster_id)
     if not manager:
-        logging.error(f"Cluster {cluster_id} not found in cluster_managers")
+        logging.error(f"Cluster {_sl(cluster_id)} not found in cluster_managers")
         return jsonify({'error': 'Cluster not found'}), 404
     
     logging.info(f"Manager found: is_connected={manager.is_connected}")
@@ -203,7 +207,7 @@ def add_pool_member(cluster_id, pool_id):
         host, port = manager.host, manager.api_port
         url = f"https://{host}:{port}/api2/json/pools/{pool_id}"
 
-        logging.info(f"Adding VM {vmid} to pool {pool_id} on {host}")
+        logging.info(f"Adding VM {_sl(vmid)} to pool {_sl(pool_id)} on {_sl(host)}")
 
         # Proxmox expects form data with string values.
         # MK Apr 2026 (#349) — `allow-move=1` lets us re-pool a VM that's already

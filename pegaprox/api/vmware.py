@@ -14,6 +14,9 @@ from pegaprox.core.db import get_db
 
 from pegaprox.utils.auth import require_auth, load_users
 from pegaprox.utils.audit import log_audit
+# MK 2026-06-04 (CWE-117): mgr.name is from cluster-config (admin-controlled),
+# vmware_id from URL. Sanitise both before logging for consistency.
+from pegaprox.utils.sanitization import sanitize_log_message as _sl
 from pegaprox.utils.rbac import user_can_access_vmware_vm
 from pegaprox.core.vmware import VMwareManager, load_vmware_servers, save_vmware_server
 from pegaprox.core.v2p import V2PMigrationTask, _run_v2p_migration
@@ -123,7 +126,7 @@ def update_vmware_server(vmware_id):
                 mgr.last_error = 'Host changed — auto-connect skipped for security (preserved credentials). Use Test Connection manually after verifying the new host.'
             except Exception:
                 pass
-            logging.warning(f"[VMware:{getattr(mgr, 'name', vmware_id)}] Skipped auto-connect after host change with preserved credentials (cred-exfil guard)")
+            logging.warning(f"[VMware:{_sl(getattr(mgr, 'name', vmware_id))}] Skipped auto-connect after host change with preserved credentials (cred-exfil guard)")
         else:
             mgr.connect()
     vmware_managers[vmware_id] = mgr

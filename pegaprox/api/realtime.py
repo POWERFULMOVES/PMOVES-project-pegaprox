@@ -13,6 +13,9 @@ from datetime import datetime
 from flask import Blueprint, jsonify, request, Response
 
 from flask_sock import Sock
+# MK 2026-06-04 (CWE-117 log-injection scanner findings): strip CR/LF/U+2028/9
+# from anything user-controlled before f-stringing into a logger.
+from pegaprox.utils.sanitization import sanitize_log_message as _sl
 from pegaprox.constants import *
 from pegaprox.globals import (
     cluster_managers, vmware_managers,
@@ -64,7 +67,7 @@ def ws_live_updates(ws):
                 'connected_at': datetime.now().isoformat()
             }
 
-        logging.info(f"WebSocket client connected: {username} ({client_id})")
+        logging.info(f"WebSocket client connected: {_sl(username)} ({client_id})")
         ws.send(json.dumps({'type': 'connected', 'client_id': client_id}))
 
         # Keep connection alive
@@ -177,7 +180,7 @@ def validate_ws_token_api():
                         access_ok = True
                         break
             if not access_ok:
-                logging.warning(f"[WS-TOKEN] user '{data['user']}' has no access to cluster '{requested_cluster}'")
+                logging.warning(f"[WS-TOKEN] user '{_sl(data['user'])}' has no access to cluster '{_sl(requested_cluster)}'")
                 return jsonify({'error': 'Access denied to this cluster'}), 403
 
             # MK May 2026 - lightweight cluster context for the SSH/VNC proxy.

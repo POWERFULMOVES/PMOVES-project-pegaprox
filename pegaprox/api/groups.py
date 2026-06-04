@@ -13,6 +13,8 @@ from pegaprox.core.db import get_db
 
 from pegaprox.utils.auth import require_auth, load_users
 from pegaprox.utils.audit import log_audit
+# MK 2026-06-04 (CWE-117): group_id from URL path goes into the logger below.
+from pegaprox.utils.sanitization import sanitize_log_message as _sl
 from pegaprox.api.helpers import load_server_settings, save_server_settings, check_cluster_access
 
 bp = Blueprint('groups', __name__)
@@ -434,7 +436,7 @@ def get_cluster_group_status(group_id):
 
         return jsonify(result)
     except Exception as e:
-        logging.error(f"Error getting group status for {group_id}: {e}")
+        logging.error(f"Error getting group status for {_sl(group_id)}: {_sl(str(e))}")
         return jsonify({'error': 'Failed to get group status'}), 500
 
 

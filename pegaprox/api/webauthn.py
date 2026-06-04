@@ -20,6 +20,9 @@ from flask import Blueprint, jsonify, request
 from pegaprox.core.db import get_db
 from pegaprox.constants import DATABASE_FILE
 from pegaprox.utils.auth import validate_session, active_sessions, sessions_lock
+# MK 2026-06-04 (CWE-117): username comes from a login attempt = attacker-
+# controllable. Sanitise before logging.
+from pegaprox.utils.sanitization import sanitize_log_message as _sl
 
 try:
     from fido2.server import Fido2Server
@@ -327,7 +330,7 @@ def auth_finish():
     try:
         matched_cred = srv.authenticate_complete(state, credentials=creds, response=data)
     except Exception as e:
-        logging.warning(f"[WebAuthn] auth_complete failed for {username}: {e}")
+        logging.warning(f"[WebAuthn] auth_complete failed for {_sl(username)}: {_sl(str(e))}")
         return jsonify({'error': f'Verification failed: {e}'}), 400
 
     # Counter lives on the AuthenticatorData in the assertion response. fido2 2.x

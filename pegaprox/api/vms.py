@@ -7483,7 +7483,20 @@ def vnc_websocket_proxy(ws, cluster_id, node, vm_type, vmid):
         return
 
     print(f"User {auth_user} authenticated for VNC")
-    
+
+    # MK 2026-06-04 (PR #523 / Aikido SSRF triage): `node` flows raw into the
+    # PVE vncproxy URL path below. The route's string converter blocks '/'
+    # but not '..', so a crafted node could path-manipulate the request on the
+    # (trusted) PVE host. Validate against the same node-name shape api/nodes.py
+    # uses (_NODE_NAME_RE). vmid is already int-safe via the <int:vmid> route
+    # converter, and vm_type only ever reaches the URL through the qemu/lxc
+    # if/else — node is the only raw segment. (Closed the Aikido PR in favour
+    # of this: its vm_type regex would have regressed the qemu/lxc normalisation.)
+    if not re.match(r'^[a-zA-Z][a-zA-Z0-9.\-]{0,62}$', node or '') or vm_type not in ('qemu', 'lxc'):
+        try: ws.send('Invalid node or vm_type')
+        except: pass
+        return
+
     if cluster_id not in cluster_managers:
         print(f"ERROR: Cluster {cluster_id} not found")
         return

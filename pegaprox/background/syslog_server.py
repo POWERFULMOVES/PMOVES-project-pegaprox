@@ -25,6 +25,66 @@ SEVERITY_MAP = {
 
 _syslog_thread = None
 
+# NS 2026-06-05 (audit N1): the listener used to do a full SQLCipher open+keying
+# + INSERT + commit + close PER PACKET on the gevent hub — an unauthenticated
+# UDP/1514 flood = hundreds of keyings/sec = the whole web process wedges.
+# Now the packet path only enqueues (no DB work) onto a BOUNDED queue (floods
+# drop instead of buffering), and a single drain greenlet writes batches OFF the
+# hub via the gevent threadpool (one keying per batch, ~2/sec max under load).
+import queue as _queue
+_LOG_QUEUE = _queue.Queue(maxsize=20000)
+_DROPPED = 0
+
+
+def _enqueue_log(entry):
+    global _DROPPED
+    try:
+        _LOG_QUEUE.put_nowait(entry)
+    except _queue.Full:
+        _DROPPED += 1
+        if _DROPPED % 1000 == 1:
+            logging.warning(f"[Syslog] ingest queue full — dropped {_DROPPED} messages (flood / slow disk?)")
+
+
+def _flush_batch(batch):
+    """Write a batch on a fresh syslog.db connection. Runs inside the gevent
+    threadpool (see _drain_loop) so the encrypt+insert stays off the hub."""
+    conn = _open_db(timeout=30)
+    try:
+        conn.executemany(
+            "INSERT INTO logs (timestamp, source_ip, hostname, facility, severity, severity_text, message, protocol) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)", batch)
+        conn.commit()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _drain_loop():
+    """Batch queued syslog entries and flush them off the hub."""
+    try:
+        from gevent import get_hub
+    except Exception:
+        get_hub = None
+    while True:
+        try:
+            batch = [_LOG_QUEUE.get()]          # block (cooperatively) until one arrives
+            for _ in range(999):                # drain up to 1000/batch without blocking
+                try:
+                    batch.append(_LOG_QUEUE.get_nowait())
+                except _queue.Empty:
+                    break
+            if get_hub is not None:
+                get_hub().threadpool.apply(_flush_batch, (batch,))
+            else:
+                _flush_batch(batch)
+        except Exception as e:
+            logging.debug(f"[Syslog] drain error: {e}")
+            time.sleep(0.5)
+        time.sleep(0.5)                          # coalesce → at most ~2 batched writes/sec
+
 
 def _open_db(timeout=30):
     # MK May 2026: dbcrypto.connect() unlocks SQLCipher transparently when active.
@@ -200,7 +260,7 @@ def _udp_listener(host, port):
                 datetime.now().isoformat(),
                 addr[0], hostname, facility, severity, severity_text, msg, "UDP"
             )
-            _insert_log(entry)
+            _enqueue_log(entry)
         except Exception as e:
             logging.debug(f"[Syslog] UDP error: {e}")
             time.sleep(0.1)
@@ -239,7 +299,7 @@ def _tcp_listener(host, port):
                             datetime.now().isoformat(),
                             addr[0], hostname, facility, severity, severity_text, msg, "TCP"
                         )
-                        _insert_log(entry)
+                        _enqueue_log(entry)
         except Exception:
             pass
         finally:
@@ -258,11 +318,24 @@ def _syslog_loop():
     """Main syslog server loop — runs UDP + TCP in gevent greenlets"""
     import gevent
 
+    # NS 2026-06-05 (audit N1): only open the network port when the feature is
+    # enabled. Default True keeps existing behaviour (the receiver has always
+    # been on); operators who don't ingest syslog can close the port. The
+    # per-packet DoS is fixed regardless by the queue+batched-drain above.
+    try:
+        from pegaprox.api.helpers import load_server_settings
+        if not load_server_settings().get('syslog_enabled', True):
+            logging.info("[Syslog] disabled (syslog_enabled=false) — not binding 1514")
+            return
+    except Exception:
+        pass  # settings unreadable at boot → fall through to default-on
+
     _init_db()
 
     port = 1514
     host = "0.0.0.0"
 
+    gevent.spawn(_drain_loop)                       # off-hub batched writer
     udp = gevent.spawn(_udp_listener, host, port)
     tcp = gevent.spawn(_tcp_listener, host, port)
 

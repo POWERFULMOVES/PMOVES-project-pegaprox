@@ -93,6 +93,11 @@ def load_server_settings():
         # When enabled, the Syslog viewer only shows hostnames belonging to
         # the currently selected cluster instead of all collected syslog rows.
         'syslog_filter_by_selected_cluster': False,
+        # NS 2026-06-05 (audit N1): gate the syslog RECEIVER (UDP+TCP :1514).
+        # Default True preserves the always-on behaviour; set False to close the
+        # port on installs that don't ingest syslog. (DoS-safe either way now —
+        # ingestion is bounded-queue + batched off-hub.)
+        'syslog_enabled': True,
         # Webhook alert channels (Slack, Discord, Teams, ntfy, generic)
         # Each: {id, name, type, url, enabled, ...type-specific fields}
         'alert_webhooks': [],

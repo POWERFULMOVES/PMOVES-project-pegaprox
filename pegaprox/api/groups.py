@@ -15,6 +15,7 @@ from pegaprox.utils.auth import require_auth, load_users
 from pegaprox.utils.audit import log_audit
 # MK 2026-06-04 (CWE-117): group_id from URL path goes into the logger below.
 from pegaprox.utils.sanitization import sanitize_log_message as _sl
+from pegaprox.utils.rbac import DEFAULT_TENANT_ID
 from pegaprox.api.helpers import load_server_settings, save_server_settings, check_cluster_access
 
 bp = Blueprint('groups', __name__)
@@ -24,11 +25,24 @@ bp = Blueprint('groups', __name__)
 # Organize clusters into collapsible groups with tenant assignment
 # =============================================================================
 
+def _user_tenant(user: dict):
+    """Scoping tenant for `user`, or None for unscoped (admin / default tenant).
+
+    NS 2026-06-05 (audit M-3): the whole file used to read user.get('tenant'),
+    but db.get_user()/get_all_users() map the SQLite `tenant` column to the dict
+    key `tenant_id` (never `tenant`), so that was ALWAYS None — every tenant user
+    fell into the admin branch and saw every other tenant's groups/metrics.
+    Admin + the implicit 'default' tenant stay unscoped (None = see all) so
+    single-tenant installs are unaffected; a real tenant gets scoped.
+    """
+    tid = (user or {}).get('tenant_id') or DEFAULT_TENANT_ID
+    if (user or {}).get('role') == ROLE_ADMIN or tid == DEFAULT_TENANT_ID:
+        return None
+    return tid
+
 def get_user_tenant(username: str) -> str:
-    """Get tenant_id for a user, returns None for admins/no tenant"""
-    users = load_users()
-    user = users.get(username, {})
-    return user.get('tenant')
+    """Get scoping tenant_id for a username, None for admins/default/no tenant"""
+    return _user_tenant(load_users().get(username, {}))
 
 
 @bp.route('/api/cluster-groups', methods=['GET'])
@@ -40,8 +54,8 @@ def get_cluster_groups():
         usr = getattr(request, 'session', {}).get('user', 'system')
         users = load_users()
         user = users.get(usr, {})
-        tenant_id = user.get('tenant')
-        
+        tenant_id = _user_tenant(user)
+
         # Admins see all groups, tenant users only see their tenant's groups + global groups
         if user.get('role') == ROLE_ADMIN or not tenant_id:
             groups = db.query('SELECT * FROM cluster_groups ORDER BY sort_order, name')
@@ -75,7 +89,7 @@ def create_cluster_group():
     # Non-admins can only create groups for their own tenant
     tenant_id = data.get('tenant_id')
     if user.get('role') != ROLE_ADMIN:
-        tenant_id = user.get('tenant')  # Force to user's tenant
+        tenant_id = _user_tenant(user)  # Force to user's tenant
     
     db = get_db()
     group_id = str(uuid.uuid4())[:8]
@@ -119,7 +133,7 @@ def update_cluster_group(group_id):
 
     # Check tenant access - non-admins can only edit their tenant's groups
     if user.get('role') != ROLE_ADMIN:
-        user_tenant = user.get('tenant')
+        user_tenant = _user_tenant(user)
         if group['tenant_id'] and group['tenant_id'] != user_tenant:
             log_audit(usr, 'cluster_group.update_denied', f"Access denied to group '{group['name']}' (ID: {group_id}) - tenant mismatch", ip_address=ip)
             return jsonify({'error': 'Access denied - group belongs to different tenant'}), 403
@@ -189,7 +203,7 @@ def delete_cluster_group(group_id):
     
     # Check tenant access
     if user.get('role') != ROLE_ADMIN:
-        user_tenant = user.get('tenant')
+        user_tenant = _user_tenant(user)
         if group['tenant_id'] and group['tenant_id'] != user_tenant:
             log_audit(usr, 'cluster_group.delete_denied', f"Access denied to delete group '{group['name']}' (ID: {group_id}) - tenant mismatch", ip_address=ip)
             return jsonify({'error': 'Access denied - group belongs to different tenant'}), 403
@@ -271,7 +285,7 @@ def assign_cluster_to_group(cluster_id):
         
         # Check tenant access to target group
         if user.get('role') != ROLE_ADMIN:
-            user_tenant = user.get('tenant')
+            user_tenant = _user_tenant(user)
             if group['tenant_id'] and group['tenant_id'] != user_tenant:
                 log_audit(usr, 'cluster.group_assign_denied', f"Access denied to assign cluster {cluster_id} to group '{group['name']}' - tenant mismatch", ip_address=ip)
                 return jsonify({'error': 'Access denied - group belongs to different tenant'}), 403
@@ -335,8 +349,8 @@ def get_cluster_group_status(group_id):
         usr = getattr(request, 'session', {}).get('user', 'system')
         users = load_users()
         user = users.get(usr, {})
-        tenant_id = user.get('tenant')
-        if tenant_id and user.get('role') != ROLE_ADMIN:
+        tenant_id = _user_tenant(user)
+        if tenant_id:
             if group['tenant_id'] and group['tenant_id'] != tenant_id:
                 return jsonify({'error': 'Access denied'}), 403
 
@@ -447,9 +461,15 @@ def get_cluster_group_lb_history(group_id):
     """Returns the last 50 xclb-related audit events for this group"""
     db = get_db()
 
-    group = db.query_one('SELECT id FROM cluster_groups WHERE id = ?', (group_id,))
+    group = db.query_one('SELECT id, tenant_id FROM cluster_groups WHERE id = ?', (group_id,))
     if not group:
         return jsonify({'error': 'Group not found'}), 404
+
+    # M-3: don't leak another tenant's xclb audit trail. Admins/default unscoped.
+    usr = getattr(request, 'session', {}).get('user', 'system')
+    _ut = _user_tenant(load_users().get(usr, {}))
+    if _ut and group['tenant_id'] and group['tenant_id'] != _ut:
+        return jsonify({'error': 'Access denied'}), 403
 
     # MK: grab anything tagged with xclb.* that mentions this group
     events = db.query(
@@ -470,6 +490,17 @@ def trigger_xclb_balance_now(group_id):
         return jsonify({'error': 'Group not found'}), 404
 
     group = dict(row)
+
+    # M-3 (BOLA): this spawns REAL cross-cluster VM migrations — gate it on group
+    # ownership, not just the cluster.config perm. A tenant user must not trigger
+    # rebalancing on another tenant's group. Admins/default tenant unscoped.
+    usr = getattr(request, 'session', {}).get('user', 'system')
+    _ut = _user_tenant(load_users().get(usr, {}))
+    if _ut and group.get('tenant_id') and group.get('tenant_id') != _ut:
+        log_audit(usr, 'xclb.manual_denied',
+                  f"Denied cross-cluster balance on group {_sl(str(group.get('name', group_id)))} (tenant mismatch)")
+        return jsonify({'error': 'Access denied'}), 403
+
     if not group.get('cross_cluster_lb_enabled'):
         return jsonify({'error': 'Cross-cluster LB is not enabled for this group'}), 400
 
@@ -477,7 +508,6 @@ def trigger_xclb_balance_now(group_id):
     import gevent
     gevent.spawn(run_cross_cluster_balance_check, group)
 
-    usr = getattr(request, 'session', {}).get('user', 'system')
     log_audit(usr, 'xclb.manual', f"Manual cross-cluster balance triggered for group {group.get('name', group_id)}")
 
     return jsonify({'message': 'Cross-cluster balance check started'})

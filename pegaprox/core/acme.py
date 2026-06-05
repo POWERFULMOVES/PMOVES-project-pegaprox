@@ -104,12 +104,25 @@ def _signed_request(url, payload, account_key, nonce, kid=None):
         'payload': payload_b64,
         'signature': _b64url(signature),
     }
-    resp = requests.post(url, json=body, headers={'Content-Type': 'application/jose+json'}, timeout=30)
+    _guard_acme_url(url)
+    resp = requests.post(url, json=body, headers={'Content-Type': 'application/jose+json'},
+                         timeout=30, allow_redirects=False)
     return resp
 
 
+def _guard_acme_url(url):
+    """M-8/M-9 (security audit): every ACME follow-on URL pulled out of the
+    directory doc (newNonce/newAccount/newOrder/finalize/certificate/authz/
+    challenge) must pass the SAME SSRF guard as the directory itself — a
+    hostile/MITM'd directory response could point them at 169.254.169.254 /
+    RFC1918. Public CAs (Let's Encrypt) are unaffected. Raises SsrfError."""
+    from pegaprox.utils.url_security import sanitize_outbound_url
+    return sanitize_outbound_url(url)  # https-only + block-private (matches directory guard)
+
+
 def _get_nonce(directory):
-    resp = requests.head(directory['newNonce'], timeout=10)
+    _guard_acme_url(directory['newNonce'])
+    resp = requests.head(directory['newNonce'], timeout=10, allow_redirects=False)
     return resp.headers['Replay-Nonce']
 
 
@@ -302,7 +315,7 @@ def _create_order(domain, email, ssl_dir, staging=False, directory_url=None):
     except SsrfError as guard_err:
         return {'success': False, 'message': f'ACME directory URL rejected: {guard_err}'}
 
-    dir_resp = requests.get(acme_url, timeout=15)
+    dir_resp = requests.get(acme_url, timeout=15, allow_redirects=False)  # M-8: no redirect to internal
     dir_resp.raise_for_status()
     directory = dir_resp.json()
 

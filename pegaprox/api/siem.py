@@ -39,6 +39,14 @@ import threading
 import urllib.request
 import urllib.parse
 from queue import Queue, Empty
+
+
+class _NoSiemRedirect(urllib.request.HTTPRedirectHandler):
+    # M-8 (security audit): the SSRF guard validates only the first hop, so a
+    # 30x to an internal/metadata host would bypass it. SIEM ingest endpoints
+    # don't legitimately redirect — refuse to follow (the 30x surfaces as an error).
+    def redirect_request(self, *a, **k):
+        return None
 from datetime import datetime
 from flask import Blueprint, jsonify, request, session
 
@@ -250,7 +258,10 @@ def _http_post(url, body_bytes, headers, timeout=10, verify_tls=True):
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         _warn_tls_downgrade(url)
-    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+    # M-8: build an opener that won't follow redirects; pass the SSL context via
+    # the HTTPS handler (build_opener keeps the default HTTP handler for http URLs).
+    _opener = urllib.request.build_opener(_NoSiemRedirect, urllib.request.HTTPSHandler(context=ctx))
+    with _opener.open(req, timeout=timeout) as resp:
         code = resp.getcode()
         if not (200 <= code < 300):
             raise RuntimeError(f"HTTP {code}")

@@ -47,7 +47,10 @@ def _fire_webhook(url):
         except SsrfError as guard_err:
             logger.warning(f"[SR] webhook URL rejected: {guard_err}")
             return
-        requests.post(url, json={'event': 'site_recovery', 'timestamp': datetime.utcnow().isoformat()}, timeout=30)
+        # M-8: don't follow a 30x to an internal host (the guard above only
+        # validates the first hop).
+        requests.post(url, json={'event': 'site_recovery', 'timestamp': datetime.utcnow().isoformat()},
+                      timeout=30, allow_redirects=False)
     except Exception as e:
         logger.warning(f"[SR] Webhook failed: {url} - {e}")
 

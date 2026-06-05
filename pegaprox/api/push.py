@@ -233,11 +233,26 @@ def _trim_inbox():
 # Wake-up push send
 # ──────────────────────────────────────────────────────────────────────────
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    # H-4 (security audit): a push provider that 30x-redirects could bounce us
+    # to an internal URL (SSRF). Wake-up pushes never legitimately redirect, so
+    # don't follow — return the response as-is and treat it as a non-2xx.
+    def redirect_request(self, *a, **k):
+        return None
+
+
 def _send_one(endpoint: str, sub_id: int):
     """Fire one wake-up push (no payload) to the given subscription."""
     try:
         import urllib.request
         parsed = urllib.parse.urlparse(endpoint)
+        # H-4: re-validate the stored endpoint at SEND time, not just at subscribe.
+        # The subscribe-time check is TOCTOU vs DNS rebinding, and the endpoint
+        # row could predate the M-12 validation. Fail closed on anything that
+        # isn't an external https host.
+        if parsed.scheme != 'https' or not parsed.hostname or _is_internal_or_metadata_host(parsed.hostname):
+            logging.warning(f"[push] sub {sub_id} blocked — endpoint host not allowed: {parsed.hostname}")
+            return False
         audience = f"{parsed.scheme}://{parsed.netloc}"
         jwt = _vapid_jwt(audience)
         kp = _load_vapid()
@@ -253,7 +268,8 @@ def _send_one(endpoint: str, sub_id: int):
                 'Content-Length': '0',
             }
         )
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        _opener = urllib.request.build_opener(_NoRedirect)
+        with _opener.open(req, timeout=10) as resp:
             code = resp.getcode()
             if 200 <= code < 300:
                 # success — reset failure counter

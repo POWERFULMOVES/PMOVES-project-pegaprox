@@ -121,6 +121,16 @@ def create_app():
         max_size = _upload_max if is_upload else _default_max
         if request.content_length and request.content_length > max_size:
             return jsonify({'error': f'Request too large. Max {max_size // (1024*1024)} MB'}), 413
+        # H-6 (security audit): a chunked Transfer-Encoding request carries NO
+        # Content-Length, so the check above is skipped and an unauth client could
+        # stream an unbounded body → OOM DoS. Pin werkzeug's per-request cap so the
+        # limit is enforced when the body is actually read (counts real bytes,
+        # works for chunked too). Per-request, not a global config mutation — so
+        # uploads keep their big ceiling without the #119 cross-request race.
+        try:
+            request.max_content_length = max_size
+        except Exception:
+            pass
 
         if request.path.startswith('/api/'):
             skip_paths = ['/api/auth/login', '/api/auth/check', '/api/events', '/api/health', '/api/sse',

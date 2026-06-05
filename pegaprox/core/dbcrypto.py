@@ -406,6 +406,58 @@ _AUTO_MIG_LOCK = threading.Lock()  # in-process serialisation
 _AUTO_MIG_DONE: set = set()        # paths that have already been checked
 
 
+def _shred_file(path: str) -> bool:
+    """Best-effort secure delete: overwrite with random bytes, fsync, unlink.
+    NS 2026-06-05 (audit H-5). A plain unlink leaves the cleartext blocks on
+    disk; overwrite first so a plaintext DB copy (= all cluster passwords) can't
+    be carved back. Falls back to a plain remove if the overwrite fails."""
+    try:
+        sz = os.path.getsize(path)
+        with open(path, 'r+b', buffering=0) as fh:
+            fh.seek(0)
+            fh.write(os.urandom(sz))
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.remove(path)
+        return True
+    except Exception as e:
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+        _LOG.warning("[DBCRYPTO] shred of %s incomplete: %s", path, e)
+        return False
+
+
+def purge_stale_plain_backups(db_path: str, retention_s: int = None):
+    """Securely remove plaintext migration backups (<db>.plain.bak.<ts>) once
+    they're older than the retention window. H-5 (security audit): a plaintext
+    copy of the SQLCipher DB is every stored cluster password in cleartext,
+    sitting next to the keystore. The auto-migration keeps one for a short
+    rollback window; this sweep (every startup) shreds anything past it. Default
+    1h, PEGAPROX_PLAIN_BACKUP_RETENTION_S to override (0 = shred immediately)."""
+    import glob
+    import time as _time
+    if retention_s is None:
+        try:
+            retention_s = int(os.environ.get('PEGAPROX_PLAIN_BACKUP_RETENTION_S', '3600'))
+        except ValueError:
+            retention_s = 3600
+    now = _time.time()
+    purged = []
+    for p in glob.glob(f"{os.path.abspath(db_path)}.plain.bak.*"):
+        try:
+            age = now - os.path.getmtime(p)
+        except OSError:
+            continue
+        if age >= retention_s:
+            if _shred_file(p):
+                purged.append(p)
+                _LOG.warning("[DBCRYPTO] shredded stale plaintext backup (%.1fh old): %s",
+                             age / 3600.0, p)
+    return purged
+
+
 def ensure_db_encrypted(db_path: str) -> dict:
     """Idempotent: encrypt the DB at `db_path` if it's still plain and the
     SQLCipher backend is available.  Called once per DB during app startup.
@@ -431,6 +483,14 @@ def ensure_db_encrypted(db_path: str) -> dict:
     with _AUTO_MIG_LOCK:
         if db_path in _AUTO_MIG_DONE:
             return {'action': 'already-checked'}
+        # H-5: sweep stale plaintext backups every startup (before we possibly
+        # create a fresh one below — a backup made by THIS boot's migration is
+        # younger than the retention window, so it survives this boot for
+        # rollback and gets shredded on a later start).
+        try:
+            purge_stale_plain_backups(db_path)
+        except Exception as _pe:
+            _LOG.debug("[DBCRYPTO] plain-backup purge soft-fail: %s", _pe)
         state = detect_db_state(db_path)
 
         if state in ('missing', 'encrypted'):
